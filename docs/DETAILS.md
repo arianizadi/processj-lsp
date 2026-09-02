@@ -102,14 +102,12 @@ why:
 | `pj/unused`                | unused locals and parameters                                                        |
 | `pj/missing-import`        | `println` without `import std.*;`; quick fix adds the import                       |
 
-**Run and inspect from the editor.** Code lenses above `main` offer **▶ Run**,
-**Build**, and **Generated Java**. Run performs the whole `pjc` pipeline
+**Run from the editor.** Code lenses above `main` offer **▶ Run** and
+**Build**. Run performs the whole `pjc` pipeline
 (ProcessJc, `javac --release 8`, the two ASM rewrites, `java`) in a temp
 directory, judged by exit codes rather than by grepping output, then opens a
 report with the program's output. A program that never finishes is killed after
-30 s and flagged as a probable deadlock. Generated Java opens the Java the
-compiler produced for the file, the best way to see how a `par` or an `alt`
-becomes a resumable state machine.
+30 s and flagged as a probable deadlock.
 
 **Semantic highlighting.** The server sends semantic tokens for every identifier,
 classified from the parse tree and the checker's resolutions: procedure names,
@@ -212,8 +210,7 @@ opts = {
 
 With AstroNvim the usual mappings apply: `K` hover, `gd` definition, `gr`
 references, `<Leader>lf` format, `<Leader>la` code action (quick fixes),
-`<Leader>lr` rename, `<Leader>ll` run a code lens (▶ Run, Build, Generated
-Java). `editor/nvim/lua/plugins/processj.lua` is a ready-made copy of the spec.
+`<Leader>lr` rename, `<Leader>ll` run a code lens (▶ Run, Build). `editor/nvim/lua/plugins/processj.lua` is a ready-made copy of the spec.
 
 ### 3. Neovim without a plugin manager
 

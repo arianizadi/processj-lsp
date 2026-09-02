@@ -89,7 +89,6 @@ interface Settings {
 }
 
 const COMMAND_RUN = 'processj.run';
-const COMMAND_SHOW_JAVA = 'processj.showGeneratedJava';
 const COMMAND_BUILD = 'processj.build';
 
 const connection = createConnection(ProposedFeatures.all);
@@ -165,7 +164,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       signatureHelpProvider: { triggerCharacters: ['(', ','], retriggerCharacters: [','] },
       codeActionProvider: { codeActionKinds: [CodeActionKind.QuickFix] },
       codeLensProvider: { resolveProvider: false },
-      executeCommandProvider: { commands: [COMMAND_RUN, COMMAND_SHOW_JAVA, COMMAND_BUILD] },
+      executeCommandProvider: { commands: [COMMAND_RUN, COMMAND_BUILD] },
       documentFormattingProvider: true,
       foldingRangeProvider: true,
       semanticTokensProvider: { legend: { tokenTypes: [...TOKEN_TYPES], tokenModifiers: [...TOKEN_MODIFIERS] }, full: true },
@@ -481,13 +480,10 @@ connection.onCodeLens((params: CodeLensParams): CodeLens[] => {
   if (!doc || !install) return [];
   const lenses: CodeLens[] = [];
   for (const s of symbolsFor(doc).symbols) {
-    if (s.kind !== 'proc') continue;
+    if (s.kind !== 'proc' || s.name !== 'main') continue;
     const range = Range.create(s.line, s.startCol, s.line, s.endCol);
-    if (s.name === 'main') {
-      lenses.push({ range, command: { title: '▶ Run', command: COMMAND_RUN, arguments: [doc.uri] } });
-      lenses.push({ range, command: { title: 'Build', command: COMMAND_BUILD, arguments: [doc.uri] } });
-    }
-    lenses.push({ range, command: { title: 'Generated Java', command: COMMAND_SHOW_JAVA, arguments: [doc.uri, s.name] } });
+    lenses.push({ range, command: { title: '▶ Run', command: COMMAND_RUN, arguments: [doc.uri] } });
+    lenses.push({ range, command: { title: 'Build', command: COMMAND_BUILD, arguments: [doc.uri] } });
   }
   return lenses;
 });
@@ -512,18 +508,6 @@ connection.onExecuteCommand(async (params: ExecuteCommandParams) => {
   connection.window.showInformationMessage(`ProcessJ: building ${fileName}…`);
   const built = await build(install, sourcePath, doc.getText(), { timeoutMs: settings.timeoutMs * 3 });
   try {
-    if (params.command === COMMAND_SHOW_JAVA) {
-      if (!built.javaSource) {
-        await showReport(`${stem}.build.txt`, formatReport(fileName, built.stages));
-        connection.window.showErrorMessage('ProcessJ: code generation failed; see the report');
-        return null;
-      }
-      const target = await showReport(`${stem}.java`, built.javaSource);
-      const procName = String(params.arguments?.[1] ?? '');
-      if (procName && procName !== 'main') connection.window.showInformationMessage(`Look for _proc$${procName}… or _method$${procName}… in ${path.basename(target)}`);
-      return target;
-    }
-
     if (!built.ok) {
       const target = await showReport(`${stem}.build.txt`, formatReport(fileName, built.stages));
       const failed = built.stages.find((s) => !s.ok);
