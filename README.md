@@ -46,7 +46,7 @@ If a `.pj` file opens with no diagnostics at all, run `:checkhealth vim.lsp`. If
 | quick fix | `<Leader>la` | `:lua vim.lsp.buf.code_action()` |
 | format | `<Leader>lf` | `:lua vim.lsp.buf.format()` |
 | rename | `<Leader>lr` | `:lua vim.lsp.buf.rename()` |
-| run / build the file | `:ProcessJRun` / `:ProcessJBuild` | same |
+| ▶ Run / Build | `<Leader>ll` on `main`, or `:ProcessJRun` / `:ProcessJBuild` | `:lua vim.lsp.codelens.run()` |
 
 ## VS Code
 

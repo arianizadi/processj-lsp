@@ -31,7 +31,7 @@ function M.default_config()
       runTimeoutMs = 30000,
       checkOnChange = false, -- run the real compiler only on open and save; the checker runs as you type
       lint = true,
-      codeLens = false, -- no inline "Run | Build" text; use :ProcessJRun and :ProcessJBuild instead
+      codeLens = true, -- "▶ Run | Build" above main; :ProcessJRun and :ProcessJBuild do the same
     },
   }
 end

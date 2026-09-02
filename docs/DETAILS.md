@@ -102,9 +102,8 @@ why:
 | `pj/unused`                | unused locals and parameters                                                        |
 | `pj/missing-import`        | `println` without `import std.*;`; quick fix adds the import                       |
 
-**Run from the editor.** In VS Code, code lenses above `main` offer **▶ Run**
-and **Build**; in Neovim the same actions are `:ProcessJRun` and
-`:ProcessJBuild` (no inline lens text). Run performs the whole `pjc` pipeline
+**Run from the editor.** Code lenses above `main` offer **▶ Run** and
+**Build** (Neovim also has `:ProcessJRun` and `:ProcessJBuild`). Run performs the whole `pjc` pipeline
 (ProcessJc, `javac --release 8`, the two ASM rewrites, `java`) in a temp
 directory, judged by exit codes rather than by grepping output, then opens a
 report with the program's output. A program that never finishes is killed after
