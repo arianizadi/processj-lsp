@@ -1,0 +1,13 @@
+// expect: pj/channel-self-deadlock
+import std.*;
+
+// A channel is a rendezvous between two processes. Here one process writes and
+// then reads the same channel, so the write waits for a reader that is itself:
+// it blocks forever. Put the two sides in different branches of a par.
+public void main(string[] args) {
+    chan<int> c;
+    println("about to block forever");
+    c.write(1);
+    int x = c.read();
+    println("never " + x);
+}

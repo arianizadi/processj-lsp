@@ -1,0 +1,45 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "ProcessJ",
+  "scopeName": "source.processj",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#pragma" },
+    { "include": "#strings" },
+    { "include": "#chars" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#channel-ops" },
+    { "include": "#calls" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.processj", "match": "//.*$" },
+        { "name": "comment.block.processj", "begin": "/\\*", "end": "\\*/" }
+      ]
+    },
+    "pragma": { "name": "meta.preprocessor.processj", "match": "^\\s*#pragma\\b.*$" },
+    "strings": {
+      "name": "string.quoted.double.processj",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [{ "name": "constant.character.escape.processj", "match": "\\\\." }]
+    },
+    "chars": { "name": "string.quoted.single.processj", "match": "'(\\\\.|[^'])'" },
+    "numbers": { "name": "constant.numeric.processj", "match": "\\b(0[xX][0-9a-fA-F]+[lL]?|\\d+(\\.\\d+)?([eE][+-]?\\d+)?[lLfFdD]?)\\b" },
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.processj", "match": "\\b(if|else|while|for|do|switch|case|default|break|continue|return|skip|stop|suspend|resume)\\b" },
+        { "name": "keyword.control.concurrency.processj", "match": "\\b(par|alt|pri|enroll|claim|seq|sync|fork|with)\\b" },
+        { "name": "storage.modifier.processj", "match": "\\b(public|private|protected|const|shared|mobile|native|extern)\\b" },
+        { "name": "keyword.other.processj", "match": "\\b(import|package|record|protocol|extends|implements|new|is|proc)\\b" },
+        { "name": "constant.language.processj", "match": "\\b(true|false|null)\\b" }
+      ]
+    },
+    "types": { "name": "storage.type.processj", "match": "\\b(boolean|byte|char|short|int|long|float|double|string|void|chan|timer|barrier)\\b" },
+    "channel-ops": { "name": "support.function.channel.processj", "match": "\\.(read|write|timeout|sync)\\b" },
+    "calls": { "name": "entity.name.function.processj", "match": "\\b[A-Za-z_]\\w*(?=\\s*\\()" }
+  }
+}

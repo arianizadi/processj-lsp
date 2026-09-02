@@ -1,0 +1,18 @@
+// expect: pj/pri-alt-skip
+import std.*;
+
+public void source(chan<int>.write out) { out.write(1); }
+
+// In a `pri alt` guards are tried in order and `skip` is always ready, so the
+// channel guard after it is never selected. Put `skip` last.
+public void main(string[] args) {
+    chan<int> c;
+    int v = 0;
+    par {
+        source(c.write);
+        pri alt {
+            skip : { println("nothing yet"); }
+            v = c.read() : { println("got " + v); }
+        }
+    }
+}

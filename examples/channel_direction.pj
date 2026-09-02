@@ -9,9 +9,15 @@ public void confused(chan<int>.read in, chan<int>.write out) {
     println(v);
 }
 
+public void source(chan<int>.write out) { out.write(1); }
+public void sink(chan<int>.read in) { println(in.read()); }
+
 public void main(string[] args) {
     chan<int> c;
+    chan<int> d;
     par {
-        confused(c.read, c.write);
+        source(c.write);
+        confused(c.read, d.write);
+        sink(d.read);
     }
 }

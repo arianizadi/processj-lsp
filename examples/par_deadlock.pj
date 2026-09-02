@@ -1,0 +1,22 @@
+// expect: pj/par-deadlock
+import std.*;
+
+// Each branch writes first and reads second, so both wait for a reader that is
+// itself waiting: a crossed-order deadlock. The checker simulates the
+// rendezvous of straight-line branches and reports what each one waits for.
+public void main(string[] args) {
+    chan<int> c;
+    chan<int> d;
+    par {
+        {
+            c.write(1);
+            int x = d.read();
+            println("left got " + x);
+        }
+        {
+            d.write(2);
+            int y = c.read();
+            println("right got " + y);
+        }
+    }
+}

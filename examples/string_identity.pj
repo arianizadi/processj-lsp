@@ -1,0 +1,11 @@
+// expect: pj/string-identity
+import std.*;
+
+// The compiler turns `==` on strings into .equals() only when both sides are
+// local variables. Against a literal it compares Java object identity, which is
+// almost always false. Use equals(a, b) from std.strings.
+public void main(string[] args) {
+    string command = "quit";
+    if (command == "quit") println("bye");
+    if (equals(command, "quit")) println("bye, correctly");
+}

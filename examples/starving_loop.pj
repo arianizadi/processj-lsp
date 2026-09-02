@@ -1,0 +1,19 @@
+// expect: pj/starving-loop
+import std.*;
+
+public void worker(chan<int>.write out) {
+    for (int i = 0; i < 3; i++) out.write(i);
+}
+
+// ProcessJ's scheduler is cooperative: a process only gives others a turn when
+// it communicates or waits. This loop never does, so `worker` never runs and
+// the read in the third branch waits forever.
+public void main(string[] args) {
+    chan<int> c;
+    int spins = 0;
+    par {
+        worker(c.write);
+        while (true) { spins = spins + 1; }
+        for (int i = 0; i < 3; i++) println(c.read());
+    }
+}

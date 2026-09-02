@@ -1,0 +1,14 @@
+// expect: pj/parallel-usage, pj/shared-channel-end
+import std.*;
+
+// Every iteration of a `par for` is its own process. All of them write `sum`
+// (a race) and all of them hold `c.write` (needs a shared channel).
+public void main(string[] args) {
+    chan<int> c;
+    int sum = 0;
+    par for (int i = 0; i < 4; i++) {
+        sum += i;
+        c.write(i);
+    }
+    for (int j = 0; j < 4; j++) println(c.read() + sum);
+}

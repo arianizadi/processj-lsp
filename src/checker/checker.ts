@@ -85,6 +85,11 @@ interface ChanUse {
   reads?: A.Span;
   writes?: A.Span;
   bare: boolean;
+  /** Distinct par branches (or the sequential body, `undefined`) the channel's ends are used from. */
+  branches: Set<BranchUse | undefined>;
+  first?: A.Span;
+  /** Every place an end of the channel is used. */
+  spans: A.Span[];
 }
 
 class Checker {
@@ -109,6 +114,13 @@ class Checker {
   private insideAlt = 0;
   /** Name expressions that are the target of `.read` / `.write` / `.read()` / `.write(v)`: not "bare" uses of the channel. */
   private readonly endTargets = new WeakSet<A.Expr>();
+  /** Whether a procedure body can suspend (communicates), memoised; cycles count as not yielding. */
+  private readonly yieldMemo = new Map<A.ProcDecl, boolean>();
+  /** Barriers a proc enrolled on with `par enroll`, to spot syncs nobody enrolled. */
+  private enrolled = new Set<VarInfo>();
+  private syncs: Array<{ v: VarInfo; span: A.Span }> = [];
+  /** Par blocks whose straight-line branches are simulated once the whole proc is known. */
+  private pendingSims: Array<{ par: A.ParBlock; queues: Op[][] }> = [];
 
   constructor(private readonly opts: CheckOptions) {
     this.index = opts.index;
@@ -155,9 +167,9 @@ class Checker {
     this.allVars.push(info);
     if (!isParam && this.proc) {
       const param = this.proc.params.find((p) => p.name.name === id.name);
-      if (param) this.warn(id.span, 'pj/shadows-parameter', `'${id.name}' shadows a parameter of '${this.proc.name.name}'. The compiler accepts this silently and hoists both to different fields, which makes every later '${id.name}' ambiguous to read.`);
+      if (param) this.warn(id.span, 'pj/shadows-parameter', `'${id.name}' shadows a parameter of '${this.proc.name.name}'; rename one of them`);
     }
-    if (type.k === 'chan' && !type.end && !isParam) this.chanUses.set(info, { bare: false });
+    if (type.k === 'chan' && !type.end && !isParam) this.chanUses.set(info, { bare: false, branches: new Set(), spans: [] });
     return info;
   }
 
@@ -175,7 +187,7 @@ class Checker {
     const name = node.name.name;
     if (this.index.isKnownType(name) || this.opts.unresolvedImports) return;
     const s = suggest(name, [...this.index.records.keys(), ...this.index.protocols.keys()]);
-    this.report(node.span, 'warning', 'pj/type/unknown-type', `Unknown type '${name}': no record or protocol with that name in this file, its imports, or the standard library${s ? `; did you mean '${s}'?` : ''}`, s ? { kind: 'edit', title: `Change to '${s}'`, line: node.name.span.start.line, col: node.name.span.start.col, endCol: node.name.span.end.col, text: s } : undefined);
+    this.report(node.span, 'warning', 'pj/type/unknown-type', `Unknown type '${name}'${s ? `; did you mean '${s}'?` : ' (not declared here, in an import, or in std)'}`, s ? { kind: 'edit', title: `Change to '${s}'`, line: node.name.span.start.line, col: node.name.span.start.col, endCol: node.name.span.end.col, text: s } : undefined);
   }
 
   // -------------------------------------------------------------------------
@@ -220,7 +232,7 @@ class Checker {
             }
             const vt: Type = v.dims > 0 ? { k: 'array', elem: type, dims: v.dims } : type;
             this.checkInit(vt, v.init, v.name.name);
-            if (!(isLiteralInit(v.init) && this.onlyConstNames(v.init))) this.error(v.init.span, 'pj/type/const-init', `A constant can only be initialised with literals and other constants (the compiler's LiteralInits pass rejects anything else)`);
+            if (!(isLiteralInit(v.init) && this.onlyConstNames(v.init))) this.error(v.init.span, 'pj/type/const-init', 'A constant can only be initialised with literals and other constants');
           }
           break;
         }
@@ -245,6 +257,9 @@ class Checker {
     this.altSpans = [];
     this.chanUses = new Map();
     this.activeCase = new Map();
+    this.enrolled = new Set();
+    this.syncs = [];
+    this.pendingSims = [];
     this.push();
     for (const p of d.params) {
       const t = this.resolveType(p.type);
@@ -253,7 +268,7 @@ class Checker {
     if (d.body) {
       // The body block shares the parameter scope, as in the compiler (params and locals collide there too).
       this.push();
-      for (const s of d.body.stmts) this.stmt(s);
+      this.stmts(d.body.stmts);
       this.pop();
     }
     this.pop();
@@ -269,14 +284,114 @@ class Checker {
     }
     for (const [v, use] of this.chanUses) {
       if (use.bare) continue;
-      if (use.reads && !use.writes) this.warn(use.reads, 'pj/channel-no-writer', `'${v.name}' is read here but nothing in '${d.name.name}' ever writes it or passes it on; this read blocks forever (and the scheduler spins at 100% CPU while it waits).`);
-      if (use.writes && !use.reads) this.warn(use.writes, 'pj/channel-no-reader', `'${v.name}' is written here but nothing in '${d.name.name}' ever reads it or passes it on; this write blocks forever.`);
+      if (use.reads && !use.writes) this.warn(use.reads, 'pj/channel-no-writer', `Nothing ever writes '${v.name}', so this read blocks forever`);
+      else if (use.writes && !use.reads) this.warn(use.writes, 'pj/channel-no-reader', `Nothing ever reads '${v.name}', so this write blocks forever`);
+      else if (use.reads && use.writes && use.branches.size <= 1 && use.first) {
+        this.warn(use.first, 'pj/channel-self-deadlock', `This process is both the writer and the reader of '${v.name}', so this ${use.first === use.writes ? 'write' : 'read'} blocks forever. Put the two sides in different branches of a par.`);
+      }
     }
     if (this.altCount > 0) {
       for (const v of this.allVars) {
-        if (v.proc === d.name.name && (v.name === 'index' || v.name === 'btemp')) this.warn(v.decl.span, 'pj/reserved-alt-name', `'${v.name}' is also the name of a variable the alt code generator creates; references may silently bind to the generated one. Rename it.`);
+        if (v.proc === d.name.name && (v.name === 'index' || v.name === 'btemp')) this.warn(v.decl.span, 'pj/reserved-alt-name', `'${v.name}' clashes with a variable the alt code generator creates; rename it`);
       }
     }
+    for (const sim of this.pendingSims) this.runSimulation(sim.par, sim.queues);
+    for (const { v, span } of this.syncs) {
+      if (!v.isParam && !this.enrolled.has(v)) this.warn(span, 'pj/barrier-not-enrolled', `No 'par enroll (${v.name})' here, so this sync() waits for nobody and returns at once`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Yield analysis: can this code suspend, i.e. communicate or wait?
+  // -------------------------------------------------------------------------
+
+  private procYields(decl: A.ProcDecl): boolean {
+    const memo = this.yieldMemo.get(decl);
+    if (memo !== undefined) return memo;
+    this.yieldMemo.set(decl, false); // recursion guard
+    const r = decl.body ? this.stmtYields(decl.body) : false;
+    this.yieldMemo.set(decl, r);
+    return r;
+  }
+
+  private stmtYields(s: A.Stmt): boolean {
+    switch (s.kind) {
+      case 'Block':
+        return s.stmts.some((x) => this.stmtYields(x));
+      case 'LocalDecl':
+        return s.declarators.some((v) => !!v.init && this.exprYields(v.init));
+      case 'ExprStmt':
+        return this.exprYields(s.expr);
+      case 'IfStmt':
+        return this.exprYields(s.cond) || this.stmtYields(s.then) || (!!s.else && this.stmtYields(s.else));
+      case 'WhileStmt':
+      case 'DoStmt':
+        return this.exprYields(s.cond) || this.stmtYields(s.body);
+      case 'ForStmt':
+        return s.isPar || this.stmtYields(s.body) || (!!s.cond && this.exprYields(s.cond));
+      case 'ParBlock':
+      case 'AltStmt':
+      case 'ClaimStmt':
+        return true;
+      case 'SeqBlock':
+        return this.stmtYields(s.body);
+      case 'SwitchStmt':
+        return this.exprYields(s.expr) || s.groups.some((g) => g.stmts.some((x) => this.stmtYields(x)));
+      case 'ReturnStmt':
+        return !!s.expr && this.exprYields(s.expr);
+      case 'LabeledStmt':
+        return this.stmtYields(s.stmt);
+      default:
+        return false;
+    }
+  }
+
+  private exprYields(e: A.Expr): boolean {
+    switch (e.kind) {
+      case 'ChanRead':
+      case 'ChanWrite':
+      case 'Sync':
+      case 'Timeout':
+        return true;
+      case 'Invocation': {
+        if (e.args.some((a) => this.exprYields(a))) return true;
+        const cands = this.index.procs.get(e.name.name) ?? [];
+        return cands.some((c) => this.procYields(c.decl));
+      }
+      case 'ParenExpr':
+        return this.exprYields(e.expr);
+      case 'BinaryExpr':
+        return this.exprYields(e.left) || this.exprYields(e.right);
+      case 'UnaryExpr':
+        return this.exprYields(e.operand);
+      case 'AssignExpr':
+        return this.exprYields(e.target) || this.exprYields(e.value);
+      case 'TernaryExpr':
+        return this.exprYields(e.cond) || this.exprYields(e.then) || this.exprYields(e.else);
+      case 'CastExpr':
+        return this.exprYields(e.expr);
+      case 'RecordAccess':
+        return this.exprYields(e.target);
+      case 'ArrayAccess':
+        return this.exprYields(e.target) || this.exprYields(e.index);
+      case 'NewArray':
+        return e.dimExprs.some((d) => this.exprYields(d));
+      case 'ArrayLiteral':
+        return e.elements.some((x) => this.exprYields(x));
+      case 'RecordLiteral':
+      case 'ProtocolLiteral':
+        return e.fields.some((f) => this.exprYields(f.value));
+      default:
+        return false;
+    }
+  }
+
+  /** A loop that never ends (constant-true condition) and cannot suspend starves every other process. */
+  private checkStarvingLoop(loopSpan: A.Span, cond: A.Expr | undefined, body: A.Stmt, keyword: string): void {
+    if (cond && !isTrueLiteral(cond)) return;
+    if (containsExit(body) || this.stmtYields(body)) return;
+    const head: A.Span = { start: loopSpan.start, end: { line: loopSpan.start.line, col: loopSpan.start.col + keyword.length } };
+    this.warn(head, 'pj/starving-loop', `This loop never ends and never communicates, so no other process ever runs again (the scheduler is cooperative). Add a channel operation, timeout or alt.`);
   }
 
   // -------------------------------------------------------------------------
@@ -285,8 +400,23 @@ class Checker {
 
   private block(b: A.Block): void {
     this.push();
-    for (const s of b.stmts) this.stmt(s);
+    this.stmts(b.stmts);
     this.pop();
+  }
+
+  /** A statement list; reports the first statement after a return/break/continue/stop. */
+  private stmts(list: A.Stmt[]): void {
+    let dead = false;
+    for (const s of list) {
+      if (dead) {
+        if (s.kind !== 'EmptyStmt') {
+          this.warn(s.span, 'pj/unreachable', 'Unreachable code');
+          dead = false; // one report per block
+        }
+      }
+      this.stmt(s);
+      if (s.kind === 'ReturnStmt' || s.kind === 'BreakStmt' || s.kind === 'ContinueStmt' || s.kind === 'StopStmt') dead = true;
+    }
   }
 
   private stmt(s: A.Stmt): void {
@@ -312,13 +442,16 @@ class Checker {
       }
       case 'WhileStmt':
         this.condition(s.cond, 'while');
+        this.checkStarvingLoop(s.span, s.cond, s.body, 'while');
         this.loop(() => this.stmt(s.body));
         return;
       case 'DoStmt':
         this.loop(() => this.stmt(s.body));
         this.condition(s.cond, 'do ... while');
+        this.checkStarvingLoop(s.span, s.cond, s.body, 'do');
         return;
-      case 'ForStmt':
+      case 'ForStmt': {
+        const outerDepth = this.scope.depth;
         this.push();
         if (s.init) {
           if (Array.isArray(s.init)) for (const e of s.init) this.expr(e);
@@ -326,13 +459,44 @@ class Checker {
         }
         if (s.cond) this.condition(s.cond, 'for');
         for (const e of s.update) this.expr(e);
-        for (const b of s.enroll) this.expectType(b, T.barrier, 'enroll');
-        if (s.isPar) this.branch(1, () => this.loop(() => this.stmt(s.body)));
-        else this.loop(() => this.stmt(s.body));
+        for (const b of s.enroll) {
+          this.expectType(b, T.barrier, 'enroll');
+          if (b.kind === 'NameExpr') {
+            const v = this.resolutions.get(b);
+            if (v) this.enrolled.add(v);
+          }
+        }
+        if (!s.isPar) this.checkStarvingLoop(s.span, s.cond, s.body, 'for');
+        if (s.isPar) {
+          const use = this.branch(this.scope.depth, () => this.loop(() => this.stmt(s.body)));
+          // Every iteration is its own process, so anything from outside the loop is shared by all of them.
+          const seen = new Set<VarInfo>();
+          for (const [v, span] of use.writes) {
+            if (v.depth <= outerDepth && !seen.has(v)) {
+              seen.add(v);
+              this.error(span, 'pj/parallel-usage', `Every iteration of this par for writes '${v.name}' at the same time (data race)`);
+            }
+          }
+          for (const [key, { v, span }] of use.ends) {
+            if (v.depth <= outerDepth && v.type.k === 'chan' && !v.type.shared) {
+              const typeCol = Math.max(0, v.decl.span.start.col - (typeStr(v.type).length + 1));
+              this.error(span, 'pj/shared-channel-end', `Every iteration of this par for holds '${key}'; declare it 'shared chan<${typeStr(v.type.elem)}>'`, { kind: 'make-shared', line: v.decl.span.start.line, col: typeCol, title: `Declare '${v.name}' as shared` });
+            }
+          }
+        } else this.loop(() => this.stmt(s.body));
         this.pop();
         return;
+      }
       case 'ParBlock':
-        for (const b of s.barriers) this.expectType(b, T.barrier, 'enroll');
+        for (const b of s.barriers) {
+          this.expectType(b, T.barrier, 'enroll');
+          if (b.kind === 'NameExpr') {
+            const v = this.resolutions.get(b);
+            if (v) this.enrolled.add(v);
+          }
+        }
+        if (s.body.stmts.length === 0) this.report(s.span, 'info', 'pj/trivial-par', "Empty par: nothing runs");
+        else if (s.body.stmts.length === 1) this.report({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + 3 } }, 'info', 'pj/trivial-par', "A par with one branch runs nothing concurrently");
         this.parBlock(s);
         return;
       case 'SeqBlock':
@@ -391,6 +555,9 @@ class Checker {
   private condition(e: A.Expr, owner: string): void {
     const t = this.expr(e);
     if (!isLenient(t) && !isPrim(t, 'boolean')) this.error(e.span, 'pj/type/condition', `The condition of '${owner}' must be boolean, not ${typeStr(t)}`);
+    let inner = e;
+    while (inner.kind === 'ParenExpr') inner = inner.expr;
+    if (inner.kind === 'AssignExpr' && inner.op === '=' && isPrim(t, 'boolean')) this.warn(e.span, 'pj/assign-in-condition', `This assigns '${exprText(inner.target)}' instead of comparing it; did you mean '=='?`);
   }
 
   private localDecl(d: A.LocalDecl): void {
@@ -401,7 +568,7 @@ class Checker {
       // The initialiser is checked before the name is in scope: `int x = x + 1` is an error.
       if (v.init) {
         this.checkInit(t, v.init, v.name.name);
-        if (d.isConst && !(isLiteralInit(v.init) && this.onlyConstNames(v.init))) this.error(v.init.span, 'pj/type/const-init', 'A constant can only be initialised with literals and other constants (the compiler rejects anything else)');
+        if (d.isConst && !(isLiteralInit(v.init) && this.onlyConstNames(v.init))) this.error(v.init.span, 'pj/type/const-init', 'A constant can only be initialised with literals and other constants');
       }
       this.declare(v.name, t, d.isConst, false);
     }
@@ -487,9 +654,7 @@ class Checker {
         }
       }
       this.push();
-      this.withCase(protoVar && tag ? [protoVar, tag] : undefined, () => {
-        for (const st of g.stmts) this.stmt(st);
-      });
+      this.withCase(protoVar && tag ? [protoVar, tag] : undefined, () => this.stmts(g.stmts));
       this.pop();
     }
     this.switchDepth--;
@@ -518,7 +683,7 @@ class Checker {
   private altStmt(s: A.AltStmt): void {
     this.altCount++;
     this.altSpans.push(s.span);
-    if (this.altCount === 2) this.warn(s.span, 'pj/multiple-alts', `Second 'alt' in '${this.proc?.name.name}'. The generated Java redeclares its guard variables (ready0, booleanGuards1, ...) so javac fails with "already defined"; put each alt in its own proc.`);
+    if (this.altCount === 2) this.warn(s.span, 'pj/multiple-alts', `Second alt in '${this.proc?.name.name}': the compiler's generated Java fails on it. Put each alt in its own proc.`);
     this.insideAlt++;
     this.push();
     if (s.replicated) {
@@ -529,6 +694,13 @@ class Checker {
       }
       if (r.cond) this.condition(r.cond, 'alt');
       for (const e of r.update) this.expr(e);
+    }
+    if (s.isPri) {
+      const skipAt = s.cases.findIndex((c) => c.guard?.kind === 'SkipGuard' && !c.precondition);
+      if (skipAt >= 0 && skipAt < s.cases.length - 1) this.warn(s.cases[skipAt].guard!.span, 'pj/pri-alt-skip', `'skip' is always ready, so in a pri alt the guards after it are never chosen. Put skip last.`);
+    }
+    if (s.cases.length === 1 && !s.replicated && s.cases[0].guard?.kind === 'ReadGuard' && !s.cases[0].precondition) {
+      this.report({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + (s.isPri ? 7 : 3) } }, 'info', 'pj/trivial-alt', "An alt with one guard is just a read");
     }
     for (const c of s.cases) {
       if (c.nested) {
@@ -542,7 +714,7 @@ class Checker {
           case 'SkipGuard':
             break;
           case 'TimeoutGuard':
-            this.warn(c.guard.span, 'pj/alt-timeout', 'A timeout guard in an alt is compiled as a blocking sleep *before* the alt, so channel guards are not watched during the wait (CodeGenJava.java:2104). The alt only sees them once the timeout has elapsed.');
+            this.warn(c.guard.span, 'pj/alt-timeout', 'The compiler turns this timeout guard into a sleep before the alt: the channel guards are not watched until it ends.');
             this.timeout(c.guard.timeout, true);
             break;
           case 'ReadGuard': {
@@ -572,6 +744,7 @@ class Checker {
       branches.push(use);
     }
     this.pop();
+    this.simulateRendezvous(s);
 
     const reported = new Set<VarInfo>();
     for (let x = 0; x < branches.length; x++) {
@@ -584,7 +757,7 @@ class Checker {
           reported.add(v);
           const later = after(other, wspan) ? other : wspan;
           const what = branches[y].writes.has(v) ? 'written' : 'read';
-          this.error(later, 'pj/parallel-usage', `'${v.name}' is written in one branch of this par and ${what} in another. Branches run concurrently, so this is a data race (parallel usage rule; the compiler's check for it is disabled).`);
+          this.error(later, 'pj/parallel-usage', `'${v.name}' is written in one branch of this par and ${what} in another: a data race`);
         }
       }
     }
@@ -601,8 +774,153 @@ class Checker {
         if (v.type.k !== 'chan' || v.type.shared || v.depth > branches[x].depth) continue;
         const declLine = v.decl.span.start.line;
         const typeCol = Math.max(0, v.decl.span.start.col - (typeStr(v.type).length + 1));
-        this.error(span, 'pj/shared-channel-end', `'${key}' is used in more than one branch of this par. Only one process may hold a non-shared end; declare it 'shared chan<${typeStr(v.type.elem)}>' or give each branch its own channel.`, { kind: 'make-shared', line: declLine, col: typeCol, title: `Declare '${v.name}' as shared` });
+        this.error(span, 'pj/shared-channel-end', `'${key}' is used by more than one branch of this par; declare it 'shared chan<${typeStr(v.type.elem)}>'`, { kind: 'make-shared', line: declLine, col: typeCol, title: `Declare '${v.name}' as shared` });
       }
+    }
+  }
+
+  /**
+   * Straight-line branches (only channel reads/writes, prints and plain statements)
+   * are run through a rendezvous simulation: a write on a channel pairs with a read
+   * on the same channel in another branch. Anything left waiting is a deadlock.
+   * Branches with loops, alts, conditionals, nested pars or calls that receive
+   * channels are opaque, and then the whole par is left alone.
+   */
+  private simulateRendezvous(s: A.ParBlock): void {
+    if (s.body.stmts.length < 2) return;
+    const queues: Op[][] = [];
+    for (const st of s.body.stmts) {
+      const ops = this.branchOps(st);
+      if (!ops) return;
+      queues.push(ops);
+    }
+    if (queues.every((q) => q.length === 0)) return;
+    this.pendingSims.push({ par: s, queues });
+  }
+
+  /**
+   * Only channels that live entirely inside this par can be simulated: a parameter,
+   * a channel passed on to another process, or one also used outside the par may
+   * have a partner we cannot see. Any such channel makes the whole par opaque.
+   */
+  private runSimulation(s: A.ParBlock, queues: Op[][]): void {
+    const inside = (sp: A.Span) => !before(sp, s.span.start) && before(sp, s.span.end);
+    for (const q of queues) {
+      for (const op of q) {
+        const v = op.chan;
+        const use = this.chanUses.get(v);
+        if (v.isParam || !use || use.bare || v.type.k !== 'chan' || v.type.end) return;
+        if (!use.spans.every(inside)) return;
+        if (use.branches.size <= 1) return; // a single-process channel is already a self-deadlock report
+      }
+    }
+    const heads = queues.map(() => 0);
+    for (;;) {
+      let progressed = false;
+      for (let i = 0; i < queues.length && !progressed; i++) {
+        const a = queues[i][heads[i]];
+        if (!a) continue;
+        for (let j = 0; j < queues.length; j++) {
+          if (i === j) continue;
+          const b = queues[j][heads[j]];
+          if (b && b.chan === a.chan && b.kind !== a.kind) {
+            heads[i]++;
+            heads[j]++;
+            progressed = true;
+            break;
+          }
+        }
+      }
+      if (!progressed) break;
+    }
+    const stuck = queues.map((q, i) => ({ i, op: q[heads[i]] })).filter((x) => x.op);
+    if (stuck.length === 0) return;
+    const first = stuck[0];
+    const describe = (x: { i: number; op: Op }) => `branch ${x.i + 1} waits to ${x.op.kind} '${x.op.chan.name}'`;
+    const others = stuck.slice(1).map(describe);
+    const finished = stuck.length === 1 ? ' but every other branch has finished' : '';
+    this.warn(first.op.span, 'pj/par-deadlock', `Deadlock: ${describe(first)}${others.length ? `, ${others.join(', ')}` : ''}${finished}. Writes and reads must pair up across branches in the same order.`);
+  }
+
+  /** Channel operations of a straight-line branch, or undefined if the branch is opaque. */
+  private branchOps(st: A.Stmt): Op[] | undefined {
+    const ops: Op[] = [];
+    const visit = (x: A.Stmt): boolean => {
+      switch (x.kind) {
+        case 'Block':
+          return x.stmts.every(visit);
+        case 'EmptyStmt':
+        case 'SkipStmt':
+          return true;
+        case 'LocalDecl':
+          return x.declarators.every((d) => !d.init || this.exprOps(d.init, ops));
+        case 'ExprStmt':
+          return this.exprOps(x.expr, ops);
+        default:
+          return false;
+      }
+    };
+    return visit(st) ? ops : undefined;
+  }
+
+  /**
+   * Append the channel operations of an expression in evaluation order. Returns false
+   * when the expression could communicate in a way we cannot model (an extended
+   * rendezvous, a call that yields or that receives a channel).
+   */
+  private exprOps(e: A.Expr, ops: Op[]): boolean {
+    switch (e.kind) {
+      case 'ChanWrite': {
+        if (e.target.kind !== 'NameExpr' || !this.exprOps(e.value, ops)) return false;
+        const v = this.resolutions.get(e.target);
+        if (!v) return false;
+        ops.push({ kind: 'write', chan: v, span: e.span });
+        return true;
+      }
+      case 'ChanRead': {
+        if (e.extended || e.target.kind !== 'NameExpr') return false;
+        const v = this.resolutions.get(e.target);
+        if (!v) return false;
+        ops.push({ kind: 'read', chan: v, span: e.span });
+        return true;
+      }
+      case 'ChanEnd':
+        return false; // an end being passed along
+      case 'Sync':
+      case 'Timeout':
+        return false;
+      case 'Invocation': {
+        if (e.target) return false;
+        const cands = this.index.procs.get(e.name.name) ?? [];
+        if (cands.some((c) => this.procYields(c.decl))) return false;
+        return e.args.every((a) => this.exprOps(a, ops) && this.types.get(a)?.k !== 'chan');
+      }
+      case 'AssignExpr':
+        return (e.target.kind === 'NameExpr' || this.exprOps(e.target, ops)) && this.exprOps(e.value, ops);
+      case 'BinaryExpr':
+        return this.exprOps(e.left, ops) && this.exprOps(e.right, ops);
+      case 'UnaryExpr':
+        return this.exprOps(e.operand, ops);
+      case 'ParenExpr':
+      case 'CastExpr':
+        return this.exprOps(e.expr, ops);
+      case 'TernaryExpr':
+        return this.exprOps(e.cond, ops) && !this.exprYields(e.then) && !this.exprYields(e.else);
+      case 'RecordAccess':
+        return this.exprOps(e.target, ops);
+      case 'ArrayAccess':
+        return this.exprOps(e.target, ops) && this.exprOps(e.index, ops);
+      case 'NewArray':
+        return e.dimExprs.every((d) => this.exprOps(d, ops));
+      case 'ArrayLiteral':
+        return e.elements.every((x) => this.exprOps(x, ops));
+      case 'RecordLiteral':
+      case 'ProtocolLiteral':
+        return e.fields.every((f) => this.exprOps(f.value, ops));
+      case 'NameExpr':
+        return this.types.get(e)?.k !== 'chan';
+      default:
+        return true;
     }
   }
 
@@ -641,6 +959,9 @@ class Checker {
     if (u) {
       if (end === 'read') u.reads ??= span;
       else u.writes ??= span;
+      u.first ??= span;
+      u.branches.add(this.branchStack[this.branchStack.length - 1]);
+      u.spans.push(span);
     }
   }
 
@@ -763,6 +1084,10 @@ class Checker {
       case 'Sync': {
         const t = this.expr(e.target);
         if (!isLenient(t) && !isPrim(t, 'barrier')) this.error(e.span, 'pj/type/barrier', `'.sync()' needs a barrier; ${exprText(e.target)} is ${typeStr(t)}`);
+        if (e.target.kind === 'NameExpr') {
+          const v = this.resolutions.get(e.target);
+          if (v) this.syncs.push({ v, span: e.span });
+        }
         return T.void;
       }
       case 'Timeout':
@@ -845,7 +1170,7 @@ class Checker {
     const d = this.expr(e.delay);
     if (!isLenient(t) && !isPrim(t, 'timer')) this.error(e.target.span, 'pj/type/timer', `'.timeout()' needs a timer; ${exprText(e.target)} is ${typeStr(t)}`);
     if (!isLenient(d) && !isIntegral(d)) this.error(e.delay.span, 'pj/type/timer', `The timeout delay must be an integer number of milliseconds, not ${typeStr(d)}`);
-    if (!inAlt) this.report(e.span, 'info', 'pj/timeout-noop', 'In the current ProcessJ build every timeout returns immediately: PJTimer.start() stores a relative delay that the timer queue reads as an absolute time (PJTimer.java:33).');
+    if (!inAlt) this.report(e.span, 'info', 'pj/timeout-noop', 'In this ProcessJ build timeouts return immediately (PJTimer bug); the delay is ignored at runtime');
     return T.void;
   }
 
@@ -906,14 +1231,9 @@ class Checker {
       return t;
     }
     if (target.kind === 'RecordAccess' || target.kind === 'ArrayAccess') {
-      let root: A.Expr = target;
-      while (root.kind === 'RecordAccess' || root.kind === 'ArrayAccess') root = root.target;
-      const t = this.expr(target);
-      if (root.kind === 'NameExpr') {
-        const v = this.resolutions.get(root);
-        if (v) this.noteWrite(v, root.span);
-      }
-      return t;
+      // Writing one element or field: branches usually touch different elements (a[i] in a
+      // par for), so this is recorded as a use of the container, not a write to it.
+      return this.expr(target);
     }
     const t = this.expr(target);
     if (!isLenient(t)) this.error(target.span, 'pj/type/assign', 'The left side of an assignment must be a variable, field or array element');
@@ -972,6 +1292,14 @@ class Checker {
         return this.error(e.span, 'pj/type/operator', `'${e.op}' compares numbers; here the operands are ${typeStr(l)} and ${typeStr(r)}`);
       case '==':
       case '!=':
+        if (isPrim(l, 'string') && isPrim(r, 'string')) {
+          // CodeGenJava.java:461 rewrites == to .equals only when BOTH sides are local string variables.
+          const isLocalVar = (x: A.Expr) => x.kind === 'NameExpr' && !!this.resolutions.get(x) && !this.resolutions.get(x)!.isParam;
+          if (!(isLocalVar(e.left) && isLocalVar(e.right))) {
+            this.warn(e.span, 'pj/string-identity', `'${e.op}' on strings compares identity here (${e.op === '==' ? 'almost always false' : 'almost always true'}); use ${e.op === '!=' ? '!' : ''}equals(a, b) from std`);
+          }
+          return T.boolean;
+        }
         if ((isNumeric(l) && isNumeric(r)) || (isPrim(l, 'boolean') && isPrim(r, 'boolean'))) return T.boolean;
         if (l.k === 'null' && isReference(r)) return T.boolean;
         if (r.k === 'null' && isReference(l)) return T.boolean;
@@ -1047,13 +1375,13 @@ class Checker {
         const ft = fields?.get(m);
         if (ft) return ft;
         const owners = [...cases].filter(([, f]) => f.has(m)).map(([c]) => c);
-        return this.error(e.member.span, 'pj/type/field', owners.length ? `'${m}' belongs to case${owners.length > 1 ? 's' : ''} ${owners.join(', ')} of ${t.name}, but here '${exprText(e.target)}' is known to be case '${active}' (fields: ${[...(fields?.keys() ?? [])].join(', ') || 'none'})` : `Protocol ${t.name} has no field '${m}' in any case`);
+        return this.error(e.member.span, 'pj/type/field', owners.length ? `'${m}' belongs to case ${owners.join('/')}, but here '${exprText(e.target)}' is case '${active}' (fields: ${[...(fields?.keys() ?? [])].join(', ') || 'none'})` : `Protocol ${t.name} has no field '${m}' in any case`);
       }
       for (const [, fields] of cases) {
         const ft = fields.get(m);
         if (ft) return ft;
       }
-      return this.error(e.member.span, 'pj/type/field', `Protocol ${t.name} has no field '${m}' in any case (cases: ${[...cases.keys()].join(', ')}). Access protocol fields inside 'switch (${exprText(e.target)}) { case tag: ... }'`);
+      return this.error(e.member.span, 'pj/type/field', `Protocol ${t.name} has no field '${m}' in any case (cases: ${[...cases.keys()].join(', ')})`);
     }
     if (t.k === 'chan') return this.error(e.member.span, 'pj/type/field', `A channel has '.read', '.write', '.read()' and '.write(v)', not '.${m}'`);
     return this.error(e.member.span, 'pj/type/field', `${typeStr(t)} has no field '${m}'`);
@@ -1073,7 +1401,7 @@ class Checker {
     if (!cands || cands.length === 0) {
       if (this.scope.lookup(n)) return this.error(e.name.span, 'pj/type/call', `'${n}' is a variable, not a procedure`);
       if (this.opts.stdIndex?.procs.has(n) && !this.opts.importsStd) {
-        return this.error(e.name.span, 'pj/missing-import', `'${n}' comes from the standard library; add 'import std.*;' at the top of the file.`, { kind: 'add-import', line: 0, col: 0, title: "Add 'import std.*;'" });
+        return this.error(e.name.span, 'pj/missing-import', `'${n}' needs 'import std.*;' at the top of the file`, { kind: 'add-import', line: 0, col: 0, title: "Add 'import std.*;'" });
       }
       if (this.opts.unresolvedImports) return T.unknown;
       const s = suggest(n, [...this.index.procs.keys()]);
@@ -1084,7 +1412,8 @@ class Checker {
       const argList = args.map(typeStr).join(', ');
       const sameArity = cands.filter((c) => c.params.length === args.length);
       const detail = sameArity.length === 1 ? explainMismatch(sameArity[0], args) : '';
-      return this.error(e.span, 'pj/type/call', `No version of '${n}' accepts (${argList})${detail}. Available: ${cands.map(signatureStr).join('; ')}`);
+      const shown = cands.slice(0, 3).map(signatureStr).join('; ') + (cands.length > 3 ? `; and ${cands.length - 3} more` : '');
+      return this.error(e.span, 'pj/type/call', `No version of '${n}' accepts (${argList})${detail}. Available: ${shown}`);
     }
     // Most specific: every parameter assignable to the other candidate's parameter.
     let best = applicable.filter((a) => applicable.every((b) => a === b || a.params.every((p, i) => assignable(b.params[i], p, this.index))));
@@ -1124,13 +1453,83 @@ class Checker {
 
   private warnShortCircuit(e: A.Expr, op: string): void {
     const read = findRead(e);
-    if (read) this.warn(read.span, 'pj/short-circuit-read', `This channel read is on the right of '${op}'. The compiler hoists it out of the expression and performs it unconditionally, so it can block even when the left side already decides the result. Move the read to its own statement.`);
+    if (read) this.warn(read.span, 'pj/short-circuit-read', `The compiler performs this read even when '${op}' would skip it; move the read to its own statement`);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+interface Op {
+  kind: 'read' | 'write';
+  chan: VarInfo;
+  span: A.Span;
+}
+
+function isTrueLiteral(e: A.Expr): boolean {
+  while (e.kind === 'ParenExpr') e = e.expr;
+  return e.kind === 'Literal' && e.text === 'true';
+}
+
+/** Does the loop body contain a break, return or stop that can end the loop? (Nested loops' breaks do not count.) */
+function containsExit(s: A.Stmt): boolean {
+  switch (s.kind) {
+    case 'BreakStmt':
+    case 'ReturnStmt':
+    case 'StopStmt':
+      return true;
+    case 'Block':
+      return s.stmts.some(containsExit);
+    case 'IfStmt':
+      return containsExit(s.then) || (!!s.else && containsExit(s.else));
+    case 'SwitchStmt':
+      return s.groups.some((g) => g.stmts.some((x) => x.kind === 'ReturnStmt' || x.kind === 'StopStmt' || (x.kind !== 'BreakStmt' && containsExit(x))));
+    case 'AltStmt':
+      return s.cases.some((c) => (!!c.body && containsExit(c.body)) || (!!c.nested && containsExit(c.nested)));
+    case 'ParBlock':
+    case 'SeqBlock':
+      return s.body.stmts.some((x) => x.kind === 'ReturnStmt' || x.kind === 'StopStmt' || containsExit(x));
+    case 'ClaimStmt':
+    case 'LabeledStmt':
+      return containsExit(s.kind === 'ClaimStmt' ? s.body : s.stmt);
+    case 'WhileStmt':
+    case 'DoStmt':
+    case 'ForStmt':
+      // A return or stop inside an inner loop still leaves the outer one; a break does not.
+      return returnsInside(s.body);
+    default:
+      return false;
+  }
+}
+
+function returnsInside(s: A.Stmt): boolean {
+  switch (s.kind) {
+    case 'ReturnStmt':
+    case 'StopStmt':
+      return true;
+    case 'Block':
+      return s.stmts.some(returnsInside);
+    case 'IfStmt':
+      return returnsInside(s.then) || (!!s.else && returnsInside(s.else));
+    case 'WhileStmt':
+    case 'DoStmt':
+    case 'ForStmt':
+    case 'ClaimStmt':
+      return returnsInside(s.body);
+    case 'SwitchStmt':
+      return s.groups.some((g) => g.stmts.some(returnsInside));
+    case 'AltStmt':
+      return s.cases.some((c) => (!!c.body && returnsInside(c.body)) || (!!c.nested && returnsInside(c.nested)));
+    case 'ParBlock':
+    case 'SeqBlock':
+      return s.body.stmts.some(returnsInside);
+    case 'LabeledStmt':
+      return returnsInside(s.stmt);
+    default:
+      return false;
+  }
+}
 
 function isIntLiteral(e: A.Expr): boolean {
   if (e.kind === 'ParenExpr') return isIntLiteral(e.expr);
@@ -1179,6 +1578,10 @@ function findRead(e: A.Expr): A.ChanRead | undefined {
     default:
       return undefined;
   }
+}
+
+function before(a: A.Span, p: A.Pos): boolean {
+  return a.start.line < p.line || (a.start.line === p.line && a.start.col < p.col);
 }
 
 function after(a: A.Span, b: A.Span): boolean {

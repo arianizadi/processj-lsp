@@ -48,6 +48,18 @@ If a `.pj` file opens with no diagnostics at all, run `:checkhealth vim.lsp`. If
 | rename | `<Leader>lr` | `:lua vim.lsp.buf.rename()` |
 | ▶ Run / Build / Generated Java | `<Leader>ll` on `main` | `:lua vim.lsp.codelens.run()` |
 
+## VS Code
+
+Built from source, so you always have the latest. Needs Node.js 20+ and the `code` command on PATH:
+
+```sh
+git clone https://github.com/arianizadi/processj-lsp
+cd processj-lsp/vscode
+npm run install-extension
+```
+
+To update: `git pull`, then run the same command again. Settings are under "ProcessJ" in the settings UI.
+
 ## Options
 
 Pass them in `opts`:
@@ -65,7 +77,7 @@ opts = {
 ## Good to know
 
 - The real compiler only runs on open and save, in a temp directory. Your `~/workingpj` is never touched.
-- The checker finds things the compiler does not: data races in `par`, a channel end used by two processes, writing to a read end, the wrong type on a channel. See `examples/` for one small program per message.
+- The checker finds things the compiler does not: data races in `par`, a channel end used by two processes, a process reading its own channel, branches whose reads and writes cannot pair up, loops that starve every other process, `skip` shadowing the guards after it in a `pri alt`, `==` on strings. See `examples/` for one small program per message.
 - Files that import each other are re-checked when either changes; nothing is polled.
 - More: [docs/DETAILS.md](docs/DETAILS.md) covers every feature, the numbers, and how it works.
 

@@ -90,6 +90,15 @@ why:
 | `pj/channel-direction`     | `in.write(..)` on a `chan<T>.read` end, or chains like `c.read.write(..)`          |
 | `pj/channel-write-type`    | `c.write("hi")` on a `chan<int>` (the compiler never type-checks writes)           |
 | `pj/channel-no-writer`     | a channel read in a proc that never writes it or passes it on: blocks forever      |
+| `pj/channel-self-deadlock` | both ends of a channel used by the same sequential process: the first use blocks forever |
+| `pj/par-deadlock`          | straight-line par branches whose channel operations cannot pair up (crossed order, extra write): simulated rendezvous |
+| `pj/starving-loop`         | an infinite loop with no communication, sync, timeout, alt or par: the cooperative scheduler never runs anyone else |
+| `pj/pri-alt-skip`          | `skip` before other guards in a `pri alt`: those guards can never be chosen |
+| `pj/barrier-not-enrolled`  | `sync()` on a local barrier nothing enrolled on: returns immediately              |
+| `pj/string-identity`       | `==` on strings compares Java identity unless both sides are local variables (CodeGenJava.java:461) |
+| `pj/assign-in-condition`   | `if (b = true)`: assignment where a comparison was meant                            |
+| `pj/unreachable`           | code after `return`, `break`, `continue` or `stop` in the same block               |
+| `pj/trivial-par`, `pj/trivial-alt` | a `par` with one branch, an `alt` with one guard: nothing concurrent happens   |
 | `pj/short-circuit-read`    | `c.read()` on the right of `&&`, `\|\|`, `?:`: the compiler evaluates it unconditionally |
 | `pj/alt-timeout`           | a `timeout` guard in an `alt` is compiled as a blocking sleep before the alt        |
 | `pj/multiple-alts`         | a second `alt` in one proc makes javac fail on redeclared variables                 |
@@ -315,6 +324,7 @@ scripts/smoke.js    talks LSP over stdio to a real server, ends with a real prog
 scripts/bench.js    parse / lint / format timings on generated large files
 lua/, plugin/, ftdetect/, syntax/, ftplugin/   the Neovim plugin (install the repo with lazy.nvim)
 editor/nvim/        ready-made lazy.nvim/AstroNvim spec and a plugin-manager-free config
+vscode/             VS Code extension: `npm run install-extension` builds the server, bundles it, packages and installs
 ```
 
 ## License

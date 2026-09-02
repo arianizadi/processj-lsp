@@ -1,0 +1,69 @@
+{
+  "name": "processj-lsp-vscode",
+  "displayName": "ProcessJ",
+  "description": "ProcessJ language support: diagnostics, type checking, formatting, semantic highlighting, run from the editor.",
+  "version": "0.1.0",
+  "publisher": "arianizadi",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/arianizadi/processj-lsp" },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages", "Linters", "Formatters"],
+  "main": "./out/extension.js",
+  "activationEvents": ["onLanguage:processj"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "processj",
+        "aliases": ["ProcessJ", "processj"],
+        "extensions": [".pj"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "processj",
+        "scopeName": "source.processj",
+        "path": "./syntaxes/processj.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "ProcessJ",
+      "properties": {
+        "processj.installDir": {
+          "type": "string",
+          "default": "",
+          "description": "ProcessJ install directory (with bin/ and resources/jars). Empty: use installdir from ~/processjrc or $PROCESSJ_HOME."
+        },
+        "processj.checkOnChange": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also run the real compiler on every edit (default: only on open and save; the built-in checker runs as you type)."
+        },
+        "processj.lint": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run the built-in type checker and concurrency lints."
+        },
+        "processj.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to processj-lsp.js. Empty: use the server bundled by the build script."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "package": "node scripts/build.js && vsce package --no-dependencies",
+    "install-extension": "node scripts/build.js && vsce package --no-dependencies --out processj.vsix && code --install-extension processj.vsix --force"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.9.0"
+  }
+}

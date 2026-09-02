@@ -139,7 +139,7 @@ test('records and protocols: fields, literals, switch narrowing, is', () => {
       "7: Record 'Point' has no field 'z' (fields: x, y)",
       "8: 'mvoe' is not a case of protocol Msg (cases: move, quit); did you mean 'move'?",
       "9: Case 'move' of Msg has no field 'reason' (fields: dx, dy)",
-      "11: 'reason' belongs to case quit of Msg, but here 'm' is known to be case 'move' (fields: dx, dy)",
+      "11: 'reason' belongs to case quit, but here 'm' is case 'move' (fields: dx, dy)",
       "12: 'halt' is not a case of protocol Msg (cases: move, quit)",
       "14: 'bogus' is not a case of protocol Msg (cases: move, quit)",
       "15: Cannot initialise 'q' (Point) with a value of type Msg",
@@ -170,6 +170,54 @@ test('concurrency lints from the AST: parallel usage, shared ends with fix, no w
   assert.equal(r.diagnostics.find((d) => d.code === 'pj/shared-channel-end')?.fix?.kind, 'make-shared');
   assert.deepEqual(byCode('pj/channel-no-writer'), [15]);
   assert.deepEqual(byCode('pj/short-circuit-read'), [16, 17]);
+});
+
+test('a channel written and read by the same sequential process is a self-deadlock', () => {
+  const bad = run(MAIN('    chan<int> c;\n    c.write(1);\n    int x = c.read();\n    println(x);'));
+  assert.deepEqual(bad.codes, ['pj/channel-self-deadlock']);
+  assert.equal(bad.diagnostics[0].line, 4);
+  assert.match(bad.diagnostics[0].message, /both the writer and the reader of 'c', so this write blocks forever/);
+  // Same branch of a par is still one process; different branches are fine.
+  const sameBranch = run(MAIN('    chan<int> c;\n    par {\n        { c.write(1); println(c.read()); }\n        println("other");\n    }'));
+  assert.deepEqual(sameBranch.codes, ['pj/channel-self-deadlock']);
+  const ok = run(MAIN('    chan<int> c;\n    par {\n        c.write(1);\n        println(c.read());\n    }'));
+  assert.deepEqual(ok.codes, []);
+  const viaProc = run(MAIN('    chan<int> c;\n    par {\n        w(c.write);\n        println(c.read());\n    }', 'public void w(chan<int>.write o) { o.write(1); }'));
+  assert.deepEqual(viaProc.codes, []);
+});
+
+test('starving loops: infinite loops that never communicate, unless they can exit or call something that does', () => {
+  const bad = run(MAIN('    int n = 0;\n    while (true) { n++; }\n    for (;;) { println(n); }\n    do { n--; } while (true);'));
+  assert.deepEqual(bad.codes, ['pj/starving-loop', 'pj/starving-loop', 'pj/starving-loop']);
+  const ok = run(MAIN('    chan<int> c;\n    int n = 0;\n    par {\n        while (true) c.write(n);\n        while (true) { if (c.read() > 3) break; }\n        while (true) { helper(c.read); }\n        while (n < 10) n++;\n        for (;;) { n++; if (n > 5) return; }\n    }', 'public void helper(chan<int>.read in) { println(in.read()); }'));
+  assert.deepEqual(ok.codes.filter((c) => c === 'pj/starving-loop'), []);
+});
+
+test('par deadlock simulation: crossed orders, unmatched writes, and correct pairings', () => {
+  const crossed = run(MAIN('    chan<int> c;\n    chan<int> d;\n    par {\n        { c.write(1); int x = d.read(); println(x); }\n        { d.write(2); int y = c.read(); println(y); }\n    }'));
+  assert.deepEqual(crossed.codes, ['pj/par-deadlock']);
+  assert.match(crossed.diagnostics[0].message, /branch 1 waits to write 'c', branch 2 waits to write 'd'/);
+  const unmatched = run(MAIN('    chan<int> c;\n    par {\n        { c.write(1); c.write(2); }\n        println(c.read());\n    }'));
+  assert.deepEqual(unmatched.codes, ['pj/par-deadlock']);
+  assert.match(unmatched.diagnostics[0].message, /branch 1 waits to write 'c' but every other branch has finished/);
+  const fine = run(MAIN('    chan<int> c;\n    chan<int> d;\n    par {\n        { c.write(1); int x = d.read(); println(x); }\n        { int y = c.read(); d.write(y + 1); }\n    }'));
+  assert.deepEqual(fine.codes, []);
+  // Opaque branches (a loop, a call that takes a channel) switch the simulation off.
+  const opaque = run(MAIN('    chan<int> c;\n    par {\n        while (true) c.write(1);\n        println(c.read());\n    }'));
+  assert.deepEqual(opaque.codes, []);
+});
+
+test('par for: outer variables and non-shared ends are shared by every iteration', () => {
+  const r = run(MAIN('    chan<int> c;\n    int sum = 0;\n    par for (int i = 0; i < 3; i++) {\n        sum += i;\n        c.write(i);\n    }\n    for (int j = 0; j < 3; j++) println(c.read() + sum);'));
+  assert.deepEqual(r.codes.sort(), ['pj/parallel-usage', 'pj/shared-channel-end']);
+  assert.equal(r.diagnostics.find((d) => d.code === 'pj/shared-channel-end')?.fix?.kind, 'make-shared');
+});
+
+test('pri alt with skip before other guards, trivial alt and par, unreachable code, assignment in condition, string identity, barrier not enrolled', () => {
+  const r = run(MAIN('    int v = 0;\n    boolean b = true;\n    string s = "x";\n    string t = "y";\n    barrier bar;\n    pri alt {\n        skip : { v = 1; }\n        v = c.read() : { }\n    }\n    alt { v = c.read() : { } }\n    par { println(v); }\n    if (b = true) { }\n    if (s == "x") { }\n    if (s == t) { }\n    bar.sync();\n    return;\n    println(v);', 'public void f(chan<int>.read c) { }').replace('public void main(string[] args) {', 'public void main(string[] args) {\n    chan<int>.read c;'));
+  const codes = new Set(r.codes);
+  for (const c of ['pj/pri-alt-skip', 'pj/trivial-alt', 'pj/trivial-par', 'pj/unreachable', 'pj/assign-in-condition', 'pj/string-identity', 'pj/barrier-not-enrolled']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
+  assert.equal(r.diagnostics.filter((d) => d.code === 'pj/string-identity').length, 1, 's == t (two locals) is rewritten to equals by the compiler');
 });
 
 test('alt lints, unused and shadowed variables, reserved names, constants', () => {
