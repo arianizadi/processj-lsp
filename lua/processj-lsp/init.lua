@@ -1,7 +1,7 @@
 --- processj-lsp: Neovim integration for the ProcessJ language server.
 ---
 --- Install with lazy.nvim:
----   { "arianizadi/processj-lsp", build = "npm install && npm run build", ft = "processj", opts = {} }
+---   { "arianizadi/processj-lsp", build = "npm ci && npm run build", ft = "processj", opts = {} }
 ---
 --- The plugin registers the `processj` filetype (ftdetect/), bundles syntax
 --- highlighting and ftplugin settings, and starts the server from its own
@@ -40,7 +40,7 @@ function M.check_build()
   local server = M.root() .. "/dist/src/server.js"
   if vim.fn.filereadable(server) == 1 then return true end
   vim.notify(
-    "processj-lsp: server not built (missing dist/). Run `npm install && npm run build` in " .. M.root() .. " (with lazy.nvim: :Lazy build processj-lsp).",
+    "processj-lsp: server not built (missing dist/). Run `npm ci && npm run build` in " .. M.root() .. " (with lazy.nvim: :Lazy build processj-lsp).",
     vim.log.levels.WARN
   )
   return false

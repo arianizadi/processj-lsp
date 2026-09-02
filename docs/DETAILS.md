@@ -195,7 +195,7 @@ Add one plugin spec, for example in `~/.config/nvim/lua/plugins/processj.lua`:
 return {
   {
     "arianizadi/processj-lsp",
-    build = "npm install && npm run build",
+    build = "npm ci && npm run build",
     ft = "processj",
     opts = {},
   },
@@ -228,7 +228,7 @@ Java). `editor/nvim/lua/plugins/processj.lua` is a ready-made copy of the spec.
 
 ```sh
 git clone https://github.com/arianizadi/processj-lsp ~/.local/share/processj-lsp
-cd ~/.local/share/processj-lsp && npm install && npm run build
+cd ~/.local/share/processj-lsp && npm ci && npm run build
 ```
 
 Then in `init.lua`:

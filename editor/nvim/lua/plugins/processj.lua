@@ -5,7 +5,7 @@
 return {
   {
     "arianizadi/processj-lsp",
-    build = "npm install && npm run build",
+    build = "npm ci && npm run build",
     ft = "processj",
     opts = {
       init_options = {

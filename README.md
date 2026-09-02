@@ -17,7 +17,7 @@ Add this to your lazy.nvim plugins (AstroNvim: `~/.config/nvim/lua/plugins/proce
 return {
   {
     "arianizadi/processj-lsp",
-    build = "npm install && npm run build",
+    build = "npm ci && npm run build",
     ft = "processj",
     opts = {},
   },
@@ -85,7 +85,7 @@ opts = {
 
 ```sh
 git clone https://github.com/arianizadi/processj-lsp && cd processj-lsp
-npm install && npm run build
+npm ci && npm run build
 npm test
 ```
 

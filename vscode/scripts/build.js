@@ -12,7 +12,7 @@ const run = (cmd, cwd) => {
   execSync(cmd, { cwd, stdio: 'inherit' });
 };
 
-run('npm install', root);
+run('npm ci --no-audit --no-fund', root);
 run('npm run build', root);
 
 const server = path.join(here, 'server');
@@ -24,6 +24,6 @@ const rootPkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf
 fs.writeFileSync(path.join(server, 'package.json'), JSON.stringify({ name: 'processj-lsp-server', private: true, main: 'dist/src/server.js', dependencies: rootPkg.dependencies }, null, 2));
 run('npm install --omit=dev --no-audit --no-fund', server);
 
-run('npm install --no-audit --no-fund', here);
+run(fs.existsSync(path.join(here, 'package-lock.json')) ? 'npm ci --no-audit --no-fund' : 'npm install --no-audit --no-fund', here);
 run('npx tsc -p tsconfig.json', here);
 console.log('\nBuilt. Next: `npm run package` for a .vsix, or `npm run install-extension` to install it into VS Code.');
