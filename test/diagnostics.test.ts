@@ -99,7 +99,9 @@ test('a compiler crash on stderr becomes a diagnostic with the exception', () =>
   assert.equal(succeeded, false);
   assert.ok(crash);
   assert.equal(diagnostics.length, 1);
-  assert.match(diagnostics[0].message, /compiler crashed: java.lang.IllegalArgumentException: no such attribute: switchBlock/);
+  assert.match(diagnostics[0].message, /compiler crashed on this file/);
+  assert.equal(diagnostics[0].severity, 'warning');
+  assert.match(crash ?? '', /no such attribute: switchBlock/);
   assert.equal(diagnostics[0].line, 0);
 });
 

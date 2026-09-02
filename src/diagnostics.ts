@@ -155,8 +155,8 @@ export function parseCompilerOutput(stdout: string, stderr: string): ParsedOutpu
     crash = frame ? `${first} (${frame})` : first;
     diagnostics.push({
       line: 0,
-      message: `ProcessJ compiler crashed: ${crash}`,
-      severity: 'error',
+      message: 'The ProcessJ compiler crashed on this file, so it cannot be built; the code itself may be correct (details in the server log)',
+      severity: 'warning',
       code: 'crash',
       source: 'crash',
     });
