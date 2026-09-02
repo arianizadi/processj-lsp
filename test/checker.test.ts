@@ -169,7 +169,6 @@ test('concurrency lints from the AST: parallel usage, shared ends with fix, no w
   assert.deepEqual(byCode('pj/shared-channel-end'), [9]);
   assert.equal(r.diagnostics.find((d) => d.code === 'pj/shared-channel-end')?.fix?.kind, 'make-shared');
   assert.deepEqual(byCode('pj/channel-no-writer'), [15]);
-  assert.deepEqual(byCode('pj/short-circuit-read'), [16, 17]);
 });
 
 test('a channel written and read by the same sequential process is a self-deadlock', () => {
@@ -213,18 +212,18 @@ test('par for: outer variables and non-shared ends are shared by every iteration
   assert.equal(r.diagnostics.find((d) => d.code === 'pj/shared-channel-end')?.fix?.kind, 'make-shared');
 });
 
-test('pri alt with skip before other guards, trivial alt and par, unreachable code, assignment in condition, string identity, barrier not enrolled', () => {
+test('pri alt with skip before other guards, trivial alt and par, unreachable code, assignment in condition, barrier not enrolled', () => {
   const r = run(MAIN('    int v = 0;\n    boolean b = true;\n    string s = "x";\n    string t = "y";\n    barrier bar;\n    pri alt {\n        skip : { v = 1; }\n        v = c.read() : { }\n    }\n    alt { v = c.read() : { } }\n    par { println(v); }\n    if (b = true) { }\n    if (s == "x") { }\n    if (s == t) { }\n    bar.sync();\n    return;\n    println(v);', 'public void f(chan<int>.read c) { }').replace('public void main(string[] args) {', 'public void main(string[] args) {\n    chan<int>.read c;'));
   const codes = new Set(r.codes);
-  for (const c of ['pj/pri-alt-skip', 'pj/trivial-alt', 'pj/trivial-par', 'pj/unreachable', 'pj/assign-in-condition', 'pj/string-identity', 'pj/barrier-not-enrolled']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
-  assert.equal(r.diagnostics.filter((d) => d.code === 'pj/string-identity').length, 1, 's == t (two locals) is rewritten to equals by the compiler');
+  for (const c of ['pj/pri-alt-skip', 'pj/trivial-alt', 'pj/trivial-par', 'pj/unreachable', 'pj/assign-in-condition', 'pj/barrier-not-enrolled']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
+  assert.ok(!codes.has('pj/string-identity'));
 });
 
-test('alt lints, unused and shadowed variables, reserved names, constants', () => {
+test('unused and shadowed variables, constants; nothing about compiler internals', () => {
   const r = run(MAIN('    timer t;\n    int index = 0;\n    int dead;\n    int args = 1;\n    const int k = args;\n    alt {\n        v = c.read() : { }\n        t.timeout(100) : { }\n    }\n    alt { v = c.read() : { } }\n    t.timeout(5);\n    println(index + k);', 'public void f(chan<int>.read c, int v) { }').replace('public void main(string[] args) {', 'public void main(string[] args) {\n    chan<int>.read c; int v;'));
   const codes = new Set(r.codes);
-  for (const c of ['pj/alt-timeout', 'pj/multiple-alts', 'pj/reserved-alt-name', 'pj/timeout-noop', 'pj/unused', 'pj/shadows-parameter', 'pj/type/const-init']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
-  assert.equal(r.diagnostics.filter((d) => d.code === 'pj/timeout-noop').length, 1, 'the timeout inside the alt is not a no-op report');
+  for (const c of ['pj/unused', 'pj/shadows-parameter', 'pj/type/const-init']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
+  for (const c of ['pj/alt-timeout', 'pj/multiple-alts', 'pj/reserved-alt-name', 'pj/timeout-noop']) assert.ok(!codes.has(c), `${c} must not be reported`);
   assert.ok(r.messages.some((m) => /'dead' is never used/.test(m)));
 });
 

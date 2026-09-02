@@ -77,7 +77,7 @@ opts = {
 ## Good to know
 
 - The real compiler only runs on open and save, in a temp directory. Your `~/workingpj` is never touched.
-- The checker finds things the compiler does not: data races in `par`, a channel end used by two processes, a process reading its own channel, branches whose reads and writes cannot pair up, loops that starve every other process, `skip` shadowing the guards after it in a `pri alt`, `==` on strings. See `examples/` for one small program per message.
+- The checker finds things the compiler does not: data races in `par`, a channel end used by two processes, a process reading its own channel, branches whose reads and writes cannot pair up, loops that starve every other process, `skip` shadowing the guards after it in a `pri alt`. See `examples/` for one small program per message.
 - Files that import each other are re-checked when either changes; nothing is polled.
 - More: [docs/DETAILS.md](docs/DETAILS.md) covers every feature, the numbers, and how it works.
 

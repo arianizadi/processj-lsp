@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import { test } from 'node:test';
 import { check } from '../src/checker/checker';
 import { DeclIndex } from '../src/checker/index';
-import { resolveImports } from '../src/imports';
+import { importDiagnostics, resolveImports } from '../src/imports';
 import { parse } from '../src/parser/parser';
 
 const EXAMPLES = path.join(__dirname, '..', '..', 'examples');
@@ -35,8 +35,8 @@ test('examples produce exactly the diagnostics they announce', () => {
     for (const dep of res.files) index.addProgram(parse(fs.readFileSync(dep, 'utf8')).program, dep);
     const unresolved = res.imports.some((i) => i.files.length === 0);
     const r = check(parsed.program, { index, importsStd: res.importsStd, unresolvedImports: unresolved });
-    const actual = r.diagnostics
-      .filter((d) => d.severity !== 'info' || d.code === 'pj/timeout-noop')
+    const actual = [...importDiagnostics(res, true), ...r.diagnostics]
+      .filter((d) => d.severity !== 'info')
       .map((d) => d.code ?? '?')
       .sort();
     if (unresolved) problems.push(`${f}: unresolved import`);

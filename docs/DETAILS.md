@@ -95,20 +95,11 @@ why:
 | `pj/starving-loop`         | an infinite loop with no communication, sync, timeout, alt or par: the cooperative scheduler never runs anyone else |
 | `pj/pri-alt-skip`          | `skip` before other guards in a `pri alt`: those guards can never be chosen |
 | `pj/barrier-not-enrolled`  | `sync()` on a local barrier nothing enrolled on: returns immediately              |
-| `pj/string-identity`       | `==` on strings compares Java identity unless both sides are local variables (CodeGenJava.java:461) |
 | `pj/assign-in-condition`   | `if (b = true)`: assignment where a comparison was meant                            |
 | `pj/unreachable`           | code after `return`, `break`, `continue` or `stop` in the same block               |
 | `pj/trivial-par`, `pj/trivial-alt` | a `par` with one branch, an `alt` with one guard: nothing concurrent happens   |
-| `pj/short-circuit-read`    | `c.read()` on the right of `&&`, `\|\|`, `?:`: the compiler evaluates it unconditionally |
-| `pj/alt-timeout`           | a `timeout` guard in an `alt` is compiled as a blocking sleep before the alt        |
-| `pj/multiple-alts`         | a second `alt` in one proc makes javac fail on redeclared variables                 |
-| `pj/reserved-alt-name`     | a local named `index` or `btemp` next to an `alt` aliases generated code            |
-| `pj/timeout-noop`          | timeouts return immediately in this compiler build (`PJTimer.start()`)             |
 | `pj/shadows-parameter`     | a local with the same name as a parameter (silently accepted)                      |
 | `pj/unused`                | unused locals and parameters                                                        |
-| `pj/string-escape`         | `"\n"` in a string crashes the lexer                                                |
-| `pj/non-ascii`             | any non-ASCII byte, even in a comment, crashes the 7-bit lexer                      |
-| `pj/empty-comment`         | `/**/` is not a comment to the lexer                                                |
 | `pj/missing-import`        | `println` without `import std.*;`; quick fix adds the import                       |
 
 **Run and inspect from the editor.** Code lenses above `main` offer **▶ Run**,
@@ -332,3 +323,27 @@ vscode/             VS Code extension: `npm run install-extension` builds the se
 Apache License 2.0 (see `LICENSE`). The example programs under
 `test/fixtures/processj` come from the ProcessJ compiler repository, also Apache
 2.0, University of Nevada, Las Vegas (see `NOTICE`).
+
+## Validated against the real runtime
+
+`npm run validate` builds every example with the real compiler and runs it with a timeout. A program the checker says will block must hang; a clean program must finish. Result of the last run:
+
+| example | checker says | real program | result |
+| --- | --- | --- | --- |
+| `channel_direction.pj` | other | hangs (>8s) | n/a |
+| `channel_types.pj` | other | build failed at ProcessJc n/a | Exception in thread "main" java.lang.NullPointerException |
+| `clean_pipeline.pj` | clean | finishes | CONFIRMED |
+| `deadlock_read.pj` | blocks | hangs (>8s) | CONFIRMED |
+| `overloads.pj` | other | build failed at ProcessJc n/a | error[403]: Procedure 'twise' not found |
+| `par_deadlock.pj` | blocks | hangs (>8s) | CONFIRMED |
+| `par_for_shared.pj` | other | hangs (>8s) | n/a |
+| `parallel_usage.pj` | other | finishes | n/a |
+| `pri_alt_skip.pj` | other | hangs (>8s) | n/a |
+| `protocol_fields.pj` | other | build failed at ProcessJc n/a | Exception in thread "main" java.lang.NullPointerException |
+| `self_deadlock.pj` | blocks | hangs (>8s) | CONFIRMED |
+| `shared_channel.pj` | other | hangs (>8s) | n/a |
+| `starving_loop.pj` | blocks | hangs (>8s) | CONFIRMED |
+| `typos.pj` | other | build failed at ProcessJc n/a | error[405]: Symbol 'cuont' not found |
+| `use_import.pj` | clean | build failed at javac | MISMATCH |
+
+`other` rows are programs with type errors or races: some the compiler rejects, some it builds and they hang or misbehave at runtime, which is the point of the checker.

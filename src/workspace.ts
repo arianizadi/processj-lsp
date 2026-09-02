@@ -4,14 +4,17 @@
  * editor's buffer instead of disk (the server passes them in).
  */
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { astSymbols } from './astsymbols';
 import type * as A from './parser/ast';
 import { parse } from './parser/parser';
 import type { PJSymbol } from './symbols';
 
-const SKIP_DIRS = new Set(['node_modules', '.git', 'workingpj', '.workingpj', 'dist', 'bin', 'build']);
-const MAX_DEPTH = 8;
+const SKIP_DIRS = new Set(['node_modules', '.git', 'workingpj', '.workingpj', 'dist', 'bin', 'build', 'Library', 'Applications']);
+const MAX_DEPTH = 6;
+/** Stop indexing a root once it holds this many .pj files; it is not a project, it is a disk. */
+const MAX_FILES = 2000;
 
 interface Entry {
   mtimeMs: number;
@@ -32,7 +35,10 @@ export class WorkspaceIndex {
   watched = false;
 
   setRoots(roots: string[]): void {
-    this.roots = roots.map((r) => path.resolve(r));
+    // The home directory or a filesystem root is never a project: indexing it would
+    // walk the whole disk and mix unrelated files into every lookup.
+    const home = path.resolve(os.homedir());
+    this.roots = roots.map((r) => path.resolve(r)).filter((r) => r !== home && r !== path.parse(r).root);
     this.lastRefresh = 0;
   }
 
@@ -112,7 +118,7 @@ export class WorkspaceIndex {
   }
 
   private walk(dir: string, depth: number, seen: Set<string>): void {
-    if (depth > MAX_DEPTH) return;
+    if (depth > MAX_DEPTH || seen.size >= MAX_FILES) return;
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });

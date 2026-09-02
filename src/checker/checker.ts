@@ -105,8 +105,6 @@ class Checker {
   private procRet: Type = T.void;
   private loopDepth = 0;
   private switchDepth = 0;
-  private altCount = 0;
-  private altSpans: A.Span[] = [];
   /** Protocol variable -> case tag known to hold in the current region. */
   private activeCase = new Map<VarInfo, string>();
   private branchStack: BranchUse[] = [];
@@ -253,8 +251,6 @@ class Checker {
   private procDecl(d: A.ProcDecl): void {
     this.proc = d;
     this.procRet = this.resolveType(d.returnType);
-    this.altCount = 0;
-    this.altSpans = [];
     this.chanUses = new Map();
     this.activeCase = new Map();
     this.enrolled = new Set();
@@ -288,11 +284,6 @@ class Checker {
       else if (use.writes && !use.reads) this.warn(use.writes, 'pj/channel-no-reader', `Nothing ever reads '${v.name}', so this write blocks forever`);
       else if (use.reads && use.writes && use.branches.size <= 1 && use.first) {
         this.warn(use.first, 'pj/channel-self-deadlock', `This process is both the writer and the reader of '${v.name}', so this ${use.first === use.writes ? 'write' : 'read'} blocks forever. Put the two sides in different branches of a par.`);
-      }
-    }
-    if (this.altCount > 0) {
-      for (const v of this.allVars) {
-        if (v.proc === d.name.name && (v.name === 'index' || v.name === 'btemp')) this.warn(v.decl.span, 'pj/reserved-alt-name', `'${v.name}' clashes with a variable the alt code generator creates; rename it`);
       }
     }
     for (const sim of this.pendingSims) this.runSimulation(sim.par, sim.queues);
@@ -681,9 +672,6 @@ class Checker {
   }
 
   private altStmt(s: A.AltStmt): void {
-    this.altCount++;
-    this.altSpans.push(s.span);
-    if (this.altCount === 2) this.warn(s.span, 'pj/multiple-alts', `Second alt in '${this.proc?.name.name}': the compiler's generated Java fails on it. Put each alt in its own proc.`);
     this.insideAlt++;
     this.push();
     if (s.replicated) {
@@ -714,8 +702,7 @@ class Checker {
           case 'SkipGuard':
             break;
           case 'TimeoutGuard':
-            this.warn(c.guard.span, 'pj/alt-timeout', 'The compiler turns this timeout guard into a sleep before the alt: the channel guards are not watched until it ends.');
-            this.timeout(c.guard.timeout, true);
+            this.timeout(c.guard.timeout);
             break;
           case 'ReadGuard': {
             const vt = this.chanRead(c.guard.read);
@@ -1018,8 +1005,6 @@ class Checker {
         this.condition(e.cond, '?:');
         const a = this.expr(e.then);
         const b = this.expr(e.else);
-        this.warnShortCircuit(e.then, '?:');
-        this.warnShortCircuit(e.else, '?:');
         if (isLenient(a)) return b;
         if (isLenient(b)) return a;
         if (isNumeric(a) && isNumeric(b)) return promote(a, b);
@@ -1091,7 +1076,7 @@ class Checker {
         return T.void;
       }
       case 'Timeout':
-        return this.timeout(e, false);
+        return this.timeout(e);
       case 'NewArray': {
         const elem = this.resolveType(e.elem);
         for (const d of e.dimExprs) {
@@ -1165,12 +1150,11 @@ class Checker {
     }
   }
 
-  private timeout(e: A.Timeout, inAlt: boolean): Type {
+  private timeout(e: A.Timeout): Type {
     const t = this.expr(e.target);
     const d = this.expr(e.delay);
     if (!isLenient(t) && !isPrim(t, 'timer')) this.error(e.target.span, 'pj/type/timer', `'.timeout()' needs a timer; ${exprText(e.target)} is ${typeStr(t)}`);
     if (!isLenient(d) && !isIntegral(d)) this.error(e.delay.span, 'pj/type/timer', `The timeout delay must be an integer number of milliseconds, not ${typeStr(d)}`);
-    if (!inAlt) this.report(e.span, 'info', 'pj/timeout-noop', 'In this ProcessJ build timeouts return immediately (PJTimer bug); the delay is ignored at runtime');
     return T.void;
   }
 
@@ -1264,7 +1248,6 @@ class Checker {
   private binary(e: A.BinaryExpr): Type {
     const l = this.expr(e.left);
     const r = this.expr(e.right);
-    if (e.op === '&&' || e.op === '||') this.warnShortCircuit(e.right, e.op);
     if (isLenient(l) || isLenient(r)) {
       if (['<', '>', '<=', '>=', '==', '!=', '&&', '||'].includes(e.op)) return T.boolean;
       if (e.op === '+' && (isPrim(l, 'string') || isPrim(r, 'string'))) return T.string;
@@ -1292,14 +1275,6 @@ class Checker {
         return this.error(e.span, 'pj/type/operator', `'${e.op}' compares numbers; here the operands are ${typeStr(l)} and ${typeStr(r)}`);
       case '==':
       case '!=':
-        if (isPrim(l, 'string') && isPrim(r, 'string')) {
-          // CodeGenJava.java:461 rewrites == to .equals only when BOTH sides are local string variables.
-          const isLocalVar = (x: A.Expr) => x.kind === 'NameExpr' && !!this.resolutions.get(x) && !this.resolutions.get(x)!.isParam;
-          if (!(isLocalVar(e.left) && isLocalVar(e.right))) {
-            this.warn(e.span, 'pj/string-identity', `'${e.op}' on strings compares identity here (${e.op === '==' ? 'almost always false' : 'almost always true'}); use ${e.op === '!=' ? '!' : ''}equals(a, b) from std`);
-          }
-          return T.boolean;
-        }
         if ((isNumeric(l) && isNumeric(r)) || (isPrim(l, 'boolean') && isPrim(r, 'boolean'))) return T.boolean;
         if (l.k === 'null' && isReference(r)) return T.boolean;
         if (r.k === 'null' && isReference(l)) return T.boolean;
@@ -1451,10 +1426,6 @@ class Checker {
     if (!isLenient(et) && !sameType(et, t)) this.error(e.span, `pj/type/${t.k === 'prim' ? t.name : t.k}`, `'${owner}' needs a ${typeStr(t)}; ${exprText(e)} is ${typeStr(et)}`);
   }
 
-  private warnShortCircuit(e: A.Expr, op: string): void {
-    const read = findRead(e);
-    if (read) this.warn(read.span, 'pj/short-circuit-read', `The compiler performs this read even when '${op}' would skip it; move the read to its own statement`);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,29 +1525,6 @@ function isLiteralInit(e: A.Expr): boolean {
       return e.elements.every(isLiteralInit);
     default:
       return false;
-  }
-}
-
-function findRead(e: A.Expr): A.ChanRead | undefined {
-  switch (e.kind) {
-    case 'ChanRead':
-      return e;
-    case 'ParenExpr':
-      return findRead(e.expr);
-    case 'BinaryExpr':
-      return findRead(e.left) ?? findRead(e.right);
-    case 'UnaryExpr':
-      return findRead(e.operand);
-    case 'CastExpr':
-      return findRead(e.expr);
-    case 'Invocation':
-      for (const a of e.args) {
-        const r = findRead(a);
-        if (r) return r;
-      }
-      return undefined;
-    default:
-      return undefined;
   }
 }
 

@@ -79,7 +79,7 @@ test('alt guard errors are specific', () => {
 test('top-level typos and stale proc keyword', () => {
   const msgs = parse('pubic void f() { }\nproc void g() { }\n').errors.map((e) => e.message);
   assert.ok(msgs.some((m) => /Unknown declaration 'pubic'; did you mean 'public'\?/.test(m)), msgs.join('\n'));
-  assert.ok(msgs.some((m) => /'proc' is not accepted/.test(m)), msgs.join('\n'));
+  assert.ok(msgs.some((m) => /'proc' is not part of the syntax/.test(m)), msgs.join('\n'));
 });
 
 test('AST shapes: channel types, nested generics, casts, literals, extended rendezvous', () => {

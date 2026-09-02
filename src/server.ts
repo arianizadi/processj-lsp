@@ -49,14 +49,14 @@ import {
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 
-import { lexDiagnostics, type FixHint, type LintDiagnostic } from './analysis';
+import type { FixHint, LintDiagnostic } from './analysis';
 import { astSymbols } from './astsymbols';
 import { check, type CheckResult } from './checker/checker';
-import { DeclIndex } from './checker/index';
+import { DeclIndex, signatureStr } from './checker/index';
 import { typeStr } from './checker/types';
 import { compile } from './compiler';
 import { format } from './format';
-import { resolveImports } from './imports';
+import { importDiagnostics, resolveImports } from './imports';
 import type * as A from './parser/ast';
 import { parse, type ParseResult } from './parser/parser';
 import { semanticTokens, TOKEN_MODIFIERS, TOKEN_TYPES } from './semantic';
@@ -312,10 +312,9 @@ function lintDiagnostics(doc: TextDocument): Diagnostic[] {
     const raw: LintDiagnostic = { line: e.line, startCol: e.col, endCol: e.endCol, message: e.message, severity: 'error', code: 'pj/syntax', source: 'parser', fix };
     return makeDiagnostic(doc, raw);
   });
-  const lex = lexDiagnostics(doc.getText()).map((d) => makeDiagnostic(doc, d));
-  if (!settings.lint) return [...syntax, ...lex];
+  if (!settings.lint) return syntax;
   const { checked, importDiags } = checkFor(doc);
-  return [...syntax, ...lex, ...importDiags.map((d) => makeDiagnostic(doc, d)), ...checked.diagnostics.map((d) => makeDiagnostic(doc, d))];
+  return [...syntax, ...importDiags.map((d) => makeDiagnostic(doc, d)), ...checked.diagnostics.map((d) => makeDiagnostic(doc, d))];
 }
 
 /** Type-check a document against its own declarations, its imports and the standard library. */
@@ -332,15 +331,8 @@ function checkFor(doc: TextDocument): { checked: CheckResult; index: DeclIndex; 
     const program = open && open.uri !== doc.uri ? parsedFor(open).program : (libraryPrograms.get(file) ?? workspace.programFor(file));
     if (program) index.addProgram(program, file);
   }
-  const importDiags: LintDiagnostic[] = [];
-  let unresolved = false;
-  for (const r of resolution.imports) {
-    if (r.files.length > 0) continue;
-    unresolved = true;
-    const name = r.import.path.map((p) => p.name).join('.') + (r.import.wildcard ? '.*' : '');
-    const where = install ? '' : ' (no ProcessJ install found, so the standard library is unavailable)';
-    importDiags.push({ line: r.import.span.start.line, startCol: r.import.span.start.col, endCol: r.import.span.end.col, message: `Cannot find import '${name}'${where}; looked in ${r.searched.map((d) => path.basename(d) || d).join(', ')}`, severity: 'warning', code: 'pj/import', source: 'lsp' });
-  }
+  const importDiags: LintDiagnostic[] = importDiagnostics(resolution, !!install);
+  const unresolved = resolution.imports.some((r) => r.files.length === 0);
   const checked = check(parsed.program, { index, stdIndex, importsStd: resolution.importsStd, unresolvedImports: unresolved });
   const entry = { version: doc.version, checked, index, importDiags, deps: new Set(resolution.files.map((f) => path.resolve(f))) };
   checkCache.set(doc.uri, entry);
@@ -786,12 +778,20 @@ connection.onCompletion((params: CompletionParams) => {
     add({ label: s.name, kind: completionKind(s), detail: s.detail, documentation: s.doc });
     for (const c of s.children ?? []) add({ label: c.name, kind: completionKind(c), detail: c.detail });
   }
+  // Imported declarations (typed, from the checker's index), then the rest of the workspace for navigation-style completion.
+  const { index } = checkFor(doc);
+  const ownNames = new Set(symbols.map((s) => s.name));
+  for (const [name, sigs] of index.procs) {
+    if (ownNames.has(name)) continue;
+    for (const sig of sigs) add({ label: name, kind: CompletionItemKind.Function, detail: signatureStr(sig) + (sig.file ? `  (${path.basename(sig.file, '.pj')})` : '') });
+  }
+  for (const [name, r] of index.records) if (!ownNames.has(name)) add({ label: name, kind: CompletionItemKind.Struct, detail: `record ${name}` + (r.file ? `  (${path.basename(r.file, '.pj')})` : '') });
+  for (const [name, pr] of index.protocols) if (!ownNames.has(name)) add({ label: name, kind: CompletionItemKind.Enum, detail: `protocol ${name}` + (pr.file ? `  (${path.basename(pr.file, '.pj')})` : '') });
+  for (const [name, c] of index.consts) if (!ownNames.has(name)) add({ label: name, kind: CompletionItemKind.Constant, detail: `const ${typeStr(c.type)} ${name}` });
   const ownPath = safeFileUri(doc.uri);
   for (const { file, symbol } of workspace.all(ownPath)) {
+    if (symbol.kind === 'proc' && symbol.name === 'main') continue; // every program has one; never useful to complete
     add({ label: symbol.name, kind: completionKind(symbol), detail: `${symbol.detail}  (${path.basename(file)})`, documentation: symbol.doc });
-  }
-  for (const lib of library) {
-    add({ label: lib.name, kind: completionKind(lib), detail: `${lib.detail}  (${lib.pkg}.${lib.module})`, documentation: lib.doc });
   }
   for (const [label, insert, detail] of SNIPPETS) {
     add({ label, kind: CompletionItemKind.Snippet, insertText: insert, insertTextFormat: InsertTextFormat.Snippet, detail, sortText: `zz${label}` });
@@ -983,21 +983,25 @@ connection.onSignatureHelp((params: SignatureHelpParams): SignatureHelp | null =
   const call = findCallContext(doc, params.position);
   if (!call) return null;
 
-  const { symbols } = symbolsFor(doc);
-  const candidates: PJSymbol[] = [
-    ...symbols.filter((s) => s.kind === 'proc' && s.name === call.name),
-    ...workspace.lookup(call.name, safeFileUri(doc.uri)).map((h) => h.symbol).filter((s) => s.kind === 'proc'),
-    ...library.filter((l) => l.kind === 'proc' && l.name === call.name),
-  ];
-  if (candidates.length === 0) return null;
-
-  const signatures: SignatureInformation[] = candidates.map((c) => ({
-    label: c.detail,
-    documentation: c.doc,
-    parameters: (c.params ?? []).map((p): ParameterInformation => ({ label: p })),
-  }));
-  const active = Math.max(0, signatures.findIndex((s) => (s.parameters?.length ?? 0) > call.argIndex));
-  return { signatures, activeSignature: active, activeParameter: call.argIndex };
+  // Candidates come from what this file can actually call: its own procs, its imports, the std library.
+  const { index } = checkFor(doc);
+  const sigs = index.procs.get(call.name) ?? [];
+  if (sigs.length === 0) return null;
+  const seen = new Set<string>();
+  const signatures: SignatureInformation[] = [];
+  for (const sig of sigs) {
+    const label = signatureStr(sig);
+    if (seen.has(label)) continue;
+    seen.add(label);
+    signatures.push({
+      label,
+      parameters: sig.params.map((p, i): ParameterInformation => ({ label: `${typeStr(p)} ${sig.paramNames[i]}` })),
+    });
+  }
+  // Show the overloads that can still take the argument being typed first.
+  const fits = (s: SignatureInformation) => (s.parameters?.length ?? 0) > call.argIndex;
+  signatures.sort((a, b) => Number(fits(b)) - Number(fits(a)));
+  return { signatures, activeSignature: 0, activeParameter: call.argIndex };
 });
 
 /** Walk backwards from the cursor to the unmatched `(` and the identifier before it. */

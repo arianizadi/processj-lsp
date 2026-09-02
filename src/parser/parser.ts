@@ -372,7 +372,7 @@ class Parser {
     if (this.at('proc')) {
       const t = this.peek();
       const gap = this.peek(1).line === t.line ? this.peek(1).col : t.end;
-      this.error(t, "'proc' is not accepted by the current compiler; write the return type and name directly, e.g. 'public void main(string[] args)'", { title: "Remove 'proc'", line: t.line, col: t.col, endCol: gap, text: '' });
+      this.error(t, "'proc' is not part of the syntax; write the return type and name directly, e.g. 'public void main(string[] args)'", { title: "Remove 'proc'", line: t.line, col: t.col, endCol: gap, text: '' });
       this.next();
     }
 
@@ -741,7 +741,7 @@ class Parser {
           this.accept(':');
           return undefined;
         case 'proc':
-          this.error(t, "'proc' is not accepted by the current compiler; declare procedures at top level as 'public void name(...)'");
+          this.error(t, "'proc' is not part of the syntax; declare procedures at top level as 'public void name(...)'");
           this.next();
           return undefined;
       }

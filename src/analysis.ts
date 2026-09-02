@@ -1,10 +1,9 @@
 /**
- * Lexer-level diagnostics. Every other lint now lives in the type checker
- * (src/checker/checker.ts), which works on real scopes and types; what remains
- * here are the problems the compiler's 7-bit JFlex scanner has with the raw text.
+ * Shared diagnostic shapes for the checker and the server. The checker
+ * (src/checker/checker.ts) produces every language-level diagnostic; this file
+ * only holds the types they share with the compiler-output parser.
  */
 import type { RawDiagnostic } from './diagnostics';
-import { tokenize } from './tokens';
 
 export interface FixHint {
   kind: 'add-import' | 'make-shared' | 'edit';
@@ -17,15 +16,3 @@ export interface FixHint {
 }
 
 export type LintDiagnostic = RawDiagnostic & { fix?: FixHint };
-
-export function lexDiagnostics(text: string): LintDiagnostic[] {
-  return tokenize(text).issues.map((issue) => ({
-    line: issue.line,
-    startCol: issue.col,
-    endCol: issue.end,
-    message: issue.message,
-    severity: 'error' as const,
-    code: issue.code,
-    source: 'lsp' as const,
-  }));
-}

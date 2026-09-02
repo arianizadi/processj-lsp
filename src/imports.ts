@@ -15,6 +15,32 @@ export interface ResolvedImport {
   files: string[];
   /** Directories that were searched, for the diagnostic. */
   searched: string[];
+  /** Found outside the install's include directory: a user library the compiler cannot build against. */
+  userLibrary: boolean;
+}
+
+export interface ImportDiagnostic {
+  line: number;
+  startCol: number;
+  endCol: number;
+  message: string;
+  severity: 'warning';
+  code: 'pj/import';
+  source: 'lsp';
+}
+
+/** Warnings about imports that resolve nowhere. */
+export function importDiagnostics(res: ImportResolution, haveInstall: boolean): ImportDiagnostic[] {
+  const out: ImportDiagnostic[] = [];
+  for (const r of res.imports) {
+    const name = r.import.path.map((p) => p.name).join('.') + (r.import.wildcard ? '.*' : '');
+    const span = r.import.span;
+    if (r.files.length === 0) {
+      const where = haveInstall ? '' : ' (no ProcessJ install found, so the standard library is unavailable)';
+      out.push({ line: span.start.line, startCol: span.start.col, endCol: span.end.col, message: `Cannot find import '${name}'${where}; looked in ${r.searched.map((d) => path.basename(d) || d).join(', ')}`, severity: 'warning', code: 'pj/import', source: 'lsp' });
+    }
+  }
+  return out;
 }
 
 export interface ImportResolution {
@@ -44,20 +70,24 @@ export function resolveImports(program: A.Program, ownPath: string | undefined, 
     if (parts[0] === 'std') importsStd = true;
     const found: string[] = [];
     const searched: string[] = [];
+    let userLibrary = false;
     for (const base of bases) {
       const target = path.join(base, ...parts);
       searched.push(base);
+      const inInclude = !!includeDir && base.startsWith(includeDir);
       if (im.wildcard) {
         if (isDir(target)) {
           for (const f of listPj(target)) found.push(f);
+          userLibrary = !inInclude;
           break;
         }
       } else if (isFile(`${target}.pj`)) {
         found.push(`${target}.pj`);
+        userLibrary = !inInclude;
         break;
       }
     }
-    imports.push({ import: im, files: found, searched });
+    imports.push({ import: im, files: found, searched, userLibrary });
     for (const f of found) if (!files.includes(f)) files.push(f);
   }
   return { imports, files, importsStd };

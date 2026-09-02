@@ -22,7 +22,7 @@ function M.default_config()
   return {
     cmd = { "node", M.root() .. "/bin/processj-lsp.js", "--stdio" },
     filetypes = { "processj" },
-    root_markers = { ".git", "processjrc" },
+    root_markers = { ".git" },
     workspace_required = false,
     init_options = {
       -- installDir = "~/Documents/ProcessJ", -- defaults to installdir in ~/processjrc or $PROCESSJ_HOME
