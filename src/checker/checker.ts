@@ -40,6 +40,8 @@ export interface CheckOptions {
   importsStd?: boolean;
   /** Names of imports that could not be resolved (their symbols are unknown, so stay quiet about them). */
   unresolvedImports?: boolean;
+  /** Source text, used to build quick fixes that rewrite a statement. */
+  text?: string;
 }
 
 export interface CheckResult {
@@ -120,9 +122,26 @@ class Checker {
   /** Par blocks whose straight-line branches are simulated once the whole proc is known. */
   private pendingSims: Array<{ par: A.ParBlock; queues: Op[][] }> = [];
 
+  private readonly lines: string[] | undefined;
+
   constructor(private readonly opts: CheckOptions) {
     this.index = opts.index;
     this.yields = new YieldAnalysis(this.index);
+    this.lines = opts.text?.split('\n');
+  }
+
+  /** Source text of a span, when the text was provided. */
+  private slice(span: A.Span): string | undefined {
+    if (!this.lines) return undefined;
+    if (span.start.line === span.end.line) return this.lines[span.start.line]?.slice(span.start.col, span.end.col);
+    const parts = [this.lines[span.start.line]?.slice(span.start.col) ?? ''];
+    for (let l = span.start.line + 1; l < span.end.line; l++) parts.push(this.lines[l] ?? '');
+    parts.push(this.lines[span.end.line]?.slice(0, span.end.col) ?? '');
+    return parts.join('\n');
+  }
+
+  private indentOf(line: number): string {
+    return /^\s*/.exec(this.lines?.[line] ?? '')?.[0] ?? '';
   }
 
   // -------------------------------------------------------------------------
@@ -474,6 +493,30 @@ class Checker {
     let inner = e;
     while (inner.kind === 'ParenExpr') inner = inner.expr;
     if (inner.kind === 'AssignExpr' && inner.op === '=' && isPrim(t, 'boolean')) this.warn(e.span, 'pj/assign-in-condition', `This assigns '${exprText(inner.target)}' instead of comparing it; did you mean '=='?`);
+    let call: A.Expr = inner;
+    let negated = false;
+    while (call.kind === 'UnaryExpr' && call.op === '!' && call.prefix) {
+      negated = !negated;
+      call = call.operand;
+      while (call.kind === 'ParenExpr') call = call.expr;
+    }
+    if (call.kind === 'Invocation' && (owner === 'if' || owner === 'while' || owner === 'do ... while' || owner === 'for')) {
+      const fix: FixHint | undefined = negated ? undefined : { kind: 'edit', title: "Compare with '== true'", line: call.span.end.line, col: call.span.end.col, endCol: call.span.end.col, text: ' == true' };
+      this.error(e.span, 'pj/call-as-condition', `A call cannot be the whole condition of '${owner}'; compare its result (${negated ? `${exprText(call)} == false` : `${exprText(call)} == true`}) or store it in a boolean first`, fix);
+    }
+  }
+
+  /** Quick fix for `x.write(... c.read() ...)`: read into a variable on the line above, then write it. */
+  private hoistReadFix(write: A.ChanWrite, read: A.ChanRead): FixHint | undefined {
+    const stmtText = this.slice(write.span);
+    const readText = this.slice(read.span);
+    if (!stmtText || !readText || read.span.start.line !== read.span.end.line || write.span.start.line !== write.span.end.line) return undefined;
+    const t = this.types.get(read);
+    if (!t || isLenient(t)) return undefined;
+    const name = `read${read.span.start.line + 1}`;
+    const indent = this.indentOf(write.span.start.line);
+    const rewritten = stmtText.replace(readText, name);
+    return { kind: 'edit', title: `Read into '${name}' first`, line: write.span.start.line, col: write.span.start.col, endCol: write.span.end.col, text: `${typeStr(t)} ${name} = ${readText};\n${indent}${rewritten}` };
   }
 
   private localDecl(d: A.LocalDecl): void {
@@ -930,6 +973,8 @@ class Checker {
         this.condition(e.cond, '?:');
         const a = this.expr(e.then);
         const b = this.expr(e.else);
+        const nested = findRead(e.then) ?? findRead(e.else) ?? findRead(e.cond);
+        if (nested) this.error(nested.span, 'pj/read-placement', "A channel read cannot be part of a '?:' expression; read it into a variable first");
         if (isLenient(a)) return b;
         if (isLenient(b)) return a;
         if (isNumeric(a) && isNumeric(b)) return promote(a, b);
@@ -985,6 +1030,8 @@ class Checker {
         const t = this.expr(e.target);
         this.noteChannel(e.target, 'write');
         const v = this.expr(e.value);
+        const nested = findRead(e.value);
+        if (nested) this.error(nested.span, 'pj/read-placement', "A channel read cannot be part of a write's value; read it into a variable first", this.hoistReadFix(e, nested));
         if (isLenient(t)) return T.void;
         if (t.k !== 'chan') return this.error(e.target.span, 'pj/type/channel', `${exprText(e.target)} is ${typeStr(t)}, not a channel; '.write' needs a channel or a write end`);
         if (t.end === 'read') return this.error(e.span, 'pj/channel-direction', `'${exprText(e.target)}' is a read end (${typeStr(t)}); it cannot write`);
@@ -1450,6 +1497,50 @@ function isLiteralInit(e: A.Expr): boolean {
       return e.elements.every(isLiteralInit);
     default:
       return false;
+  }
+}
+
+/** The first channel read inside an expression, if any. */
+function findRead(e: A.Expr): A.ChanRead | undefined {
+  switch (e.kind) {
+    case 'ChanRead':
+      return e;
+    case 'ParenExpr':
+    case 'CastExpr':
+      return findRead(e.expr);
+    case 'BinaryExpr':
+      return findRead(e.left) ?? findRead(e.right);
+    case 'UnaryExpr':
+      return findRead(e.operand);
+    case 'AssignExpr':
+      return findRead(e.value);
+    case 'TernaryExpr':
+      return findRead(e.cond) ?? findRead(e.then) ?? findRead(e.else);
+    case 'Invocation':
+      for (const a of e.args) {
+        const r = findRead(a);
+        if (r) return r;
+      }
+      return undefined;
+    case 'RecordAccess':
+      return findRead(e.target);
+    case 'ArrayAccess':
+      return findRead(e.target) ?? findRead(e.index);
+    case 'RecordLiteral':
+    case 'ProtocolLiteral':
+      for (const f of e.fields) {
+        const r = findRead(f.value);
+        if (r) return r;
+      }
+      return undefined;
+    case 'ArrayLiteral':
+      for (const x of e.elements) {
+        const r = findRead(x);
+        if (r) return r;
+      }
+      return undefined;
+    default:
+      return undefined;
   }
 }
 

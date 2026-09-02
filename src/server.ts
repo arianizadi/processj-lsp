@@ -334,7 +334,7 @@ function checkFor(doc: TextDocument): { checked: CheckResult; index: DeclIndex; 
   }
   const importDiags: LintDiagnostic[] = importDiagnostics(resolution, !!install);
   const unresolved = resolution.imports.some((r) => r.files.length === 0);
-  const checked = check(parsed.program, { index, stdIndex, importsStd: resolution.importsStd, unresolvedImports: unresolved });
+  const checked = check(parsed.program, { index, stdIndex, importsStd: resolution.importsStd, unresolvedImports: unresolved, text: doc.getText() });
   const entry = { version: doc.version, checked, index, importDiags, deps: new Set(resolution.files.map((f) => path.resolve(f))) };
   checkCache.set(doc.uri, entry);
   return entry;

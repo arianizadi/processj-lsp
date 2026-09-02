@@ -1,0 +1,23 @@
+// expect: pj/read-placement, pj/read-placement, pj/call-as-condition
+import std.*;
+
+public boolean ready(int n) { return n > 0; }
+
+// A channel read must be its own statement: not inside `?:` and not inside a
+// write's value. A call cannot be the whole condition of an if; compare its
+// result. Each has a quick fix.
+public void main(string[] args) {
+    chan<int> c;
+    chan<int> d;
+    boolean flag = true;
+    par {
+        c.write(1);
+        { int x = flag ? c.read() : 7; println(x); }
+    }
+    par {
+        c.write(2);
+        d.write(c.read() + 1);
+        println(d.read());
+    }
+    if (ready(1)) println("ready");
+}

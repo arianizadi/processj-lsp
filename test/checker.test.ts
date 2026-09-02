@@ -28,7 +28,7 @@ export function run(src: string, opts: { std?: boolean } = {}) {
   index.addProgram(parsed.program, 'test.pj');
   const importsStd = /import\s+std\b/.test(src);
   if (opts.std !== false && importsStd) index.addIndex(STD);
-  const result = check(parsed.program, { index, stdIndex: STD, importsStd });
+  const result = check(parsed.program, { index, stdIndex: STD, importsStd, text: src });
   return { ...result, codes: result.diagnostics.map((d) => d.code), messages: result.diagnostics.map((d) => `${d.line + 1}: ${d.message}`), errors: result.diagnostics.filter((d) => d.severity === 'error') };
 }
 
@@ -224,6 +224,17 @@ test('a procedure that suspends only through calls gets a [yield=true] quick fix
   const hits = r.diagnostics.filter((d) => d.code === 'pj/needs-yield-annotation');
   assert.deepEqual(hits.map((d) => d.line + 1), [5, 9]);
   assert.deepEqual(hits[0].fix, { kind: 'edit', title: 'Add [yield=true]', line: 4, col: 20, endCol: 20, text: '[yield=true] ' });
+});
+
+test('reads that must be their own statement: inside ?:, inside a write value; calls as whole conditions', () => {
+  const r = run(MAIN('    chan<int> c;\n    chan<int> d;\n    boolean flag = true;\n    par {\n        c.write(1);\n        { int x = flag ? c.read() : 7; println(x); }\n    }\n    par {\n        c.write(2);\n        d.write(c.read() + 1);\n        println(d.read());\n    }\n    if (ready(1)) println("r");\n    while (!ready(2)) { break; }\n    if (ready(3) && flag) println("fine");', 'public boolean ready(int n) { return n > 0; }'));
+  const placement = r.diagnostics.filter((d) => d.code === 'pj/read-placement');
+  assert.deepEqual(placement.map((d) => d.line + 1), [9, 13]);
+  assert.equal(placement[1].fix?.title, "Read into 'read13' first");
+  assert.equal(placement[1].fix?.text, 'int read13 = c.read();\n        d.write(read13 + 1)');
+  const calls = r.diagnostics.filter((d) => d.code === 'pj/call-as-condition');
+  assert.deepEqual(calls.map((d) => d.line + 1), [16, 17]);
+  assert.equal(calls[0].fix?.text, ' == true');
 });
 
 test('unused and shadowed variables, constants; nothing about compiler internals', () => {
