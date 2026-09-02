@@ -2,7 +2,7 @@
   "name": "processj-lsp-vscode",
   "displayName": "ProcessJ",
   "description": "ProcessJ language support: diagnostics, type checking, formatting, semantic highlighting, run from the editor.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "arianizadi",
   "license": "Apache-2.0",
   "repository": {

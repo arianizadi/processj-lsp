@@ -1,5 +1,4 @@
 // expect: none
-// notes: pj/note-narrow-literal, pj/note-par-gc, pj/note-par-gc, pj/note-par-gc
 import std.*;
 
 record Box { int value; }

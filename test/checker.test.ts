@@ -286,7 +286,7 @@ test('every confirmed compiler bug that depends on the code is reported at its p
   ));
   const lines = r.diagnostics.map((d) => `${d.line + 1}:${d.code}`);
   // Line numbers: MAIN adds two lines (import + extra decls) before the body.
-  const want = ['3:pj/compiler-limit', '7:pj/compiler-limit', '8:pj/note-narrow-literal', '9:pj/note-semicolon-string', '10:pj/note-ignored-statement', '11:pj/note-par-gc', '12:pj/note-par-loop-calls', '13:pj/compiler-limit', '17:pj/compiler-limit', '19:pj/read-placement', '20:pj/read-placement', '21:pj/read-placement', '22:pj/note-par-gc', '24:pj/note-ignored-statement'];
+  const want = ['3:pj/compiler-limit', '7:pj/compiler-limit', '13:pj/compiler-limit', '17:pj/compiler-limit', '19:pj/read-placement', '20:pj/read-placement', '21:pj/read-placement'];
   for (const w of want) assert.ok(lines.includes(w), `${w} in ${lines.join(' ')}`);
   // Comparing with null is fine and reads inside an index on the right-hand side are fine.
   assert.equal(lines.filter((l) => l.startsWith('23:')).length, 0, lines.join(' '));
@@ -298,7 +298,6 @@ test('unused and shadowed variables, constants; nothing about compiler internals
   const r = run(MAIN('    timer t;\n    int index = 0;\n    int dead;\n    int args = 1;\n    const int k = args;\n    alt {\n        v = c.read() : { }\n        t.timeout(100) : { }\n    }\n    alt { v = c.read() : { } }\n    t.timeout(5);\n    println(index + k);', 'public void f(chan<int>.read c, int v) { }').replace('public void main(string[] args) {', 'public void main(string[] args) {\n    chan<int>.read c; int v;'));
   const codes = new Set(r.codes);
   for (const c of ['pj/unused', 'pj/shadows-parameter', 'pj/type/const-init']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
-  for (const d of r.diagnostics) if ((d.code ?? '').startsWith('pj/note-')) assert.equal(d.severity, 'info', `${d.code} is a note`);
   assert.ok(codes.has('pj/multiple-alts'), 'a second alt in one procedure cannot be built');
   assert.ok(r.messages.some((m) => /'dead' is never used/.test(m)));
 });
@@ -342,34 +341,6 @@ test('a correct program produces no diagnostics at all', () => {
   const r = run(src);
   assert.deepEqual(r.messages, []);
   assert.ok(r.types.size > 20, 'expression types recorded');
-});
-
-test('a break or continue after a nested for/do/par-for in a process jumps to the wrong loop; while, switch and plain methods are fine', () => {
-  const hasNote = (r: ReturnType<typeof run>) => r.notes.some((n) => n.endsWith(':pj/note-loop-labels'));
-  const loopBody = (inner: string) => `    int k = 0;\n    while (true) {\n        int s = 0;\n${inner}\n        k = k + 3;\n        if (k > 5) break;\n    }\n    println(k);`;
-  for (const inner of ['        for (int i = 0; i < 3; i++) { s = s + i; }', '        do { s++; } while (s < 3);', '        par for (int i = 0; i < 2; i++) { println(i); }', '        if (k >= 0) { for (int i = 0; i < 3; i++) { s = s + i; } }']) {
-    const r = run(MAIN(loopBody(inner)));
-    assert.ok(hasNote(r), `${inner}: ${r.notes.join(' ')}`);
-  }
-  for (const inner of ['        while (s < 3) { s++; }', '        par { println("x"); println("y"); }']) {
-    const r = run(MAIN(loopBody(inner)));
-    assert.ok(!hasNote(r), `${inner}: ${r.notes.join(' ')}`);
-  }
-  // A break inside the inner for itself is fine (line 7); only the later break in the enclosing loop (line 9) is flagged.
-  const innerBreak = run(MAIN(loopBody('        for (int i = 0; i < 3; i++) { if (i == 2) break; s = s + i; }')));
-  assert.deepEqual(innerBreak.notes.filter((n) => n.endsWith(':pj/note-loop-labels')), ['9:pj/note-loop-labels']);
-  // A break before the for, a switch break after it, and a continue after it.
-  const before = run(MAIN('    int k = 0;\n    while (true) {\n        k++;\n        if (k > 5) break;\n        for (int i = 0; i < 3; i++) { k = k + i; }\n    }'));
-  assert.ok(!hasNote(before), before.messages.join('\n'));
-  const sw = run(MAIN('    int k = 0;\n    while (k < 4) {\n        for (int i = 0; i < 3; i++) { k = k + i; }\n        switch (k) { case 1: k++; break; default: k = k + 2; }\n    }'));
-  assert.ok(!hasNote(sw), sw.messages.join('\n'));
-  const cont = run(MAIN('    int k = 0; int n = 0;\n    while (n < 6) {\n        n++;\n        for (int i = 0; i < 2; i++) { k = k + i; }\n        if (n % 2 == 0) continue;\n        k = k + n;\n    }'));
-  assert.ok(hasNote(cont), cont.messages.join('\n'));
-  // Only procedures compiled as processes are rewritten: a plain method keeps Java's break.
-  const method = run(MAIN('    work();', 'public void work() {\n    int k = 0;\n    while (true) {\n        for (int i = 0; i < 3; i++) { k = k + i; }\n        if (k > 5) break;\n    }\n    println(k);\n}'));
-  assert.ok(!hasNote(method), method.messages.join('\n'));
-  const process = run(MAIN('    chan<int> c;\n    par { c.write(1); c.write(2); c.write(3); consume(c.read); }', 'public void consume(chan<int>.read in) {\n    int k = 0;\n    while (true) {\n        for (int i = 0; i < 3; i++) { k = k + i; }\n        k = k + in.read();\n        if (k > 5) break;\n    }\n    println(k);\n}'));
-  assert.ok(hasNote(process), process.messages.join('\n'));
 });
 
 test('a constant initialised from a variable is reported, with the reason', () => {

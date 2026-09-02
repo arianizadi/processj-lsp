@@ -12,7 +12,7 @@ const INCLUDE = path.join(__dirname, '..', '..', 'test', 'fixtures', 'include');
 
 /**
  * Every example declares the diagnostic codes it must produce on its first line
- * (`// expect:`); an optional `// notes:` line lists the information-level notes.
+ * (`// expect:`).
  */
 test('examples produce exactly the diagnostics they announce', () => {
   const files = fs.readdirSync(EXAMPLES).filter((f) => f.endsWith('.pj')).sort();
@@ -40,12 +40,6 @@ test('examples produce exactly the diagnostics they announce', () => {
     const r = check(parsed.program, { index, importsStd: res.importsStd, unresolvedImports: unresolved });
     const all = [...importDiagnostics(res, true), ...r.diagnostics];
     const actual = all.filter((d) => d.severity !== 'info').map((d) => d.code ?? '?').sort();
-    const notesHeader = /^\/\/ notes:\s*(.*)$/m.exec(src);
-    if (notesHeader) {
-      const wantNotes = notesHeader[1].trim() === 'none' ? [] : notesHeader[1].split(',').map((s) => s.trim()).sort();
-      const gotNotes = all.filter((d) => d.severity === 'info').map((d) => d.code ?? '?').sort();
-      if (JSON.stringify(gotNotes) !== JSON.stringify(wantNotes)) problems.push(`${f}: expected notes [${wantNotes.join(', ')}] but got [${gotNotes.join(', ')}]`);
-    }
     if (unresolved) problems.push(`${f}: unresolved import`);
     if (JSON.stringify(actual) !== JSON.stringify(expected)) {
       problems.push(`${f}: expected [${expected.join(', ')}] but got [${actual.join(', ')}]\n    ${r.diagnostics.map((d) => `L${d.line + 1} ${d.code}: ${d.message}`).join('\n    ')}`);

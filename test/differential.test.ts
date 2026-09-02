@@ -11,7 +11,7 @@ const INCLUDE = path.join(__dirname, '..', '..', 'test', 'fixtures', 'include');
 const BLOCKING = new Set(['pj/channel-no-writer', 'pj/channel-no-reader', 'pj/channel-self-deadlock', 'pj/par-deadlock', 'pj/starving-loop']);
 
 /**
- * Each program records what the real compiler and runtime did with it (`// outcome: runs` or `runs-wrong` (builds and runs, but wrong: a note or an error must say so) or `error` (does not build: an error must say so), `runs-wrong`, `error`
+ * Each program records what the real compiler and runtime did with it (`// outcome: runs` or `runs-wrong` (builds and runs, but wrong; kept as a corpus, no claim is checked) or `error` (does not build: an error must say so), `runs-wrong`, `error`
  * means it built and finished). The checker must never claim that a program that runs
  * blocks or has an error. `npm run validate test/differential` re-derives the outcomes.
  */
@@ -38,7 +38,6 @@ test('the checker never contradicts a program that really runs', () => {
     if (outcome === 'runs' && claims.length) problems.push(`${f} runs, but the checker says: ${claims.map((d) => `L${d.line + 1} ${d.code}`).join(', ')}`);
     if (outcome === 'compiler-limit' && !r.diagnostics.some((d) => d.code === 'pj/compiler-limit')) problems.push(`${f} cannot be built by this compiler, but nothing in the file says so`);
     if (outcome === 'error' && !r.diagnostics.some((d) => d.severity === 'error')) problems.push(`${f} does not build, but the checker reports no error`);
-    if (outcome === 'runs-wrong' && !r.diagnostics.some((d) => d.severity === 'error' || (d.severity === 'info' && d.code?.startsWith('pj/note-')))) problems.push(`${f} runs but misbehaves, and no note or error says so`);
   }
   assert.deepEqual(problems, []);
 });

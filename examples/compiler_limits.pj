@@ -1,5 +1,4 @@
 // expect: pj/compiler-limit, pj/compiler-limit, pj/compiler-limit, pj/compiler-limit, pj/read-placement, pj/read-placement, pj/read-placement
-// notes: pj/note-par-gc, pj/note-par-gc
 import std.*;
 
 record Node { int value; Node next; }   // a record that contains itself overflows the compiler
