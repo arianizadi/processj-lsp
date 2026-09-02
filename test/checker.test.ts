@@ -171,6 +171,15 @@ test('concurrency lints from the AST: parallel usage, shared ends with fix, no w
   assert.deepEqual(byCode('pj/channel-no-writer'), [15]);
 });
 
+test('an end handed to a procedure is not an operation: no blocking or self-deadlock claims about it', () => {
+  // alttest.pj: c2's read end goes to a procedure that may only use it in an alt.
+  const passedEnd = run(MAIN('    chan<int> c1;\n    chan<int> c2;\n    par {\n        c1.write(42);\n        reader(c1.read, c2.read);\n    }', 'public void reader(chan<int>.read a, chan<int>.read b) { println(a.read()); }'));
+  assert.deepEqual(passedEnd.codes.filter((c) => (c ?? '').startsWith('pj/channel')), []);
+  // fibonacci.pj: both ends of one channel handed to one call that forks internally.
+  const bothEnds = run(MAIN('    chan<int> c;\n    fib(c.write, c.read);', 'public void fib(chan<int>.write w, chan<int>.read r) { par { w.write(1); println(r.read()); } }'));
+  assert.deepEqual(bothEnds.codes.filter((c) => (c ?? '').startsWith('pj/channel')), []);
+});
+
 test('a channel written and read by the same sequential process is a self-deadlock', () => {
   const bad = run(MAIN('    chan<int> c;\n    c.write(1);\n    int x = c.read();\n    println(x);'));
   assert.deepEqual(bad.codes, ['pj/channel-self-deadlock']);
@@ -241,7 +250,8 @@ test('unused and shadowed variables, constants; nothing about compiler internals
   const r = run(MAIN('    timer t;\n    int index = 0;\n    int dead;\n    int args = 1;\n    const int k = args;\n    alt {\n        v = c.read() : { }\n        t.timeout(100) : { }\n    }\n    alt { v = c.read() : { } }\n    t.timeout(5);\n    println(index + k);', 'public void f(chan<int>.read c, int v) { }').replace('public void main(string[] args) {', 'public void main(string[] args) {\n    chan<int>.read c; int v;'));
   const codes = new Set(r.codes);
   for (const c of ['pj/unused', 'pj/shadows-parameter', 'pj/type/const-init']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
-  for (const c of ['pj/alt-timeout', 'pj/multiple-alts', 'pj/reserved-alt-name', 'pj/timeout-noop']) assert.ok(!codes.has(c), `${c} must not be reported`);
+  for (const c of ['pj/alt-timeout', 'pj/reserved-alt-name', 'pj/timeout-noop']) assert.ok(!codes.has(c), `${c} must not be reported`);
+  assert.ok(codes.has('pj/multiple-alts'), 'a second alt in one procedure cannot be built');
   assert.ok(r.messages.some((m) => /'dead' is never used/.test(m)));
 });
 

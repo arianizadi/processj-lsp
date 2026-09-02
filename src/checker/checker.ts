@@ -113,6 +113,7 @@ class Checker {
   private branchStack: BranchUse[] = [];
   private chanUses = new Map<VarInfo, ChanUse>();
   private insideAlt = 0;
+  private altCount = 0;
   /** Name expressions that are the target of `.read` / `.write` / `.read()` / `.write(v)`: not "bare" uses of the channel. */
   private readonly endTargets = new WeakSet<A.Expr>();
   private readonly yields: YieldAnalysis;
@@ -278,6 +279,7 @@ class Checker {
     this.procRet = this.resolveType(d.returnType);
     this.chanUses = new Map();
     this.activeCase = new Map();
+    this.altCount = 0;
     this.enrolled = new Set();
     this.syncs = [];
     this.pendingSims = [];
@@ -640,6 +642,8 @@ class Checker {
   }
 
   private altStmt(s: A.AltStmt): void {
+    this.altCount++;
+    if (this.altCount === 2) this.error({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + (s.isPri ? 7 : 3) } }, 'pj/multiple-alts', `A procedure can contain only one alt; move this one into its own procedure`);
     this.insideAlt++;
     this.push();
     if (s.replicated) {
@@ -904,20 +908,23 @@ class Checker {
     if (b && !b.writes.has(v)) b.writes.set(v, span);
   }
 
-  private noteEnd(v: VarInfo, end: 'read' | 'write', span: A.Span): void {
+  private noteEnd(v: VarInfo, end: 'read' | 'write', span: A.Span, direct = true): void {
     const b = this.branchStack[this.branchStack.length - 1];
     if (b) {
       const key = `${v.name}.${end}`;
       if (!b.ends.has(key)) b.ends.set(key, { v, span });
     }
     const u = this.chanUses.get(v);
-    if (u) {
-      if (end === 'read') u.reads ??= span;
-      else u.writes ??= span;
-      u.first ??= span;
-      u.branches.add(this.branchStack[this.branchStack.length - 1]);
-      u.spans.push(span);
+    if (!u) return;
+    if (!direct) {
+      u.bare = true; // handed to another process: we cannot know what it does with it
+      return;
     }
+    if (end === 'read') u.reads ??= span;
+    else u.writes ??= span;
+    u.first ??= span;
+    u.branches.add(this.branchStack[this.branchStack.length - 1]);
+    u.spans.push(span);
   }
 
   private noteBare(v: VarInfo): void {
@@ -1017,7 +1024,7 @@ class Checker {
       case 'ChanEnd': {
         this.endTargets.add(e.target);
         const t = this.expr(e.target);
-        this.noteChannel(e.target, e.end);
+        this.noteChannel(e.target, e.end, false);
         if (isLenient(t)) return T.unknown;
         if (t.k !== 'chan') return this.error(e.span, 'pj/type/channel', `${exprText(e.target)} is ${typeStr(t)}, not a channel; '.${e.end}' needs a channel`);
         if (t.end) return this.error(e.span, 'pj/channel-direction', `'${exprText(e.target)}' is already a ${t.end} end; it has no '.${e.end}'`);
@@ -1028,7 +1035,7 @@ class Checker {
       case 'ChanWrite': {
         this.endTargets.add(e.target);
         const t = this.expr(e.target);
-        this.noteChannel(e.target, 'write');
+        this.noteChannel(e.target, 'write', true);
         const v = this.expr(e.value);
         const nested = findRead(e.value);
         if (nested) this.error(nested.span, 'pj/read-placement', "A channel read cannot be part of a write's value; read it into a variable first", this.hoistReadFix(e, nested));
@@ -1138,7 +1145,7 @@ class Checker {
       if (e.extended) this.error(e.extended.span, 'pj/type/timer', 'A timer read takes no block');
       return T.long;
     }
-    this.noteChannel(e.target, 'read');
+    this.noteChannel(e.target, 'read', true);
     if (e.extended) this.block(e.extended);
     if (isLenient(t)) return T.unknown;
     if (t.k !== 'chan') return this.error(e.target.span, 'pj/type/channel', `${exprText(e.target)} is ${typeStr(t)}, not a channel; '.read()' needs a channel or a read end`);
@@ -1146,11 +1153,16 @@ class Checker {
     return t.elem;
   }
 
-  /** Record a channel-end use on a plain variable, for the par and no-partner rules. */
-  private noteChannel(target: A.Expr, end: 'read' | 'write'): void {
+  /**
+   * Record a channel-end use on a plain variable. A direct operation (`c.read()`,
+   * `c.write(v)`) counts for the deadlock rules; an end handed to a procedure
+   * (`f(c.read)`) only counts for the par sharing rule, since the callee may use it
+   * in an alt or in another process.
+   */
+  private noteChannel(target: A.Expr, end: 'read' | 'write', direct: boolean): void {
     if (target.kind !== 'NameExpr') return;
     const v = this.resolutions.get(target);
-    if (v && v.type.k === 'chan' && !v.type.end) this.noteEnd(v, end, target.span);
+    if (v && v.type.k === 'chan' && !v.type.end) this.noteEnd(v, end, target.span, direct);
   }
 
   private name(e: A.NameExpr): Type {

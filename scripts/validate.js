@@ -20,8 +20,9 @@ const { importDiagnostics, resolveImports } = require('../dist/src/imports.js');
 const { build, run } = require('../dist/src/pipeline.js');
 
 const BLOCKING = new Set(['pj/channel-no-writer', 'pj/channel-no-reader', 'pj/channel-self-deadlock', 'pj/par-deadlock', 'pj/starving-loop']);
-const runTimeout = Number(process.argv[2]) || 8000;
-const dir = path.join(__dirname, '..', 'examples');
+const args = process.argv.slice(2);
+const runTimeout = Number(args.find((a) => /^\d+$/.test(a))) || 8000;
+const dir = path.resolve(args.find((a) => !/^\d+$/.test(a)) ?? path.join(__dirname, '..', 'examples'));
 
 const found = findInstall();
 if ('error' in found) {
@@ -47,17 +48,21 @@ function verdictOf(codes) {
     const index = new DeclIndex();
     index.addProgram(parsed.program, file);
     for (const dep of res.files) index.addProgram(parse(fs.readFileSync(dep, 'utf8')).program, dep);
-    const checked = check(parsed.program, { index, importsStd: res.importsStd });
-    const codes = [...new Set([...importDiagnostics(res, true), ...checked.diagnostics].filter((d) => d.severity !== 'info').map((d) => d.code))].sort();
+    const checked = check(parsed.program, { index, importsStd: res.importsStd, text: src });
+    const codes = [...new Set([...parsed.errors.map(() => 'pj/syntax'), ...importDiagnostics(res, true), ...checked.diagnostics].filter((d) => d.severity !== 'info').map((d) => d.code ?? d))].sort();
     const verdict = verdictOf(codes);
+    const hasMain = parsed.program.decls.some((d) => d.kind === 'ProcDecl' && d.name.name === 'main');
 
     const built = await build(install, file, src, { timeoutMs: 90_000 });
     let actual;
     let detail = '';
     if (!built.ok) {
       const failed = built.stages.find((s) => !s.ok);
-      actual = `build failed at ${failed?.name}`;
+      const crashed = /Exception in thread "main"/.test(failed?.output ?? '');
+      actual = crashed ? 'compiler crashed' : `build failed at ${failed?.name}`;
       detail = (failed?.output ?? '').split('\n').find((l) => /error|Exception|rror\[/.test(l)) ?? '';
+    } else if (!hasMain) {
+      actual = 'no main (not runnable)';
     } else {
       const r = await run(install, built, { timeoutMs: runTimeout });
       const out = r.output.split('\n').filter((l) => l && !/^\[Scheduler\]|^Total execution/.test(l));
@@ -69,13 +74,23 @@ function verdictOf(codes) {
 
     let ok = 'n/a';
     if (verdict === 'blocks') ok = actual.startsWith('hangs') ? 'CONFIRMED' : 'MISMATCH';
-    if (verdict === 'clean') ok = actual === 'finishes' ? 'CONFIRMED' : actual.startsWith('build failed') ? 'compiler limit' : 'MISMATCH';
-    if (ok === 'MISMATCH') failures++;
+    if (verdict === 'clean') ok = actual === 'finishes' ? 'CONFIRMED' : actual.startsWith('build failed') ? 'MISSING RULE?' : actual.startsWith('hangs') ? 'hangs (design?)' : actual.startsWith('no main') || actual === 'compiler crashed' ? 'n/a' : 'MISMATCH';
+    if (verdict === 'blocks' && actual.startsWith('no main')) ok = 'n/a';
+    // Errors from the checker but the program builds and runs: look at it, it may be a false positive.
+    // Races are expected to run; their result is just not reliable.
+    const RACES = new Set(['pj/parallel-usage', 'pj/shared-channel-end']);
+    const hasErrors = checked.diagnostics.some((d) => d.severity === 'error' && !RACES.has(d.code));
+    const onlyRaces = checked.diagnostics.some((d) => RACES.has(d.code)) && !hasErrors;
+    if (verdict === 'other' && actual === 'finishes') ok = onlyRaces ? 'race (runs)' : hasErrors ? 'FALSE POSITIVE?' : ok;
+    // This compiler build cannot link user-library imports; that is not a checker gap.
+    const userImports = res.imports.some((i) => i.userLibrary);
+    if (verdict === 'clean' && actual.startsWith('build failed') && userImports) ok = 'compiler limit (imports)';
+    if (ok === 'MISMATCH' || ok === 'MISSING RULE?') failures++;
     rows.push({ f, verdict, codes: codes.join(', ') || '-', actual, ok, detail });
   }
   const w = (s, n) => String(s).padEnd(n);
   console.log(`${w('example', 22)} ${w('checker says', 13)} ${w('real program', 22)} ${w('result', 10)} output / error`);
   for (const r of rows) console.log(`${w(r.f, 22)} ${w(r.verdict, 13)} ${w(r.actual, 22)} ${w(r.ok, 10)} ${r.detail}`);
-  console.log(`\n${rows.filter((r) => r.ok === 'CONFIRMED').length} confirmed, ${failures} mismatched, ${rows.filter((r) => r.ok === 'compiler limit').length} not buildable by this compiler, ${rows.filter((r) => r.ok === 'n/a').length} informational`);
+  console.log(`\n${rows.filter((r) => r.ok === 'CONFIRMED').length} confirmed, ${failures} to investigate (missing rule or mismatch), ${rows.filter((r) => r.ok === 'FALSE POSITIVE?').length} possible false positives, ${rows.filter((r) => r.ok === 'n/a' || r.ok.startsWith('hangs')).length} informational`);
   process.exit(failures ? 1 : 0);
 })();

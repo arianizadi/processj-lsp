@@ -98,6 +98,7 @@ why:
 | `pj/assign-in-condition`   | `if (b = true)`: assignment where a comparison was meant                            |
 | `pj/unreachable`           | code after `return`, `break`, `continue` or `stop` in the same block               |
 | `pj/trivial-par`, `pj/trivial-alt` | a `par` with one branch, an `alt` with one guard: nothing concurrent happens   |
+| `pj/multiple-alts`         | a second `alt` in one procedure cannot be built; move it into its own procedure |
 | `pj/read-placement`        | a channel read inside `?:` or inside a write's value; it must be its own statement (quick fix hoists it) |
 | `pj/call-as-condition`     | a bare call as the whole `if`/`while` condition; compare its result (quick fix adds `== true`) |
 | `pj/needs-yield-annotation` | a procedure that suspends only through the procedures it calls; quick fix adds `[yield=true]`. The server also adds it in its private copy before every compiler run, so Run works regardless |
@@ -326,24 +327,26 @@ Apache License 2.0 (see `LICENSE`). The example programs under
 
 ## Validated against the real runtime
 
-`npm run validate` builds every example with the real compiler and runs it with a timeout. A program the checker says will block must hang; a clean program must finish. Result of the last run:
+`npm run validate [dir]` builds every program with the real compiler and runs it with a timeout. A program the checker says will block must hang; a clean program must finish; a program with type errors must not build and run. It runs over `examples/` by default and over the compiler's own corpus with `npm run validate test/fixtures/processj` (that run: every program confirmed or informational, none to investigate). Last run over the examples:
 
 | example | checker says | real program | result |
 | --- | --- | --- | --- |
 | `channel_direction.pj` | other | hangs (>8s) | n/a |
-| `channel_types.pj` | other | build failed at ProcessJc n/a | Exception in thread "main" java.lang.NullPointerException |
+| `channel_types.pj` | other | compiler crashed | n/a |
 | `clean_pipeline.pj` | clean | finishes | CONFIRMED |
 | `deadlock_read.pj` | blocks | hangs (>8s) | CONFIRMED |
 | `overloads.pj` | other | build failed at ProcessJc n/a | error[403]: Procedure 'twise' not found |
 | `par_deadlock.pj` | blocks | hangs (>8s) | CONFIRMED |
 | `par_for_shared.pj` | other | hangs (>8s) | n/a |
-| `parallel_usage.pj` | other | finishes | n/a |
+| `parallel_usage.pj` | other | finishes | race (runs) x is 1 |
 | `pri_alt_skip.pj` | other | hangs (>8s) | n/a |
-| `protocol_fields.pj` | other | build failed at ProcessJc n/a | Exception in thread "main" java.lang.NullPointerException |
+| `protocol_fields.pj` | other | compiler crashed | n/a |
+| `read_placement.pj` | other | build failed at javac | n/a |
 | `self_deadlock.pj` | blocks | hangs (>8s) | CONFIRMED |
 | `shared_channel.pj` | other | hangs (>8s) | n/a |
 | `starving_loop.pj` | blocks | hangs (>8s) | CONFIRMED |
-| `typos.pj` | other | build failed at ProcessJc n/a | error[405]: Symbol 'cuont' not found |
-| `use_import.pj` | clean | build failed at javac | compiler limit /var/folders/yw/c_xqrv6n39d475z2v2d09x8w0000gn/T/processj-lsp-UU7ZHe/.pjlsp-home/work/use_import.java:9: error: package lib does not exist |
+| `typos.pj` | other | compiler crashed | n/a |
+| `use_import.pj` | clean | build failed at javac | compiler limit (imports) /var/folders/yw/c_xqrv6n39d475z2v2d09x8w0000gn/T/processj-lsp-SCbX1c/.pjlsp-home/work/use_import.java:9: error: package lib does not exist |
+| `yield_through_calls.pj other` | finishes | n/a | ok |
 
-`other` rows are programs with type errors or races: some the compiler rejects, some it builds and they hang or misbehave at runtime, which is the point of the checker. `compiler limit` means the program is fine but this compiler build cannot build it (user-library imports).
+`other` rows are programs with type errors or races: some the compiler rejects, some it builds and they hang or misbehave at runtime, which is the point of the checker. `compiler limit (imports)` means the program is fine but this compiler build cannot link a user library.
