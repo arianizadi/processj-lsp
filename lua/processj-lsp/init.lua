@@ -61,6 +61,19 @@ function M.setup(opts)
   local config = vim.tbl_deep_extend("force", M.default_config(), opts or {})
   vim.lsp.config("processj_ls", config)
   vim.lsp.enable "processj_ls"
+  -- AstroNvim applies its LSP keymaps (<Leader>la, <Leader>lf, gd, ...) from AstroLSP's
+  -- on_attach, which only runs for servers AstroLSP started itself. Run it for ours too.
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = vim.api.nvim_create_augroup("processj_lsp_attach", { clear = true }),
+    callback = function(args)
+      local client = vim.lsp.get_client_by_id(args.data.client_id)
+      if not client or client.name ~= "processj_ls" then return end
+      if vim.b[args.buf].processj_lsp_attached then return end
+      vim.b[args.buf].processj_lsp_attached = true
+      local ok, astrolsp = pcall(require, "astrolsp")
+      if ok and type(astrolsp.on_attach) == "function" then astrolsp.on_attach(client, args.buf) end
+    end,
+  })
   -- Warn once, on the first .pj buffer, if the build step was skipped.
   vim.api.nvim_create_autocmd("FileType", {
     pattern = "processj",
