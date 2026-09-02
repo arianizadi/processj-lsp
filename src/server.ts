@@ -429,7 +429,8 @@ function makeDiagnostic(doc: TextDocument, raw: RawDiagnostic | LintDiagnostic):
   if (end <= start) end = start + 1;
 
   const severity =
-    raw.severity === 'error' ? DiagnosticSeverity.Error : raw.severity === 'warning' ? DiagnosticSeverity.Warning : raw.source === 'lsp' ? DiagnosticSeverity.Hint : DiagnosticSeverity.Information;
+    // Notes go out as Information, not Hint: VS Code draws hints as faint dots and keeps them out of the Problems panel.
+    raw.severity === 'error' ? DiagnosticSeverity.Error : raw.severity === 'warning' ? DiagnosticSeverity.Warning : DiagnosticSeverity.Information;
   const fix = (raw as LintDiagnostic).fix;
   return {
     range: Range.create(line, start, line, end),
