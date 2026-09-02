@@ -1,0 +1,35 @@
+{
+  "name": "processj-lsp",
+  "version": "0.1.0",
+  "description": "Language server for the ProcessJ language: diagnostics from the real compiler, completion, hover, go-to-definition, document symbols and signature help.",
+  "license": "MIT",
+  "author": "Arian Izadi",
+  "type": "commonjs",
+  "main": "dist/src/server.js",
+  "bin": {
+    "processj-lsp": "bin/processj-lsp.js"
+  },
+  "files": [
+    "bin",
+    "dist/src",
+    "editor",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -p tsconfig.json --watch",
+    "test": "npm run build && node --test dist/test/",
+    "smoke": "npm run build && node scripts/smoke.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "vscode-languageserver": "^10.1.1",
+    "vscode-languageserver-textdocument": "^1.0.14"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "typescript": "^5.9.0"
+  }
+}
