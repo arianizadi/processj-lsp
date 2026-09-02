@@ -1,0 +1,11 @@
+// expect: pj/needs-yield-annotation, pj/needs-yield-annotation
+import std.*;
+
+public void wait1() { timer t; t.timeout(1); }
+
+// `twice` and `main` never communicate themselves, only through what they
+// call, so they must be marked [yield=true] to be compiled as suspending
+// processes. The quick fix adds the annotation; Run applies it automatically.
+public void twice() { wait1(); wait1(); }
+
+public void main(string[] args) { twice(); println("ok"); }

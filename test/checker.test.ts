@@ -219,6 +219,13 @@ test('pri alt with skip before other guards, trivial alt and par, unreachable co
   assert.ok(!codes.has('pj/string-identity'));
 });
 
+test('a procedure that suspends only through calls gets a [yield=true] quick fix', () => {
+  const r = run('import std.*;\n\npublic void wait1() { timer t; t.timeout(1); }\n\npublic void twice() { wait1(); wait1(); }\n\npublic void marked() [yield=true] { wait1(); }\n\npublic void main(string[] args) { twice(); marked(); println("ok"); }\n');
+  const hits = r.diagnostics.filter((d) => d.code === 'pj/needs-yield-annotation');
+  assert.deepEqual(hits.map((d) => d.line + 1), [5, 9]);
+  assert.deepEqual(hits[0].fix, { kind: 'edit', title: 'Add [yield=true]', line: 4, col: 20, endCol: 20, text: '[yield=true] ' });
+});
+
 test('unused and shadowed variables, constants; nothing about compiler internals', () => {
   const r = run(MAIN('    timer t;\n    int index = 0;\n    int dead;\n    int args = 1;\n    const int k = args;\n    alt {\n        v = c.read() : { }\n        t.timeout(100) : { }\n    }\n    alt { v = c.read() : { } }\n    t.timeout(5);\n    println(index + k);', 'public void f(chan<int>.read c, int v) { }').replace('public void main(string[] args) {', 'public void main(string[] args) {\n    chan<int>.read c; int v;'));
   const codes = new Set(r.codes);

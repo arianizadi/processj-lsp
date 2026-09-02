@@ -15,6 +15,7 @@ import type { FixHint } from '../analysis';
 import type * as A from '../parser/ast';
 import { suggest } from '../parser/parser';
 import { DeclIndex, signatureStr, type ProcSig } from './index';
+import { hasYieldAnnotation, YieldAnalysis } from './yields';
 import { assignable, endOf, isIntegral, isLenient, isNumeric, isPrim, isReference, isSubtype, promote, sameType, T, typeStr, whyNotAssignable, type Type } from './types';
 
 export interface VarInfo {
@@ -112,8 +113,7 @@ class Checker {
   private insideAlt = 0;
   /** Name expressions that are the target of `.read` / `.write` / `.read()` / `.write(v)`: not "bare" uses of the channel. */
   private readonly endTargets = new WeakSet<A.Expr>();
-  /** Whether a procedure body can suspend (communicates), memoised; cycles count as not yielding. */
-  private readonly yieldMemo = new Map<A.ProcDecl, boolean>();
+  private readonly yields: YieldAnalysis;
   /** Barriers a proc enrolled on with `par enroll`, to spot syncs nobody enrolled. */
   private enrolled = new Set<VarInfo>();
   private syncs: Array<{ v: VarInfo; span: A.Span }> = [];
@@ -122,6 +122,7 @@ class Checker {
 
   constructor(private readonly opts: CheckOptions) {
     this.index = opts.index;
+    this.yields = new YieldAnalysis(this.index);
   }
 
   // -------------------------------------------------------------------------
@@ -246,6 +247,11 @@ class Checker {
       }
     }
     for (const d of p.decls) if (d.kind === 'ProcDecl') this.procDecl(d);
+    for (const d of this.yields.needingAnnotation(p)) {
+      if (hasYieldAnnotation(d) || !d.body) continue;
+      const at = d.body.span.start;
+      this.report(d.name.span, 'warning', 'pj/needs-yield-annotation', `'${d.name.name}' suspends only through the procedures it calls; mark it [yield=true] so it is compiled as a suspending process`, { kind: 'edit', title: 'Add [yield=true]', line: at.line, col: at.col, endCol: at.col, text: '[yield=true] ' });
+    }
   }
 
   private procDecl(d: A.ProcDecl): void {
@@ -296,91 +302,10 @@ class Checker {
   // Yield analysis: can this code suspend, i.e. communicate or wait?
   // -------------------------------------------------------------------------
 
-  private procYields(decl: A.ProcDecl): boolean {
-    const memo = this.yieldMemo.get(decl);
-    if (memo !== undefined) return memo;
-    this.yieldMemo.set(decl, false); // recursion guard
-    const r = decl.body ? this.stmtYields(decl.body) : false;
-    this.yieldMemo.set(decl, r);
-    return r;
-  }
-
-  private stmtYields(s: A.Stmt): boolean {
-    switch (s.kind) {
-      case 'Block':
-        return s.stmts.some((x) => this.stmtYields(x));
-      case 'LocalDecl':
-        return s.declarators.some((v) => !!v.init && this.exprYields(v.init));
-      case 'ExprStmt':
-        return this.exprYields(s.expr);
-      case 'IfStmt':
-        return this.exprYields(s.cond) || this.stmtYields(s.then) || (!!s.else && this.stmtYields(s.else));
-      case 'WhileStmt':
-      case 'DoStmt':
-        return this.exprYields(s.cond) || this.stmtYields(s.body);
-      case 'ForStmt':
-        return s.isPar || this.stmtYields(s.body) || (!!s.cond && this.exprYields(s.cond));
-      case 'ParBlock':
-      case 'AltStmt':
-      case 'ClaimStmt':
-        return true;
-      case 'SeqBlock':
-        return this.stmtYields(s.body);
-      case 'SwitchStmt':
-        return this.exprYields(s.expr) || s.groups.some((g) => g.stmts.some((x) => this.stmtYields(x)));
-      case 'ReturnStmt':
-        return !!s.expr && this.exprYields(s.expr);
-      case 'LabeledStmt':
-        return this.stmtYields(s.stmt);
-      default:
-        return false;
-    }
-  }
-
-  private exprYields(e: A.Expr): boolean {
-    switch (e.kind) {
-      case 'ChanRead':
-      case 'ChanWrite':
-      case 'Sync':
-      case 'Timeout':
-        return true;
-      case 'Invocation': {
-        if (e.args.some((a) => this.exprYields(a))) return true;
-        const cands = this.index.procs.get(e.name.name) ?? [];
-        return cands.some((c) => this.procYields(c.decl));
-      }
-      case 'ParenExpr':
-        return this.exprYields(e.expr);
-      case 'BinaryExpr':
-        return this.exprYields(e.left) || this.exprYields(e.right);
-      case 'UnaryExpr':
-        return this.exprYields(e.operand);
-      case 'AssignExpr':
-        return this.exprYields(e.target) || this.exprYields(e.value);
-      case 'TernaryExpr':
-        return this.exprYields(e.cond) || this.exprYields(e.then) || this.exprYields(e.else);
-      case 'CastExpr':
-        return this.exprYields(e.expr);
-      case 'RecordAccess':
-        return this.exprYields(e.target);
-      case 'ArrayAccess':
-        return this.exprYields(e.target) || this.exprYields(e.index);
-      case 'NewArray':
-        return e.dimExprs.some((d) => this.exprYields(d));
-      case 'ArrayLiteral':
-        return e.elements.some((x) => this.exprYields(x));
-      case 'RecordLiteral':
-      case 'ProtocolLiteral':
-        return e.fields.some((f) => this.exprYields(f.value));
-      default:
-        return false;
-    }
-  }
-
   /** A loop that never ends (constant-true condition) and cannot suspend starves every other process. */
   private checkStarvingLoop(loopSpan: A.Span, cond: A.Expr | undefined, body: A.Stmt, keyword: string): void {
     if (cond && !isTrueLiteral(cond)) return;
-    if (containsExit(body) || this.stmtYields(body)) return;
+    if (containsExit(body) || this.yields.stmtYields(body, true)) return;
     const head: A.Span = { start: loopSpan.start, end: { line: loopSpan.start.line, col: loopSpan.start.col + keyword.length } };
     this.warn(head, 'pj/starving-loop', `This loop never ends and never communicates, so no other process ever runs again (the scheduler is cooperative). Add a channel operation, timeout or alt.`);
   }
@@ -879,7 +804,7 @@ class Checker {
       case 'Invocation': {
         if (e.target) return false;
         const cands = this.index.procs.get(e.name.name) ?? [];
-        if (cands.some((c) => this.procYields(c.decl))) return false;
+        if (cands.some((c) => this.yields.procYields(c.decl))) return false;
         return e.args.every((a) => this.exprOps(a, ops) && this.types.get(a)?.k !== 'chan');
       }
       case 'AssignExpr':
@@ -892,7 +817,7 @@ class Checker {
       case 'CastExpr':
         return this.exprOps(e.expr, ops);
       case 'TernaryExpr':
-        return this.exprOps(e.cond, ops) && !this.exprYields(e.then) && !this.exprYields(e.else);
+        return this.exprOps(e.cond, ops) && !this.yields.exprYields(e.then, true) && !this.yields.exprYields(e.else, true);
       case 'RecordAccess':
         return this.exprOps(e.target, ops);
       case 'ArrayAccess':

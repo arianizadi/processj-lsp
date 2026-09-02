@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { Install } from './config';
+import { withYieldAnnotations } from './yieldfix';
 
 export interface ExecResult {
   stdout: string;
@@ -93,7 +94,7 @@ export function makeSandbox(install: Install, sourcePath: string, text: string):
   const base = path.basename(sourcePath);
   const fileName = base.endsWith('.pj') ? base : 'buffer.pj';
   const src = path.join(root, fileName);
-  fs.writeFileSync(src, text);
+  fs.writeFileSync(src, withYieldAnnotations(text));
   // The compiler resolves `import a.b;` relative to its working directory before the
   // include directory, so mirror the file's own directory here with symlinks (no copies):
   // sibling .pj files and subdirectories become visible exactly as with `pjc`.

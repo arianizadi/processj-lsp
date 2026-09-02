@@ -98,6 +98,7 @@ why:
 | `pj/assign-in-condition`   | `if (b = true)`: assignment where a comparison was meant                            |
 | `pj/unreachable`           | code after `return`, `break`, `continue` or `stop` in the same block               |
 | `pj/trivial-par`, `pj/trivial-alt` | a `par` with one branch, an `alt` with one guard: nothing concurrent happens   |
+| `pj/needs-yield-annotation` | a procedure that suspends only through the procedures it calls; quick fix adds `[yield=true]`. The server also adds it in its private copy before every compiler run, so Run works regardless |
 | `pj/shadows-parameter`     | a local with the same name as a parameter (silently accepted)                      |
 | `pj/unused`                | unused locals and parameters                                                        |
 | `pj/missing-import`        | `println` without `import std.*;`; quick fix adds the import                       |
