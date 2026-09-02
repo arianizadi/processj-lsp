@@ -162,46 +162,91 @@ file, on disk or in another buffer, re-checks only the open documents that impor
 it. Without watcher support the directory walk falls back to at most once every
 5 seconds, and only when a lookup needs it.
 
-## Requirements
+## Setup
 
-- Node.js 20 or newer.
-- A ProcessJ install with a built `bin/` directory and `resources/jars`. The
-  server finds it from `initializationOptions.installDir`, the `PROCESSJ_HOME`
-  environment variable, or `installdir=` in `~/processjrc` (the file `pjc` reads).
-  Without one, parsing, lints, formatting and navigation still work; compiler
-  diagnostics and Run are disabled.
-- A JDK on `PATH` (or `JAVA_HOME`). The compiler was built with JDK 11.
+### 1. Prerequisites
 
-## Install
+- **Neovim 0.11 or newer** (uses the built-in `vim.lsp.config`).
+- **Node.js 20 or newer** with `npm` on PATH (`brew install node`, `apt install nodejs npm`, or nvm).
+- **A JDK** on PATH or in `JAVA_HOME`; the compiler was built with JDK 11.
+- **A ProcessJ install** for compiler diagnostics and the Run code lens: a
+  checkout with a built `bin/` directory and `resources/jars`. Tell the server
+  where it is with `installdir=/path/to/ProcessJ` in `~/processjrc` (the same
+  file `pjc` reads), `export PROCESSJ_HOME=/path/to/ProcessJ`, or
+  `init_options.installDir`. Without one, everything except compiler
+  diagnostics and Run still works.
+
+### 2. Neovim with lazy.nvim (AstroNvim, LazyVim, kickstart, ...)
+
+Add one plugin spec, for example in `~/.config/nvim/lua/plugins/processj.lua`:
+
+```lua
+return {
+  {
+    "arianizadi/processj-lsp",
+    build = "npm install && npm run build",
+    ft = "processj",
+    opts = {},
+  },
+}
+```
+
+Restart Neovim (or run `:Lazy sync`). lazy.nvim clones the repository, runs the
+build, and the plugin registers the `processj` filetype for `*.pj`, bundled
+syntax highlighting and indentation, and the language server from its own
+checkout. Open any `.pj` file; `:checkhealth vim.lsp` should list `processj_ls`
+as attached. If it says the server is not built, run `:Lazy build processj-lsp`.
+
+`opts` is merged into the server configuration. Useful keys:
+
+```lua
+opts = {
+  init_options = {
+    installDir = "~/Documents/ProcessJ", -- instead of ~/processjrc
+    checkOnChange = true,                -- also run the real compiler on every edit
+  },
+}
+```
+
+With AstroNvim the usual mappings apply: `K` hover, `gd` definition, `gr`
+references, `<Leader>lf` format, `<Leader>la` code action (quick fixes),
+`<Leader>lr` rename, `<Leader>ll` run a code lens (▶ Run, Build, Generated
+Java). `editor/nvim/lua/plugins/processj.lua` is a ready-made copy of the spec.
+
+### 3. Neovim without a plugin manager
 
 ```sh
-git clone https://github.com/arianizadi/processj-lsp ~/Documents/processj-lsp
-cd ~/Documents/processj-lsp
+git clone https://github.com/arianizadi/processj-lsp ~/.local/share/processj-lsp
+cd ~/.local/share/processj-lsp && npm install && npm run build
+```
+
+Then in `init.lua`:
+
+```lua
+vim.opt.runtimepath:append(vim.fn.expand "~/.local/share/processj-lsp")
+require("processj-lsp").setup {}
+```
+
+### 4. Other editors
+
+The server speaks standard LSP over stdio: launch
+`node <checkout>/bin/processj-lsp.js --stdio` for files of language id
+`processj` (extension `.pj`). Pass the options below as `initializationOptions`.
+
+### 5. Developing
+
+```sh
+git clone https://github.com/arianizadi/processj-lsp
+cd processj-lsp
 npm install
 npm run build
-npm test          # parser corpus, formatter idempotence, lints, output parser, performance budgets
-npm run smoke     # end-to-end against a real ProcessJ install, including a full run
+npm test          # parser corpus, formatter, checker, semantic tokens, imports, examples, perf budgets
+npm run smoke     # end-to-end against a real ProcessJ install, including a full program run
 npm run bench     # timings for generated 1k / 10k / 50k-line files
 ```
 
-`bin/processj-lsp.js --stdio` is the executable editors launch.
-
-## Neovim
-
-**AstroNvim v5:** copy `editor/nvim/lua/plugins/processj.lua` into
-`~/.config/nvim/lua/plugins/` and restart. It registers the `processj` filetype
-for `*.pj`, loads the bundled syntax highlighting, and enables the server.
-Format with `<Leader>lf` (or `:lua vim.lsp.buf.format()`); AstroNvim's
-format-on-save applies to this server too. Code lenses refresh with
-`<Leader>lL` and run with `<Leader>ll`.
-
-**Plain Neovim 0.11+:** see `editor/nvim/plain.lua`; it uses `vim.lsp.config`
-and `vim.lsp.enable`.
-
-Both files assume the repo lives at `~/Documents/processj-lsp`; edit `lsp_repo`
-otherwise. `:checkhealth vim.lsp` shows whether `processj_ls` attached;
-`:LspLog` has the server log, including the install directory it found and how
-long each compile took.
+`:LspLog` in Neovim shows the server log, including which install directory it
+found and how long each compile took.
 
 ## Options
 
@@ -266,7 +311,8 @@ test/               node:test unit tests; test/fixtures holds the compiler's exa
 examples/           one program per diagnostic, self-describing and tested
 scripts/smoke.js    talks LSP over stdio to a real server, ends with a real program run
 scripts/bench.js    parse / lint / format timings on generated large files
-editor/nvim/        AstroNvim plugin spec, plain config, syntax and ftplugin files
+lua/, plugin/, ftdetect/, syntax/, ftplugin/   the Neovim plugin (install the repo with lazy.nvim)
+editor/nvim/        ready-made lazy.nvim/AstroNvim spec and a plugin-manager-free config
 ```
 
 ## License

@@ -1,16 +1,8 @@
--- ProcessJ support for plain Neovim 0.11+ (no AstroNvim).
--- Put this in your init.lua or require() it from there.
-
-local lsp_repo = vim.fn.expand "~/Documents/processj-lsp"
-
-vim.filetype.add { extension = { pj = "processj" } }
-vim.opt.runtimepath:append(lsp_repo .. "/editor/nvim")
-
-vim.lsp.config("processj_ls", {
-  cmd = { "node", lsp_repo .. "/bin/processj-lsp.js", "--stdio" },
-  filetypes = { "processj" },
-  root_markers = { ".git", "processjrc" },
-  workspace_required = false,
-  init_options = { debounceMs = 400, timeoutMs = 20000, checkOnChange = false },
-})
-vim.lsp.enable "processj_ls"
+-- ProcessJ support for plain Neovim 0.11+ without a plugin manager: clone the repo,
+-- build it, put it on the runtimepath, and call setup().
+--   git clone https://github.com/arianizadi/processj-lsp ~/.local/share/processj-lsp
+--   cd ~/.local/share/processj-lsp && npm install && npm run build
+vim.opt.runtimepath:append(vim.fn.expand "~/.local/share/processj-lsp")
+require("processj-lsp").setup {
+  init_options = { checkOnChange = false },
+}
