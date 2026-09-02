@@ -1,0 +1,12 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    chan<int> c;
+    timer t;
+    int v = 0;
+    boolean enabled = false;
+    pri alt {
+        (enabled) && v = c.read() : { println("never " + v); }
+        t.timeout(10) : { println("timeout"); }
+    }
+}

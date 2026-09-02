@@ -1,0 +1,15 @@
+// outcome: compiler-limit
+import std.*;
+public void writer(shared chan<int>.write out, int v) {
+    claim (out) {
+        out.write(v);
+    }
+}
+public void main(string[] args) {
+    shared chan<int> c;
+    par {
+        writer(c.write, 1);
+        writer(c.write, 2);
+        { println(c.read()); println(c.read()); }
+    }
+}

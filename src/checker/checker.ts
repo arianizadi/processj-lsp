@@ -82,6 +82,8 @@ interface BranchUse {
   ends: Map<string, { v: VarInfo; span: A.Span }>; // "name.read" / "name.write"
   bare: Set<VarInfo>;
   depth: number;
+  /** A `par for` body: one branch in the source, many processes at runtime. */
+  replicated: boolean;
 }
 
 interface ChanUse {
@@ -197,7 +199,18 @@ class Checker {
   private resolveType(node: A.TypeNode): Type {
     const t = this.index.resolve(node);
     this.checkTypeKnown(node);
+    this.checkCompilable(node);
     return t;
+  }
+
+  /**
+   * Features this ProcessJ build does not compile (verified by building them): arrays of
+   * channels, variables holding a channel end. The program is not wrong; it just cannot be
+   * built with this compiler, and the warning says so where the feature is used.
+   */
+  private checkCompilable(node: A.TypeNode): void {
+    if (node.kind === 'ArrayType' && node.elem.kind === 'ChanType') this.report(node.span, 'warning', 'pj/compiler-limit', 'Arrays of channels cannot be compiled by this ProcessJ build; use separate channels');
+    if (node.kind === 'ArrayType') return this.checkCompilable(node.elem);
   }
 
   /** Warn about a named type nothing declares; suggest a close name. */
@@ -288,6 +301,7 @@ class Checker {
     this.push();
     for (const p of d.params) {
       const t = this.resolveType(p.type);
+      if (t.k === 'protocol') this.report(p.type.span, 'warning', 'pj/compiler-limit', 'A protocol value received as a parameter cannot be inspected (switch, is, fields) by this ProcessJ build; inspect it in the procedure that created it, or pass the fields you need');
       this.declare(p.name, t, p.isConst, true);
     }
     if (d.body) {
@@ -311,11 +325,16 @@ class Checker {
       if (use.bare) continue;
       if (use.reads && !use.writes) this.warn(use.reads, 'pj/channel-no-writer', `Nothing ever writes '${v.name}', so this read blocks forever`);
       else if (use.writes && !use.reads) this.warn(use.writes, 'pj/channel-no-reader', `Nothing ever reads '${v.name}', so this write blocks forever`);
-      else if (use.reads && use.writes && use.branches.size <= 1 && use.first) {
+      else if (use.reads && use.writes && use.branches.size <= 1 && use.first && ![...use.branches].some((b) => b?.replicated)) {
         this.warn(use.first, 'pj/channel-self-deadlock', `This process is both the writer and the reader of '${v.name}', so this ${use.first === use.writes ? 'write' : 'read'} blocks forever. Put the two sides in different branches of a par.`);
       }
     }
     for (const sim of this.pendingSims) this.runSimulation(sim.par, sim.queues);
+    if (this.altCount > 0) {
+      for (const v of this.allVars) {
+        if (v.proc === d.name.name && (v.name === 'index' || v.name === 'btemp')) this.report(v.decl.span, 'info', 'pj/note-reserved-name', `Note: this ProcessJ build generates its own variable named '${v.name}' for alts, which can shadow this one; a different name avoids it`);
+      }
+    }
     for (const { v, span } of this.syncs) {
       if (!v.isParam && !this.enrolled.has(v)) this.warn(span, 'pj/barrier-not-enrolled', `No 'par enroll (${v.name})' here, so this sync() waits for nobody and returns at once`);
     }
@@ -407,7 +426,7 @@ class Checker {
         }
         if (!s.isPar) this.checkStarvingLoop(s.span, s.cond, s.body, 'for');
         if (s.isPar) {
-          const use = this.branch(this.scope.depth, () => this.loop(() => this.stmt(s.body)));
+          const use = this.branch(this.scope.depth, () => this.loop(() => this.stmt(s.body)), true);
           // Every iteration is its own process, so anything from outside the loop is shared by all of them.
           const seen = new Set<VarInfo>();
           for (const [v, span] of use.writes) {
@@ -441,6 +460,7 @@ class Checker {
       case 'SeqBlock':
         return this.block(s.body);
       case 'ClaimStmt':
+        this.report({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + 5 } }, 'warning', 'pj/compiler-limit', "'claim' cannot be compiled by this ProcessJ build");
         this.push();
         for (const c of s.channels) {
           if (c.kind === 'LocalDecl') this.localDecl(c);
@@ -510,6 +530,11 @@ class Checker {
     }
   }
 
+  private noteShortCircuit(e: A.Expr, op: string): void {
+    const read = findRead(e);
+    if (read) this.report(read.span, 'info', 'pj/note-short-circuit', `Note: this ProcessJ build performs this read even when '${op}' would skip it; a read in its own statement avoids that`);
+  }
+
   /** Quick fix for `x.write(... c.read() ...)`: read into a variable on the line above, then write it. */
   private hoistReadFix(write: A.ChanWrite, read: A.ChanRead): FixHint | undefined {
     const stmtText = this.slice(write.span);
@@ -525,6 +550,7 @@ class Checker {
 
   private localDecl(d: A.LocalDecl): void {
     const base = this.resolveType(d.type);
+    if (base.k === 'chan' && base.end) this.report(d.type.span, 'warning', 'pj/compiler-limit', 'A variable holding a channel end cannot be compiled by this ProcessJ build; use the channel directly or pass the end to a procedure');
     if (isPrim(base, 'void')) this.error(d.type.span, 'pj/type/void', 'A variable cannot have type void');
     for (const v of d.declarators) {
       const t: Type = v.dims > 0 ? { k: 'array', elem: base.k === 'array' ? base.elem : base, dims: (base.k === 'array' ? base.dims : 0) + v.dims } : base;
@@ -676,7 +702,7 @@ class Checker {
           case 'SkipGuard':
             break;
           case 'TimeoutGuard':
-            this.timeout(c.guard.timeout);
+            this.timeout(c.guard.timeout, true);
             break;
           case 'ReadGuard': {
             if (s.cases.length > 1) this.inChoiceGuard++;
@@ -887,8 +913,8 @@ class Checker {
     }
   }
 
-  private branch(depth: number, body: () => void): BranchUse {
-    const use: BranchUse = { reads: new Map(), writes: new Map(), ends: new Map(), bare: new Set(), depth };
+  private branch(depth: number, body: () => void, replicated = false): BranchUse {
+    const use: BranchUse = { reads: new Map(), writes: new Map(), ends: new Map(), bare: new Set(), depth, replicated };
     this.branchStack.push(use);
     body();
     this.branchStack.pop();
@@ -984,6 +1010,8 @@ class Checker {
         this.condition(e.cond, '?:');
         const a = this.expr(e.then);
         const b = this.expr(e.else);
+        this.noteShortCircuit(e.then, '?:');
+        this.noteShortCircuit(e.else, '?:');
         const nested = findRead(e.then) ?? findRead(e.else) ?? findRead(e.cond);
         if (nested) this.error(nested.span, 'pj/read-placement', "A channel read cannot be part of a '?:' expression; read it into a variable first");
         if (isLenient(a)) return b;
@@ -1004,6 +1032,7 @@ class Checker {
       }
       case 'IsExpr': {
         const t = this.expr(e.expr);
+        this.report(e.span, 'warning', 'pj/compiler-limit', "'is' cannot be compiled by this ProcessJ build; use 'switch' on the protocol value instead");
         if (isLenient(t)) return T.boolean;
         if (t.k !== 'protocol') return this.error(e.span, 'pj/type/is', `'is' tests a protocol value for its case; ${exprText(e.expr)} is ${typeStr(t)}`);
         const cases = this.index.protocolCases(t.name);
@@ -1059,7 +1088,7 @@ class Checker {
         return T.void;
       }
       case 'Timeout':
-        return this.timeout(e);
+        return this.timeout(e, false);
       case 'NewArray': {
         const elem = this.resolveType(e.elem);
         for (const d of e.dimExprs) {
@@ -1086,6 +1115,7 @@ class Checker {
         const seen = new Set<string>();
         for (const f of e.fields) {
           const ft = fields.get(f.name.name);
+          if (f.value.kind === 'RecordLiteral') this.report(f.value.span, 'warning', 'pj/compiler-limit', 'A record literal nested inside another cannot be compiled by this ProcessJ build; build the inner record in a variable first');
           const vt = this.expr(f.value);
           if (!ft) {
             const s = suggest(f.name.name, fields.keys());
@@ -1133,9 +1163,11 @@ class Checker {
     }
   }
 
-  private timeout(e: A.Timeout): Type {
+  private timeout(e: A.Timeout, inAlt = false): Type {
     const t = this.expr(e.target);
     const d = this.expr(e.delay);
+    if (inAlt) this.report(e.span, 'info', 'pj/note-alt-timeout', 'Note: this ProcessJ build compiles a timeout guard as a sleep before the alt, so the other guards are not watched until it ends');
+    else this.report(e.span, 'info', 'pj/note-timeout', 'Note: in this ProcessJ build timeouts return immediately; the delay is not honoured at runtime');
     if (!isLenient(t) && !isPrim(t, 'timer')) this.error(e.target.span, 'pj/type/timer', `'.timeout()' needs a timer; ${exprText(e.target)} is ${typeStr(t)}`);
     if (!isLenient(d) && !isIntegral(d)) this.error(e.delay.span, 'pj/type/timer', `The timeout delay must be an integer number of milliseconds, not ${typeStr(d)}`);
     return T.void;
@@ -1237,6 +1269,11 @@ class Checker {
   private binary(e: A.BinaryExpr): Type {
     const l = this.expr(e.left);
     const r = this.expr(e.right);
+    if (e.op === '&&' || e.op === '||') this.noteShortCircuit(e.right, e.op);
+    if ((e.op === '==' || e.op === '!=') && isPrim(l, 'string') && isPrim(r, 'string')) {
+      const isLocalVar = (x: A.Expr) => x.kind === 'NameExpr' && !!this.resolutions.get(x) && !this.resolutions.get(x)!.isParam;
+      if (!(isLocalVar(e.left) && isLocalVar(e.right))) this.report(e.span, 'info', 'pj/note-string-compare', `Note: this ProcessJ build compiles '${e.op}' on strings as an identity comparison unless both sides are local variables; equals(a, b) from std compares contents`);
+    }
     if (isLenient(l) || isLenient(r)) {
       if (['<', '>', '<=', '>=', '==', '!=', '&&', '||'].includes(e.op)) return T.boolean;
       if (e.op === '+' && (isPrim(l, 'string') || isPrim(r, 'string'))) return T.string;
@@ -1353,6 +1390,9 @@ class Checker {
 
   private invocation(e: A.Invocation): Type {
     const args = e.args.map((a) => this.expr(a));
+    for (const a of e.args) {
+      if (a.kind === 'RecordLiteral' || a.kind === 'ProtocolLiteral') this.report(a.span, 'warning', 'pj/compiler-limit', 'A record or protocol literal passed directly as an argument cannot be compiled by this ProcessJ build; store it in a variable first');
+    }
     for (const a of e.args) if (a.kind === 'NameExpr') this.markBareArg(a);
     if (e.qualifier?.length) return T.unknown;
     if (e.target) {

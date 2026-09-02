@@ -1,0 +1,12 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    chan<int>[] cs = new chan<int>[2];
+    int v = 0;
+    par {
+        cs[0].write(7);
+        alt (int i = 0; i < 2; i++) {
+            v = cs[i].read() : { println("got " + v + " on " + i); }
+        }
+    }
+}

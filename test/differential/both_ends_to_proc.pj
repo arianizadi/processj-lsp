@@ -1,0 +1,12 @@
+// outcome: runs
+import std.*;
+public void pipe(chan<int>.write w, chan<int>.read r) {
+    par {
+        w.write(11);
+        println("pipe " + r.read());
+    }
+}
+public void main(string[] args) {
+    chan<int> c;
+    pipe(c.write, c.read);
+}

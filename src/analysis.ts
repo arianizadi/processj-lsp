@@ -1,9 +1,9 @@
 /**
- * Shared diagnostic shapes for the checker and the server. The checker
- * (src/checker/checker.ts) produces every language-level diagnostic; this file
- * only holds the types they share with the compiler-output parser.
+ * Shared diagnostic shapes, plus the lexer-level notes: things the real compiler's
+ * 7-bit JFlex scanner cannot handle, reported as low-severity information.
  */
 import type { RawDiagnostic } from './diagnostics';
+import { tokenize } from './tokens';
 
 export interface FixHint {
   kind: 'add-import' | 'make-shared' | 'edit';
@@ -16,3 +16,15 @@ export interface FixHint {
 }
 
 export type LintDiagnostic = RawDiagnostic & { fix?: FixHint };
+
+export function lexDiagnostics(text: string): LintDiagnostic[] {
+  return tokenize(text).issues.map((issue) => ({
+    line: issue.line,
+    startCol: issue.col,
+    endCol: issue.end,
+    message: `Note: ${issue.message}`,
+    severity: 'info' as const,
+    code: issue.code,
+    source: 'lsp' as const,
+  }));
+}

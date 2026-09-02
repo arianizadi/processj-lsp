@@ -1,0 +1,13 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    chan<int> c;
+    par {
+        c.write(1);
+        println("first " + c.read());
+    }
+    par {
+        c.write(2);
+        println("second " + c.read());
+    }
+}

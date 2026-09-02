@@ -24,8 +24,8 @@ export interface ImportDiagnostic {
   startCol: number;
   endCol: number;
   message: string;
-  severity: 'warning';
-  code: 'pj/import';
+  severity: 'warning' | 'info';
+  code: 'pj/import' | 'pj/note-import';
   source: 'lsp';
 }
 
@@ -38,6 +38,8 @@ export function importDiagnostics(res: ImportResolution, haveInstall: boolean): 
     if (r.files.length === 0) {
       const where = haveInstall ? '' : ' (no ProcessJ install found, so the standard library is unavailable)';
       out.push({ line: span.start.line, startCol: span.start.col, endCol: span.end.col, message: `Cannot find import '${name}'${where}; looked in ${r.searched.map((d) => path.basename(d) || d).join(', ')}`, severity: 'warning', code: 'pj/import', source: 'lsp' });
+    } else if (r.userLibrary) {
+      out.push({ line: span.start.line, startCol: span.start.col, endCol: span.end.col, message: `Note: this ProcessJ build cannot link a user library such as '${name}' (the editor still understands it)`, severity: 'info', code: 'pj/note-import', source: 'lsp' });
     }
   }
   return out;

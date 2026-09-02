@@ -1,0 +1,17 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    chan<int> a;
+    chan<int> b;
+    par {
+        par {
+            a.write(1);
+            b.write(2);
+        }
+        {
+            int x = a.read();
+            int y = b.read();
+            println("sum " + (x + y));
+        }
+    }
+}

@@ -1,0 +1,9 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    timer t;
+    long start = t.read();
+    t.timeout(5);
+    long elapsed = t.read() - start;
+    println("elapsed >= 0: " + (elapsed >= 0));
+}

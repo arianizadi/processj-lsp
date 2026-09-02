@@ -188,6 +188,11 @@ test('a read guard in an alt with other guards does not block by itself', () => 
   assert.ok(lone.codes.includes('pj/channel-no-writer'));
 });
 
+test('a par for body is many processes: writes and reads of one channel inside it are not a self-deadlock', () => {
+  const r = run(MAIN('    shared chan<int> c;\n    par for (int i = 0; i < 4; i++) {\n        if (i % 2 == 0) c.write(i);\n        else println("odd " + c.read());\n    }'));
+  assert.deepEqual(r.codes.filter((c) => (c ?? '').startsWith('pj/channel')), []);
+});
+
 test('a channel written and read by the same sequential process is a self-deadlock', () => {
   const bad = run(MAIN('    chan<int> c;\n    c.write(1);\n    int x = c.read();\n    println(x);'));
   assert.deepEqual(bad.codes, ['pj/channel-self-deadlock']);
@@ -258,7 +263,7 @@ test('unused and shadowed variables, constants; nothing about compiler internals
   const r = run(MAIN('    timer t;\n    int index = 0;\n    int dead;\n    int args = 1;\n    const int k = args;\n    alt {\n        v = c.read() : { }\n        t.timeout(100) : { }\n    }\n    alt { v = c.read() : { } }\n    t.timeout(5);\n    println(index + k);', 'public void f(chan<int>.read c, int v) { }').replace('public void main(string[] args) {', 'public void main(string[] args) {\n    chan<int>.read c; int v;'));
   const codes = new Set(r.codes);
   for (const c of ['pj/unused', 'pj/shadows-parameter', 'pj/type/const-init']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
-  for (const c of ['pj/alt-timeout', 'pj/reserved-alt-name', 'pj/timeout-noop']) assert.ok(!codes.has(c), `${c} must not be reported`);
+  for (const d of r.diagnostics) if ((d.code ?? '').startsWith('pj/note-')) assert.equal(d.severity, 'info', `${d.code} is a note`);
   assert.ok(codes.has('pj/multiple-alts'), 'a second alt in one procedure cannot be built');
   assert.ok(r.messages.some((m) => /'dead' is never used/.test(m)));
 });

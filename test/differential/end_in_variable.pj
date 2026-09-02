@@ -1,0 +1,11 @@
+// outcome: compiler-limit
+import std.*;
+public void main(string[] args) {
+    chan<int> c;
+    chan<int>.read r = c.read;
+    chan<int>.write w = c.write;
+    par {
+        w.write(9);
+        println("got " + r.read());
+    }
+}

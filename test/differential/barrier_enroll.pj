@@ -1,0 +1,14 @@
+// outcome: runs
+import std.*;
+public void worker(barrier b, int id) {
+    println("before " + id);
+    b.sync();
+    println("after " + id);
+}
+public void main(string[] args) {
+    barrier b;
+    par enroll (b) {
+        worker(b, 1);
+        worker(b, 2);
+    }
+}

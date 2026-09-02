@@ -1,0 +1,11 @@
+// outcome: compiler-limit
+import std.*;
+const int N = 3;
+public void producer(chan<int>.write out, int id) { out.write(id * 10); }
+public void main(string[] args) {
+    chan<int>[] cs = new chan<int>[N];
+    par {
+        par for (int i = 0; i < N; i++) producer(cs[i].write, i);
+        for (int j = 0; j < N; j++) println("got " + cs[j].read());
+    }
+}

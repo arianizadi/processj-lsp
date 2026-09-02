@@ -1,0 +1,11 @@
+// outcome: runs
+import std.*;
+public void sink(chan<int>.read in) { println("sink " + in.read()); }
+public void relay(chan<int>.read in) { sink(in); }
+public void main(string[] args) {
+    chan<int> c;
+    par {
+        c.write(3);
+        relay(c.read);
+    }
+}

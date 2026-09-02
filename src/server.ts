@@ -49,7 +49,7 @@ import {
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 
-import type { FixHint, LintDiagnostic } from './analysis';
+import { lexDiagnostics, type FixHint, type LintDiagnostic } from './analysis';
 import { astSymbols } from './astsymbols';
 import { check, type CheckResult } from './checker/checker';
 import { DeclIndex, signatureStr } from './checker/index';
@@ -315,7 +315,8 @@ function lintDiagnostics(doc: TextDocument): Diagnostic[] {
   });
   if (!settings.lint) return syntax;
   const { checked, importDiags } = checkFor(doc);
-  return [...syntax, ...importDiags.map((d) => makeDiagnostic(doc, d)), ...checked.diagnostics.map((d) => makeDiagnostic(doc, d))];
+  const notes = lexDiagnostics(doc.getText()).map((d) => makeDiagnostic(doc, d));
+  return [...syntax, ...notes, ...importDiags.map((d) => makeDiagnostic(doc, d)), ...checked.diagnostics.map((d) => makeDiagnostic(doc, d))];
 }
 
 /** Type-check a document against its own declarations, its imports and the standard library. */

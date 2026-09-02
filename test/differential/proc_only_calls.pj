@@ -1,0 +1,14 @@
+// outcome: runs
+import std.*;
+public void ping(chan<int>.write out) { out.write(1); }
+public void pong(chan<int>.read in) { println("pong " + in.read()); }
+public void both(chan<int>.write w, chan<int>.read r) {
+    par {
+        ping(w);
+        pong(r);
+    }
+}
+public void main(string[] args) {
+    chan<int> c;
+    both(c.write, c.read);
+}

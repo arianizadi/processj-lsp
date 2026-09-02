@@ -1,0 +1,27 @@
+// outcome: compiler-limit
+import std.*;
+record Inner { int a; }
+record Outer { Inner in; double d; }
+protocol Msg { num : { int n; } text : { string s; } }
+public void show(Msg m) {
+    switch (m) {
+        case num: println("num " + m.n); break;
+        case text: println("text " + m.s); break;
+    }
+}
+public void main(string[] args) {
+    Outer o = new Outer { in = new Inner { a = 2 }, d = 1.5 };
+    int[][] grid = new int[2][3];
+    grid[1][2] = o.in.a;
+    long big = grid[1][2] * 1000000000L;
+    byte b = 7;
+    short sh = b;
+    char ch = 'x';
+    string s = "" + ch + b + sh + big + o.d;
+    double avg = (big + 1) / 2.0;
+    int rounded = (int) avg;
+    boolean ok = avg > 1 && rounded >= 1 || false;
+    show(new Msg { num: n = rounded });
+    show(new Msg { text: s = s });
+    println(ok ? "ok" : "no");
+}

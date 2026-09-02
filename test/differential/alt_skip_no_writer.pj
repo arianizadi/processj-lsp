@@ -1,0 +1,18 @@
+// outcome: runs
+import std.*;
+public void reader(chan<int>.read in1, chan<int>.read in2) {
+    int v = 0;
+    alt {
+        v = in1.read() : { println("from 1 " + v); }
+        v = in2.read() : { println("from 2 " + v); }
+        skip : { println("skip"); }
+    }
+}
+public void main(string[] args) {
+    chan<int> c1;
+    chan<int> c2;
+    par {
+        reader(c1.read, c2.read);
+        c1.write(1);
+    }
+}

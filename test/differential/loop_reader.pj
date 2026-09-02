@@ -1,0 +1,20 @@
+// outcome: runs
+import std.*;
+public void producer(chan<int>.write out, int n) {
+    for (int i = 0; i < n; i++) out.write(i);
+}
+public void consumer(chan<int>.read in, int n) {
+    int i = 0;
+    while (i < n) {
+        int v = in.read();
+        println("v " + v);
+        i++;
+    }
+}
+public void main(string[] args) {
+    chan<int> c;
+    par {
+        producer(c.write, 3);
+        consumer(c.read, 3);
+    }
+}

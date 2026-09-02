@@ -1,0 +1,9 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    shared chan<int> c;
+    par for (int i = 0; i < 4; i++) {
+        if (i % 2 == 0) c.write(i);
+        else println("odd read " + c.read());
+    }
+}
