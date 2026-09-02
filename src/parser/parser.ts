@@ -155,29 +155,35 @@ class Parser {
     }
   }
 
-  private error(tok: Token, message: string): void {
+  private error(tok: Token, message: string, fix?: A.ParseFix): void {
     const idx = tok === this.eof ? this.toks.length : this.i;
     // One error per token position: avoids cascades after a recovery.
     if (idx === this.lastErrorTok) return;
     this.lastErrorTok = idx;
-    this.errors.push({ line: tok.line, col: tok.col, endCol: Math.max(tok.end, tok.col + 1), message });
+    this.errors.push({ line: tok.line, col: tok.col, endCol: Math.max(tok.end, tok.col + 1), message, fix });
   }
 
-  /** Error placed just after the previous token (for "missing ';'" style messages). */
-  private errorAfterPrevious(message: string): void {
+  /** Replace the token's text with `text` as the quick fix for an error on it. */
+  private replaceFix(tok: Token, text: string, title: string): A.ParseFix {
+    return { title, line: tok.line, col: tok.col, endCol: tok.end, text };
+  }
+
+  /** Error placed just after the previous token (for "missing ';'" style messages); the fix inserts `insert`. */
+  private errorAfterPrevious(message: string, insert?: string): void {
     const prev = this.toks[this.i - 1];
     if (!prev) return this.error(this.peek(), message);
     const idx = this.i;
     if (idx === this.lastErrorTok) return;
     this.lastErrorTok = idx;
-    this.errors.push({ line: prev.line, col: prev.end, endCol: prev.end + 1, message });
+    const fix = insert !== undefined ? { title: `Insert '${insert}'`, line: prev.line, col: prev.end, endCol: prev.end, text: insert } : undefined;
+    this.errors.push({ line: prev.line, col: prev.end, endCol: prev.end + 1, message, fix });
   }
 
   private expect(text: string, what: string): Token | undefined {
     if (this.at(text)) return this.next();
     const t = this.peek();
     if (text === ';' || text === ')' || text === ']' || text === '>') {
-      this.errorAfterPrevious(`Missing '${text}' ${what}`);
+      this.errorAfterPrevious(`Missing '${text}' ${what}`, text);
     } else {
       this.error(t, `Expected '${text}' ${what} but found ${this.describe(t)}`);
     }
@@ -345,7 +351,7 @@ class Parser {
     if (t.kind === 'ident' && !this.atIdent(1) && !this.at('[', 1)) {
       const s = suggest(t.text, TOP_LEVEL_KEYWORDS);
       if (s) {
-        this.error(t, `Unknown declaration '${t.text}'; did you mean '${s}'?`);
+        this.error(t, `Unknown declaration '${t.text}'; did you mean '${s}'?`, this.replaceFix(t, s, `Change to '${s}'`));
         this.next();
         return undefined;
       }
@@ -364,7 +370,9 @@ class Parser {
     if (this.at('protocol')) return this.parseProtocol(modifiers, start);
 
     if (this.at('proc')) {
-      this.error(this.peek(), "'proc' is not accepted by the current compiler; write the return type and name directly, e.g. 'public void main(string[] args)'");
+      const t = this.peek();
+      const gap = this.peek(1).line === t.line ? this.peek(1).col : t.end;
+      this.error(t, "'proc' is not accepted by the current compiler; write the return type and name directly, e.g. 'public void main(string[] args)'", { title: "Remove 'proc'", line: t.line, col: t.col, endCol: gap, text: '' });
       this.next();
     }
 
@@ -766,7 +774,7 @@ class Parser {
 
   /** Report a misspelled keyword, then parse the statement as if it had been spelled right so its body is still checked. */
   private retryAsKeyword(t: Token, keyword: string): A.Stmt | undefined {
-    this.error(t, `Unknown statement '${t.text}'; did you mean '${keyword}'?`);
+    this.error(t, `Unknown statement '${t.text}'; did you mean '${keyword}'?`, this.replaceFix(t, keyword, `Change to '${keyword}'`));
     this.next();
     this.toks.splice(this.i, 0, { kind: 'keyword', text: keyword, line: t.line, col: t.col, end: t.end });
     return this.parseStatement();
@@ -819,7 +827,7 @@ class Parser {
     // Capitalised names are left alone: they may be records imported from another file.
     if (type.kind === 'NamedType' && !this.declaredTypes.has(type.name.name) && /^[a-z]/.test(type.name.name)) {
       const s = suggest(type.name.name, [...TYPE_KEYWORDS, 'return', 'break', 'continue']);
-      if (s) this.error(typeTok, `Unknown type '${type.name.name}'; did you mean '${s}'?`);
+      if (s) this.error(typeTok, `Unknown type '${type.name.name}'; did you mean '${s}'?`, this.replaceFix(typeTok, s, `Change to '${s}'`));
     }
     const declarators = this.parseDeclarators();
     return { kind: 'LocalDecl', isConst, isMobile, type, declarators, span: this.span(start) };
@@ -1040,7 +1048,7 @@ class Parser {
       const e = this.parseExpression();
       if (e.kind === 'AssignExpr' && e.op === '=' && e.value.kind === 'ChanRead') guard = { kind: 'ReadGuard', target: e.target, read: e.value, span: this.span(gstart) };
       else if (e.kind === 'Timeout') guard = { kind: 'TimeoutGuard', timeout: e, span: this.span(gstart) };
-      else if (e.kind === 'ChanRead') this.error(gtok, `An alt guard must store the value: write 'v = ${sourceOf(e.target)}.read()'`);
+      else if (e.kind === 'ChanRead') this.error(gtok, `An alt guard must store the value: write 'v = ${sourceOf(e.target)}.read()'`, { title: "Store the value in 'v'", line: gtok.line, col: gtok.col, endCol: gtok.col, text: 'v = ' });
       else if (e.kind !== 'ErrorExpr') this.error(gtok, `Invalid alt guard ${describeExpr(e)}; a guard is 'v = c.read()', 'skip', or 't.timeout(ms)'`);
     }
     if (!this.expect(':', 'after the alt guard')) {

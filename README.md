@@ -23,8 +23,10 @@ An alt guard must store the value: write 'v = c.read()'
 'proc' is not accepted by the current compiler; write the return type and name directly
 ```
 
-The compiler's own "Syntax error" line is suppressed when the parser has a better
-message for the same problem.
+Each of these carries a quick fix (code action): change `pa` to `par`, insert the
+missing `;`, remove `proc`, add `v = ` before a bare read guard. The compiler's own
+"Syntax error" line is suppressed when the parser has a better message for the
+same problem.
 
 **A formatter.** `textDocument/formatting` prints the parse tree back in a
 canonical layout: 4-space indent, braces on the header line, spaces around

@@ -550,11 +550,21 @@ export interface ErrorExpr {
   span: Span;
 }
 
+export interface ParseFix {
+  title: string;
+  line: number;
+  col: number;
+  endCol: number;
+  text: string;
+}
+
 export interface ParseError {
   line: number;
   col: number;
   endCol: number;
   message: string;
+  /** A single-range edit that resolves the error (a replaced typo, an inserted token). */
+  fix?: ParseFix;
 }
 
 /** Render a type back to source form (used in hover text and symbols). */

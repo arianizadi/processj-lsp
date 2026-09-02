@@ -147,6 +147,16 @@ public void main(string[] args) {
   const actions = await request('textDocument/codeAction', { textDocument: { uri: uri2 }, range: shared.range, context: { diagnostics: [shared] } });
   check(actions.result.some((a) => /shared/.test(a.title) && a.edit), 'code action: make channel shared');
 
+  // Quick fix for a parser suggestion.
+  const uri4 = pathToFileURL(path.join(__dirname, 'smoke-typo.pj')).toString();
+  notify('textDocument/didOpen', { textDocument: { uri: uri4, languageId: 'processj', version: 1, text: 'import std.*;\n\npublic void main(string[] args) {\n    pa {\n        println("a");\n    }\n}\n' } });
+  const diag4 = await waitForDiagnostics(uri4, false);
+  const typo = diag4.params.diagnostics.find((d) => /did you mean 'par'/.test(d.message));
+  check(!!typo, 'parser: typo diagnostic with suggestion');
+  const fixes = await request('textDocument/codeAction', { textDocument: { uri: uri4 }, range: typo.range, context: { diagnostics: [typo] } });
+  const fix = fixes.result.find((a) => a.title === "Change to 'par'");
+  check(!!fix && fix.edit.changes[uri4][0].newText === 'par', "code action: Change to 'par'");
+
   // Full pipeline: build + run a valid program through the Run command.
   const uri3 = pathToFileURL(path.join(__dirname, 'SmokeHello.pj')).toString();
   const HELLO = 'import std.*;\n\npublic void main(string[] args) {\n    chan<int> c;\n    par {\n        c.write(41);\n        println("value " + (c.read() + 1));\n    }\n}\n';

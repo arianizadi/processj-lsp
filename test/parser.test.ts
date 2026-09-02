@@ -30,6 +30,7 @@ test('misspelled statement keyword gets a suggestion and the body is still parse
   const { errors, program } = parse(src);
   assert.equal(errors[0].line, 1);
   assert.match(errors[0].message, /Unknown statement 'pa'; did you mean 'par'\?/);
+  assert.deepEqual(errors[0].fix, { title: "Change to 'par'", line: 1, col: 4, endCol: 6, text: 'par' });
   assert.ok(errors.some((e) => e.line === 3 && /Expected an expression but found ';'/.test(e.message)));
   const main = program.decls[0];
   assert.equal(main.kind, 'ProcDecl');
@@ -43,6 +44,7 @@ test('missing semicolon is reported right after the statement, once', () => {
   assert.equal(errors[0].line, 1);
   assert.equal(errors[0].col, 13);
   assert.match(errors[0].message, /Missing ';' after the variable declaration/);
+  assert.deepEqual(errors[0].fix, { title: "Insert ';'", line: 1, col: 13, endCol: 13, text: ';' });
 });
 
 test('unclosed block names the line where it was opened', () => {

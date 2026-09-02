@@ -226,9 +226,11 @@ function scheduleCheck(doc: TextDocument, delayMs: number): void {
 
 function lintDiagnostics(doc: TextDocument): Diagnostic[] {
   const parsed = parsedFor(doc);
-  const syntax: Diagnostic[] = parsed.errors.map((e) =>
-    makeDiagnostic(doc, { line: e.line, startCol: e.col, endCol: e.endCol, message: e.message, severity: 'error', code: 'pj/syntax', source: 'parser' }),
-  );
+  const syntax: Diagnostic[] = parsed.errors.map((e) => {
+    const fix: FixHint | undefined = e.fix ? { kind: 'edit', title: e.fix.title, line: e.fix.line, col: e.fix.col, endCol: e.fix.endCol, text: e.fix.text } : undefined;
+    const raw: LintDiagnostic = { line: e.line, startCol: e.col, endCol: e.endCol, message: e.message, severity: 'error', code: 'pj/syntax', source: 'parser', fix };
+    return makeDiagnostic(doc, raw);
+  });
   if (!settings.lint) return syntax;
   const { symbols, locals } = symbolsFor(doc);
   const lints = analyze(doc.getText(), symbols, locals, { libraryNames }).map((d) => makeDiagnostic(doc, d));
@@ -345,6 +347,8 @@ connection.onCodeAction((params: CodeActionParams): CodeAction[] => {
       edit = TextEdit.insert(Position.create(line, 0), `${prefix}import std.*;\n`);
     } else if (fix.kind === 'make-shared') {
       edit = TextEdit.insert(Position.create(fix.line, fix.col), 'shared ');
+    } else if (fix.kind === 'edit') {
+      edit = TextEdit.replace(Range.create(fix.line, fix.col, fix.line, fix.endCol ?? fix.col), fix.text ?? '');
     }
     if (!edit) continue;
     actions.push({
