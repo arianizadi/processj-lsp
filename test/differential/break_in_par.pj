@@ -1,0 +1,9 @@
+// outcome: compiler-limit
+import std.*;
+public void main(string[] args) {
+    int n = 0;
+    par {
+        { while (true) { n++; if (n > 3) break; } println("n " + n); }
+        println("other");
+    }
+}

@@ -1,0 +1,6 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    par { { println("x"); stop; } println("y"); }
+    println("after par");
+}

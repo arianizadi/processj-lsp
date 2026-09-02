@@ -1,0 +1,12 @@
+// outcome: runs-wrong
+import std.*;
+public void quick() { println("quick done"); }
+public void main(string[] args) {
+    chan<int> c;
+    par {
+        quick();
+        println("read " + c.read());
+    }
+    println("after par");
+    c.write(1);
+}

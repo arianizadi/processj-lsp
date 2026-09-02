@@ -1,0 +1,4 @@
+// outcome: compiler-limit
+import std.*;
+record R { int x; }
+public void main(string[] args) { R r = null; r = new R { x = 1 }; println(r.x); }

@@ -1,0 +1,6 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    chan<int> c; int[] xs = new int[4]; xs[2] = 9;
+    par { { c.write(2); c.write(1); } { int v = xs[c.read()]; xs[1] = c.read(); println(v + xs[1]); } }
+}

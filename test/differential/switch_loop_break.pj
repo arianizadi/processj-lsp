@@ -1,0 +1,9 @@
+// outcome: compiler-limit
+import std.*;
+public void main(string[] args) {
+    int v = 1;
+    switch (v) {
+        case 1: while (true) { v++; if (v > 3) break; } println("v " + v); break;
+        default: println("d");
+    }
+}

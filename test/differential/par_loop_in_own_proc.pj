@@ -1,0 +1,12 @@
+// outcome: runs
+import std.*;
+public void worker(int i, chan<int>.write out) { out.write(i); }
+public void producer(chan<int>.write out) { for (int i = 0; i < 3; i++) worker(i, out); }
+public void main(string[] args) {
+    shared chan<int> c;
+    par {
+        producer(c.write);
+        for (int j = 0; j < 3; j++) println("got " + c.read());
+    }
+    println("after par");
+}

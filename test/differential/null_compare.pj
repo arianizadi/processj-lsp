@@ -1,0 +1,4 @@
+// outcome: runs
+import std.*;
+record R { int x; }
+public void main(string[] args) { R r = new R { x = 1 }; if (r == null) println("null"); else println("ok"); }

@@ -1,0 +1,7 @@
+// outcome: error
+import std.*;
+public void main(string[] args) {
+    chan<int> c; int[] xs = new int[4];
+    par { c.write(2); xs[c.read()] = 7; }
+    println(xs[2]);
+}

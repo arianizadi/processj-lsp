@@ -1,0 +1,37 @@
+// expect: none
+// notes: pj/note-narrow-literal, pj/note-par-gc, pj/note-par-gc, pj/note-par-gc
+import std.*;
+
+record Box { int value; }
+
+// Close relatives of the compiler bugs that this build handles fine. None of
+// these should get a warning or an error.
+public void main(string[] args) {
+    chan<int> c;
+    int[] xs = new int[4];
+    Box b = new Box { value = 3 };
+    if (b == null) println("never");      // comparing with null works; only assigning null breaks
+    par {
+        c.write(2);
+        { int v = xs[c.read()]; println(v); }   // a read inside an index on the right-hand side is fine
+    }
+    par {
+        c.write(5);
+        { xs[1] = c.read(); println(xs[1]); }   // assigning a read to an element is fine
+    }
+    int n = 0;
+    while (true) {                            // break in a loop around a par is fine; only inside a par branch breaks
+        par { c.write(n); println(c.read()); }
+        n++;
+        if (n == 2) break;
+    }
+    for (int i = 0; i < 3; i++) {             // break inside a switch inside a loop is fine
+        switch (i) { case 1: n = n + 10; break; default: n++; }
+    }
+    switch (n) {                              // a loop inside a case without break is fine
+        case 14: for (int i = 0; i < 3; i++) n++; break;
+        default: n = 0;
+    }
+    char semi = 59;                           // (char) 59 is the way to print ';'
+    println("n " + n + semi);
+}

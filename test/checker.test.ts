@@ -29,7 +29,7 @@ export function run(src: string, opts: { std?: boolean } = {}) {
   const importsStd = /import\s+std\b/.test(src);
   if (opts.std !== false && importsStd) index.addIndex(STD);
   const result = check(parsed.program, { index, stdIndex: STD, importsStd, text: src });
-  return { ...result, codes: result.diagnostics.map((d) => d.code), messages: result.diagnostics.map((d) => `${d.line + 1}: ${d.message}`), errors: result.diagnostics.filter((d) => d.severity === 'error') };
+  return { ...result, codes: result.diagnostics.filter((d) => d.severity !== 'info').map((d) => d.code), notes: result.diagnostics.filter((d) => d.severity === 'info').map((d) => `${d.line + 1}:${d.code}`), messages: result.diagnostics.filter((d) => d.severity !== 'info').map((d) => `${d.line + 1}: ${d.message}`), errors: result.diagnostics.filter((d) => d.severity === 'error') };
 }
 
 const MAIN = (body: string, extra = '') => `import std.*;\n${extra}\npublic void main(string[] args) {\n${body}\n}\n`;
@@ -217,10 +217,10 @@ test('starving loops: infinite loops that never communicate, unless they can exi
 test('par deadlock simulation: crossed orders, unmatched writes, and correct pairings', () => {
   const crossed = run(MAIN('    chan<int> c;\n    chan<int> d;\n    par {\n        { c.write(1); int x = d.read(); println(x); }\n        { d.write(2); int y = c.read(); println(y); }\n    }'));
   assert.deepEqual(crossed.codes, ['pj/par-deadlock']);
-  assert.match(crossed.diagnostics[0].message, /branch 1 waits to write 'c', branch 2 waits to write 'd'/);
+  assert.match(crossed.messages[0], /branch 1 waits to write 'c', branch 2 waits to write 'd'/);
   const unmatched = run(MAIN('    chan<int> c;\n    par {\n        { c.write(1); c.write(2); }\n        println(c.read());\n    }'));
   assert.deepEqual(unmatched.codes, ['pj/par-deadlock']);
-  assert.match(unmatched.diagnostics[0].message, /branch 1 waits to write 'c' but every other branch has finished/);
+  assert.match(unmatched.messages[0], /branch 1 waits to write 'c' but every other branch has finished/);
   const fine = run(MAIN('    chan<int> c;\n    chan<int> d;\n    par {\n        { c.write(1); int x = d.read(); println(x); }\n        { int y = c.read(); d.write(y + 1); }\n    }'));
   assert.deepEqual(fine.codes, []);
   // Opaque branches (a loop, a call that takes a channel) switch the simulation off.
@@ -236,7 +236,7 @@ test('par for: outer variables and non-shared ends are shared by every iteration
 
 test('pri alt with skip before other guards, trivial alt and par, unreachable code, assignment in condition, barrier not enrolled', () => {
   const r = run(MAIN('    int v = 0;\n    boolean b = true;\n    string s = "x";\n    string t = "y";\n    barrier bar;\n    pri alt {\n        skip : { v = 1; }\n        v = c.read() : { }\n    }\n    alt { v = c.read() : { } }\n    par { println(v); }\n    if (b = true) { }\n    if (s == "x") { }\n    if (s == t) { }\n    bar.sync();\n    return;\n    println(v);', 'public void f(chan<int>.read c) { }').replace('public void main(string[] args) {', 'public void main(string[] args) {\n    chan<int>.read c;'));
-  const codes = new Set(r.codes);
+  const codes = new Set(r.diagnostics.map((d) => d.code));
   for (const c of ['pj/pri-alt-skip', 'pj/trivial-alt', 'pj/trivial-par', 'pj/unreachable', 'pj/assign-in-condition', 'pj/barrier-not-enrolled']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
   assert.ok(!codes.has('pj/string-identity'));
 });
@@ -257,6 +257,41 @@ test('reads that must be their own statement: inside ?:, inside a write value; c
   const calls = r.diagnostics.filter((d) => d.code === 'pj/call-as-condition');
   assert.deepEqual(calls.map((d) => d.line + 1), [16, 17]);
   assert.equal(calls[0].fix?.text, ' == true');
+});
+
+test('every confirmed compiler bug that depends on the code is reported at its point of use', () => {
+  const r = run(MAIN(
+    [
+      '    chan<int> c;',
+      '    R rr = null;',
+      '    byte b = 1;',
+      '    println("a;b");',
+      '    suspend;',
+      '    par {',
+      '        for (int i = 0; i < 3; i++) worker(i, c.write);',
+      '        { while (true) { int v = c.read(); if (v > 1) break; } }',
+      '    }',
+      '    int k = 1;',
+      '    switch (k) {',
+      '        case 1: while (true) { k++; if (k > 3) break; } break;',
+      '    }',
+      '    int[] xs = new int[c.read()];',
+      '    xs[c.read()] = 1;',
+      '    int f = c.read().x;',
+      '    par for (int j = 0; j < 2; j++) println(j);',
+      '    if (rr == null) rr = new R { x = 1 };',
+      '    stop;',
+    ].join('\n'),
+    'record R { int x; }\nrecord Cyc { Cyc next; }\npublic void worker(int i, chan<int>.write out) { out.write(i); }',
+  ));
+  const lines = r.diagnostics.map((d) => `${d.line + 1}:${d.code}`);
+  // Line numbers: MAIN adds two lines (import + extra decls) before the body.
+  const want = ['3:pj/compiler-limit', '7:pj/compiler-limit', '8:pj/note-narrow-literal', '9:pj/note-semicolon-string', '10:pj/note-ignored-statement', '11:pj/note-par-gc', '12:pj/note-par-loop-calls', '13:pj/compiler-limit', '17:pj/compiler-limit', '19:pj/read-placement', '20:pj/read-placement', '21:pj/read-placement', '22:pj/note-par-gc', '24:pj/note-ignored-statement'];
+  for (const w of want) assert.ok(lines.includes(w), `${w} in ${lines.join(' ')}`);
+  // Comparing with null is fine and reads inside an index on the right-hand side are fine.
+  assert.equal(lines.filter((l) => l.startsWith('23:')).length, 0, lines.join(' '));
+  const fine = run(MAIN('    chan<int> c;\n    int[] xs = new int[4];\n    par { c.write(2); { int v = xs[c.read()]; xs[1] = c.read(); println(v); } }\n    while (true) { par { c.write(1); println(c.read()); } break; }\n    int n = 0;\n    for (int i = 0; i < 3; i++) { switch (i) { case 1: n++; break; default: n--; } }\n    switch (n) { case 1: for (int i = 0; i < 3; i++) n++; break; }'));
+  assert.deepEqual(fine.codes, [], fine.messages.join('\n'));
 });
 
 test('unused and shadowed variables, constants; nothing about compiler internals', () => {

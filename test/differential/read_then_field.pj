@@ -1,0 +1,7 @@
+// outcome: error
+import std.*;
+record R { int x; }
+public void main(string[] args) {
+    chan<R> c;
+    par { c.write(new R { x = 5 }); println(c.read().x); }
+}

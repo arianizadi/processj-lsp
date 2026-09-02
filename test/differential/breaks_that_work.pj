@@ -1,0 +1,9 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    int v = 1; int n = 0;
+    switch (v) { case 1: for (int i = 0; i < 3; i++) n++; println("n " + n); break; default: println("d"); }
+    for (int i = 0; i < 3; i++) { switch (i) { case 1: n = n + 10; break; default: n++; } }
+    while (true) { par { println("p"); println("q"); } n++; if (n > 15) break; }
+    println(n);
+}

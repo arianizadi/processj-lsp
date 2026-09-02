@@ -1,0 +1,29 @@
+// expect: pj/compiler-limit, pj/compiler-limit, pj/compiler-limit, pj/compiler-limit, pj/read-placement, pj/read-placement, pj/read-placement
+// notes: pj/note-par-gc, pj/note-par-gc
+import std.*;
+
+record Node { int value; Node next; }   // a record that contains itself overflows the compiler
+
+public void main(string[] args) {
+    chan<int> c;
+    chan<Node> nodes;
+    Node n = null;                       // assigning null: "cannot assign void"; n == null would be fine
+    int k = 0;
+    par {
+        { while (true) { k++; if (k > 3) break; } }   // break anywhere inside a par branch is rejected
+        println("other");
+    }
+    switch (k) {
+        case 1: while (true) { k++; if (k > 6) break; } break;   // a loop with break inside a case: false "unreachable"
+        default: k = 0;
+    }
+    par {
+        { c.write(4); c.write(1); nodes.write(n); }
+        {
+            int[] xs = new int[c.read()];    // a read as an array size
+            xs[c.read()] = 1;                // a read indexing the array being assigned
+            int v = nodes.read().value;      // a field taken from a read
+            println(v + " " + (n == null));
+        }
+    }
+}

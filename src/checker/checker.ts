@@ -116,6 +116,8 @@ class Checker {
   private chanUses = new Map<VarInfo, ChanUse>();
   private insideAlt = 0;
   private altCount = 0;
+  /** >0 while inside a par block's branches. */
+  private parDepth = 0;
   /** >0 while checking a read guard of an alt that has other guards: such a read does not block by itself. */
   private inChoiceGuard = 0;
   /** Name expressions that are the target of `.read` / `.write` / `.read()` / `.write(v)`: not "bare" uses of the channel. */
@@ -281,12 +283,35 @@ class Checker {
           break;
       }
     }
+    for (const d of p.decls) {
+      if (d.kind === 'RecordDecl' && this.memberCycle(d.name.name, 'record')) this.report(d.name.span, 'warning', 'pj/compiler-limit', `Record '${d.name.name}' refers back to itself through its fields, which overflows this ProcessJ build's stack; break the cycle`);
+      if (d.kind === 'ProtocolDecl' && this.memberCycle(d.name.name, 'protocol')) this.report(d.name.span, 'warning', 'pj/compiler-limit', `Protocol '${d.name.name}' refers back to itself through its case fields, which overflows this ProcessJ build's stack; break the cycle`);
+    }
     for (const d of p.decls) if (d.kind === 'ProcDecl') this.procDecl(d);
     for (const d of this.yields.needingAnnotation(p)) {
       if (hasYieldAnnotation(d) || !d.body) continue;
       const at = d.body.span.start;
       this.report(d.name.span, 'warning', 'pj/needs-yield-annotation', `'${d.name.name}' suspends only through the procedures it calls; mark it [yield=true] so it is compiled as a suspending process`, { kind: 'edit', title: 'Add [yield=true]', line: at.line, col: at.col, endCol: at.col, text: '[yield=true] ' });
     }
+  }
+
+  /** Does a record or protocol reach itself again through member types (records and protocol cases)? */
+  private memberCycle(name: string, kind: 'record' | 'protocol'): boolean {
+    const seen = new Set<string>();
+    const visit = (n: string, k: 'record' | 'protocol', first: boolean): boolean => {
+      const key = `${k}:${n}`;
+      if (!first && key === `${kind}:${name}`) return true;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      const types: Type[] = k === 'record' ? [...this.index.recordFields(n).values()] : [...this.index.protocolCases(n).values()].flatMap((f) => [...f.values()]);
+      for (const t of types) {
+        const inner = t.k === 'array' ? t.elem : t;
+        if (inner.k === 'record' && visit(inner.name, 'record', false)) return true;
+        if (inner.k === 'protocol' && visit(inner.name, 'protocol', false)) return true;
+      }
+      return false;
+    };
+    return visit(name, kind, true);
   }
 
   private procDecl(d: A.ProcDecl): void {
@@ -383,8 +408,12 @@ class Checker {
         return this.block(s);
       case 'EmptyStmt':
       case 'SkipStmt':
+        return;
       case 'StopStmt':
+        this.report(s.span, 'info', 'pj/note-ignored-statement', "Note: this ProcessJ build ignores 'stop'; the process ends normally instead of stopping");
+        return;
       case 'SuspendStmt':
+        this.report(s.span, 'info', 'pj/note-ignored-statement', "Note: this ProcessJ build ignores 'suspend'; execution continues");
         return;
       case 'LocalDecl':
         return this.localDecl(s);
@@ -427,6 +456,7 @@ class Checker {
         if (!s.isPar) this.checkStarvingLoop(s.span, s.cond, s.body, 'for');
         if (s.isPar) {
           const use = this.branch(this.scope.depth, () => this.loop(() => this.stmt(s.body)), true);
+          this.report(firstLine(s.span, 7), 'info', 'pj/note-par-gc', PAR_GC_NOTE);
           // Every iteration is its own process, so anything from outside the loop is shared by all of them.
           const seen = new Set<VarInfo>();
           for (const [v, span] of use.writes) {
@@ -479,6 +509,7 @@ class Checker {
         return this.altStmt(s);
       case 'ReturnStmt': {
         if (!this.proc) return;
+        if (s.expr) this.noteNull(s.expr);
         if (isPrim(this.procRet, 'void')) {
           if (s.expr) {
             this.expr(s.expr);
@@ -496,9 +527,11 @@ class Checker {
       }
       case 'BreakStmt':
         if (this.loopDepth === 0 && this.switchDepth === 0) this.error(s.span, 'pj/type/break', "'break' outside of a loop or switch");
+        else if (this.parDepth > 0) this.report(s.span, 'warning', 'pj/compiler-limit', "'break' inside a par branch, even within a loop, is rejected by this ProcessJ build; move the loop into its own procedure");
         return;
       case 'ContinueStmt':
         if (this.loopDepth === 0) this.error(s.span, 'pj/type/break', "'continue' outside of a loop");
+        else if (this.parDepth > 0) this.report(s.span, 'warning', 'pj/compiler-limit', "'continue' inside a par branch is rejected by this ProcessJ build; move the loop into its own procedure");
         return;
       case 'LabeledStmt':
         return this.stmt(s.stmt);
@@ -556,6 +589,7 @@ class Checker {
       const t: Type = v.dims > 0 ? { k: 'array', elem: base.k === 'array' ? base.elem : base, dims: (base.k === 'array' ? base.dims : 0) + v.dims } : base;
       // The initialiser is checked before the name is in scope: `int x = x + 1` is an error.
       if (v.init) {
+        if (isPrim(t, 'byte', 'short', 'char') && isIntLiteral(v.init)) this.report(v.init.span, 'info', 'pj/note-narrow-literal', `Note: this ProcessJ build prints a spurious "cannot assign int to ${typeStr(t)}" error for this initialiser; the program still builds`);
         this.checkInit(t, v.init, v.name.name);
         if (d.isConst && !(isLiteralInit(v.init) && this.onlyConstNames(v.init))) this.error(v.init.span, 'pj/type/const-init', 'A constant can only be initialised with literals and other constants');
       }
@@ -588,6 +622,7 @@ class Checker {
       this.arrayLiteral(init, t, name);
       return;
     }
+    this.noteNull(init);
     const it = this.expr(init);
     if (!this.assignableExpr(t, it, init)) this.error(init.span, 'pj/type/assign', `Cannot initialise '${name}' (${typeStr(t)}) with a value of type ${typeStr(it)}${why(t, it)}`);
   }
@@ -645,6 +680,12 @@ class Checker {
       this.push();
       this.withCase(protoVar && tag ? [protoVar, tag] : undefined, () => this.stmts(g.stmts));
       this.pop();
+      for (const st of g.stmts) {
+        if ((st.kind === 'WhileStmt' || st.kind === 'DoStmt' || st.kind === 'ForStmt') && containsBreak(st.body)) {
+          this.report(st.span.start.line === st.span.end.line ? st.span : { start: st.span.start, end: { line: st.span.start.line, col: st.span.start.col + 5 } }, 'warning', 'pj/compiler-limit', "A loop with 'break' inside a switch case is rejected as unreachable by this ProcessJ build; move the loop into its own procedure");
+          break;
+        }
+      }
     }
     this.switchDepth--;
   }
@@ -727,13 +768,24 @@ class Checker {
 
   private parBlock(s: A.ParBlock): void {
     const branches: BranchUse[] = [];
+    this.parDepth++;
     this.push();
     for (const st of s.body.stmts) {
       const use = this.branch(this.scope.depth, () => this.stmt(st));
       branches.push(use);
     }
     this.pop();
+    this.parDepth--;
     this.simulateRendezvous(s);
+    if (s.body.stmts.length >= 2) {
+      const loopy = s.body.stmts.filter((st) => containsLoop(st));
+      for (const st of loopy) {
+        if (loopCallsSuspending(st, (name) => (this.index.procs.get(name) ?? []).some((c) => this.yields.procYields(c.decl)))) {
+          this.report(firstLine(st.span), 'info', 'pj/note-par-loop-calls', 'Note: in this ProcessJ build a par branch that loops over calls to suspending procedures can end the par early (calls counted against the wrong par); put the loop in its own procedure');
+        }
+      }
+      this.report(firstLine(s.span, 3), 'info', 'pj/note-par-gc', PAR_GC_NOTE);
+    }
 
     const reported = new Set<VarInfo>();
     for (let x = 0; x < branches.length; x++) {
@@ -987,6 +1039,7 @@ class Checker {
           case 'boolean':
             return T.boolean;
           case 'string':
+            if (e.text.includes(';')) this.report(e.span, 'info', 'pj/note-semicolon-string', "Note: this ProcessJ build strips ';' inside string literals in the generated code (\"a;b\" prints ab)");
             return T.string;
           case 'char':
             return T.char;
@@ -1093,6 +1146,8 @@ class Checker {
         const elem = this.resolveType(e.elem);
         for (const d of e.dimExprs) {
           const dt = this.expr(d);
+          const nested = findRead(d);
+          if (nested) this.error(nested.span, 'pj/read-placement', 'A channel read cannot be used as an array size; read it into a variable first');
           if (!isLenient(dt) && !isIntegral(dt)) this.error(d.span, 'pj/type/index', `Array size must be an integer, not ${typeStr(dt)}`);
         }
         const dims = e.dimExprs.length + e.extraDims;
@@ -1245,8 +1300,18 @@ class Checker {
     return t;
   }
 
+  /** `x = null` and `T x = null` are rejected by this compiler ("cannot assign void"); `x == null` is fine. */
+  private noteNull(e: A.Expr): void {
+    if (e.kind === 'Literal' && e.litKind === 'null') this.report(e.span, 'warning', 'pj/compiler-limit', "'null' cannot be assigned or passed in this ProcessJ build (it treats null as void, and later uses of the variable fail the build); comparing with null is fine");
+  }
+
   private assign(e: A.AssignExpr): Type {
     const lt = this.lvalue(e.target);
+    this.noteNull(e.value);
+    if (e.target.kind === 'ArrayAccess') {
+      const nested = findRead(e.target.index);
+      if (nested) this.error(nested.span, 'pj/read-placement', 'A channel read cannot index the array being assigned; read it into a variable first');
+    }
     if (e.value.kind === 'ArrayLiteral') {
       this.arrayLiteral(e.value, lt, exprText(e.target));
       return lt;
@@ -1350,6 +1415,7 @@ class Checker {
 
   private access(e: A.RecordAccess): Type {
     const t = this.expr(e.target);
+    if (e.target.kind === 'ChanRead') this.error(e.target.span, 'pj/read-placement', 'A field cannot be taken from a channel read directly; read it into a variable first');
     const m = e.member.name;
     if (isLenient(t)) return T.unknown;
     if (t.k === 'array') {
@@ -1390,6 +1456,7 @@ class Checker {
 
   private invocation(e: A.Invocation): Type {
     const args = e.args.map((a) => this.expr(a));
+    for (const a of e.args) this.noteNull(a);
     for (const a of e.args) {
       if (a.kind === 'RecordLiteral' || a.kind === 'ProtocolLiteral') this.report(a.span, 'warning', 'pj/compiler-limit', 'A record or protocol literal passed directly as an argument cannot be compiled by this ProcessJ build; store it in a variable first');
     }
@@ -1526,6 +1593,81 @@ function returnsInside(s: A.Stmt): boolean {
       return s.body.stmts.some(returnsInside);
     case 'LabeledStmt':
       return returnsInside(s.stmt);
+    default:
+      return false;
+  }
+}
+
+/** Reproduced: par { quick(); c.read(); } prints what follows the par as soon as the first young-generation GC runs. */
+const PAR_GC_NOTE = 'Note: this ProcessJ build can end a par early: once a branch has finished, the next garbage collection counts it twice; if that matters, have each branch signal on a channel read after the par';
+
+function firstLine(span: A.Span, width = 0): A.Span {
+  return { start: span.start, end: { line: span.start.line, col: width ? span.start.col + width : span.end.line === span.start.line ? span.end.col : span.start.col + 1 } };
+}
+
+function containsLoop(s: A.Stmt): boolean {
+  switch (s.kind) {
+    case 'WhileStmt':
+    case 'DoStmt':
+    case 'ForStmt':
+      return true;
+    case 'Block':
+      return s.stmts.some(containsLoop);
+    case 'IfStmt':
+      return containsLoop(s.then) || (!!s.else && containsLoop(s.else));
+    case 'LabeledStmt':
+      return containsLoop(s.stmt);
+    default:
+      return false;
+  }
+}
+
+function containsBreak(s: A.Stmt): boolean {
+  switch (s.kind) {
+    case 'BreakStmt':
+      return true;
+    case 'Block':
+      return s.stmts.some(containsBreak);
+    case 'IfStmt':
+      return containsBreak(s.then) || (!!s.else && containsBreak(s.else));
+    case 'WhileStmt':
+    case 'DoStmt':
+    case 'ForStmt':
+      return containsBreak(s.body);
+    case 'LabeledStmt':
+      return containsBreak(s.stmt);
+    default:
+      return false;
+  }
+}
+
+/** Does a loop inside `s` call a suspending procedure directly in its body? */
+function loopCallsSuspending(s: A.Stmt, suspends: (name: string) => boolean): boolean {
+  const callsIn = (x: A.Stmt): boolean => {
+    switch (x.kind) {
+      case 'ExprStmt':
+        return x.expr.kind === 'Invocation' && suspends(x.expr.name.name);
+      case 'Block':
+        return x.stmts.some(callsIn);
+      case 'IfStmt':
+        return callsIn(x.then) || (!!x.else && callsIn(x.else));
+      case 'WhileStmt':
+      case 'DoStmt':
+      case 'ForStmt':
+        return callsIn(x.body);
+      default:
+        return false;
+    }
+  };
+  switch (s.kind) {
+    case 'WhileStmt':
+    case 'DoStmt':
+    case 'ForStmt':
+      return callsIn(s.body);
+    case 'Block':
+      return s.stmts.some((x) => loopCallsSuspending(x, suspends));
+    case 'IfStmt':
+      return loopCallsSuspending(s.then, suspends) || (!!s.else && loopCallsSuspending(s.else, suspends));
     default:
       return false;
   }
