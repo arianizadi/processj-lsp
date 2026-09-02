@@ -114,6 +114,8 @@ class Checker {
   private chanUses = new Map<VarInfo, ChanUse>();
   private insideAlt = 0;
   private altCount = 0;
+  /** >0 while checking a read guard of an alt that has other guards: such a read does not block by itself. */
+  private inChoiceGuard = 0;
   /** Name expressions that are the target of `.read` / `.write` / `.read()` / `.write(v)`: not "bare" uses of the channel. */
   private readonly endTargets = new WeakSet<A.Expr>();
   private readonly yields: YieldAnalysis;
@@ -677,7 +679,9 @@ class Checker {
             this.timeout(c.guard.timeout);
             break;
           case 'ReadGuard': {
+            if (s.cases.length > 1) this.inChoiceGuard++;
             const vt = this.chanRead(c.guard.read);
+            if (s.cases.length > 1) this.inChoiceGuard--;
             const lt = this.lvalue(c.guard.target);
             if (!this.assignableExpr(lt, vt, c.guard.read)) this.error(c.guard.span, 'pj/type/assign', `Cannot store a ${typeStr(vt)} read from the channel in '${exprText(c.guard.target)}' (${typeStr(lt)})`);
             break;
@@ -1145,7 +1149,8 @@ class Checker {
       if (e.extended) this.error(e.extended.span, 'pj/type/timer', 'A timer read takes no block');
       return T.long;
     }
-    this.noteChannel(e.target, 'read', true);
+    // A read guard among other alt guards is a choice, not a blocking read: the alt may take another guard.
+    this.noteChannel(e.target, 'read', this.inChoiceGuard === 0);
     if (e.extended) this.block(e.extended);
     if (isLenient(t)) return T.unknown;
     if (t.k !== 'chan') return this.error(e.target.span, 'pj/type/channel', `${exprText(e.target)} is ${typeStr(t)}, not a channel; '.read()' needs a channel or a read end`);

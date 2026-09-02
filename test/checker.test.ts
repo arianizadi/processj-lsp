@@ -180,6 +180,14 @@ test('an end handed to a procedure is not an operation: no blocking or self-dead
   assert.deepEqual(bothEnds.codes.filter((c) => (c ?? '').startsWith('pj/channel')), []);
 });
 
+test('a read guard in an alt with other guards does not block by itself', () => {
+  const alt = run(MAIN('    chan<int> c;\n    timer t;\n    int v;\n    alt {\n        v = c.read() : { println("got " + v); }\n        t.timeout(5000) : { println("timer"); }\n    }'));
+  assert.deepEqual(alt.codes.filter((c) => (c ?? '').startsWith('pj/channel')), []);
+  // A lone read guard is just a read: with no writer anywhere it blocks.
+  const lone = run(MAIN('    chan<int> c;\n    int v;\n    alt {\n        v = c.read() : { println("got " + v); }\n    }'));
+  assert.ok(lone.codes.includes('pj/channel-no-writer'));
+});
+
 test('a channel written and read by the same sequential process is a self-deadlock', () => {
   const bad = run(MAIN('    chan<int> c;\n    c.write(1);\n    int x = c.read();\n    println(x);'));
   assert.deepEqual(bad.codes, ['pj/channel-self-deadlock']);
