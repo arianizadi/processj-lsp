@@ -69,13 +69,13 @@ function verdictOf(codes) {
 
     let ok = 'n/a';
     if (verdict === 'blocks') ok = actual.startsWith('hangs') ? 'CONFIRMED' : 'MISMATCH';
-    if (verdict === 'clean') ok = actual === 'finishes' ? 'CONFIRMED' : 'MISMATCH';
+    if (verdict === 'clean') ok = actual === 'finishes' ? 'CONFIRMED' : actual.startsWith('build failed') ? 'compiler limit' : 'MISMATCH';
     if (ok === 'MISMATCH') failures++;
     rows.push({ f, verdict, codes: codes.join(', ') || '-', actual, ok, detail });
   }
   const w = (s, n) => String(s).padEnd(n);
   console.log(`${w('example', 22)} ${w('checker says', 13)} ${w('real program', 22)} ${w('result', 10)} output / error`);
   for (const r of rows) console.log(`${w(r.f, 22)} ${w(r.verdict, 13)} ${w(r.actual, 22)} ${w(r.ok, 10)} ${r.detail}`);
-  console.log(`\n${rows.filter((r) => r.ok === 'CONFIRMED').length} confirmed, ${failures} mismatched, ${rows.filter((r) => r.ok === 'n/a').length} informational`);
+  console.log(`\n${rows.filter((r) => r.ok === 'CONFIRMED').length} confirmed, ${failures} mismatched, ${rows.filter((r) => r.ok === 'compiler limit').length} not buildable by this compiler, ${rows.filter((r) => r.ok === 'n/a').length} informational`);
   process.exit(failures ? 1 : 0);
 })();

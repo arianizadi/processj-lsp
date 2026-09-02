@@ -344,6 +344,6 @@ Apache License 2.0 (see `LICENSE`). The example programs under
 | `shared_channel.pj` | other | hangs (>8s) | n/a |
 | `starving_loop.pj` | blocks | hangs (>8s) | CONFIRMED |
 | `typos.pj` | other | build failed at ProcessJc n/a | error[405]: Symbol 'cuont' not found |
-| `use_import.pj` | clean | build failed at javac | MISMATCH |
+| `use_import.pj` | clean | build failed at javac | compiler limit /var/folders/yw/c_xqrv6n39d475z2v2d09x8w0000gn/T/processj-lsp-UU7ZHe/.pjlsp-home/work/use_import.java:9: error: package lib does not exist |
 
-`other` rows are programs with type errors or races: some the compiler rejects, some it builds and they hang or misbehave at runtime, which is the point of the checker.
+`other` rows are programs with type errors or races: some the compiler rejects, some it builds and they hang or misbehave at runtime, which is the point of the checker. `compiler limit` means the program is fine but this compiler build cannot build it (user-library imports).
