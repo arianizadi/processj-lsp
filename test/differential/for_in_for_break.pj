@@ -1,0 +1,20 @@
+// outcome: runs-wrong
+import std.*;
+public void consumer(chan<int>.read in) {
+    int k = 0;
+    for (int r = 0; r < 10; r++) {
+        int s = 0;
+        for (int i = 0; i < 3; i++) { s = s + i; }
+        k = k + in.read();
+        if (k > 5) break;
+    }
+    println("k " + k);
+}
+public void producer(chan<int>.write out) {
+    for (int i = 1; i <= 3; i++) out.write(i);
+}
+public void main(string[] args) {
+    chan<int> c;
+    par { producer(c.write); consumer(c.read); }
+    println("after par");
+}

@@ -110,6 +110,14 @@ class Checker {
   private procRet: Type = T.void;
   private loopDepth = 0;
   private switchDepth = 0;
+  /** Innermost construct a plain 'break' leaves: the compiler rewrites loop breaks into jumps, switch breaks stay. */
+  private breakables: ('loop' | 'switch')[] = [];
+  /**
+   * True once a for, par for or do loop has been walked earlier in the enclosing loop body. The compiler's loop
+   * rewriter sets its break/continue labels on entering those loops and never restores them (a while does), so a
+   * later break or continue in the enclosing loop jumps to the inner loop's labels instead.
+   */
+  private staleLabels = false;
   /** Protocol variable -> case tag known to hold in the current region. */
   private activeCase = new Map<VarInfo, string>();
   private branchStack: BranchUse[] = [];
@@ -320,6 +328,8 @@ class Checker {
     this.chanUses = new Map();
     this.activeCase = new Map();
     this.altCount = 0;
+    this.staleLabels = false;
+    this.breakables = [];
     this.enrolled = new Set();
     this.syncs = [];
     this.pendingSims = [];
@@ -430,10 +440,15 @@ class Checker {
       case 'WhileStmt':
         this.condition(s.cond, 'while');
         this.checkStarvingLoop(s.span, s.cond, s.body, 'while');
-        this.loop(() => this.stmt(s.body));
+        {
+          const saved = this.staleLabels;
+          this.staleLabels = false;
+          this.loop(() => this.stmt(s.body));
+          this.staleLabels = saved;
+        }
         return;
       case 'DoStmt':
-        this.loop(() => this.stmt(s.body));
+        this.clobberingLoop(() => this.stmt(s.body));
         this.condition(s.cond, 'do ... while');
         this.checkStarvingLoop(s.span, s.cond, s.body, 'do');
         return;
@@ -455,7 +470,7 @@ class Checker {
         }
         if (!s.isPar) this.checkStarvingLoop(s.span, s.cond, s.body, 'for');
         if (s.isPar) {
-          const use = this.branch(this.scope.depth, () => this.loop(() => this.stmt(s.body)), true);
+          const use = this.branch(this.scope.depth, () => this.clobberingLoop(() => this.stmt(s.body)), true);
           this.report(firstLine(s.span, 7), 'info', 'pj/note-par-gc', PAR_GC_NOTE);
           // Every iteration is its own process, so anything from outside the loop is shared by all of them.
           const seen = new Set<VarInfo>();
@@ -471,7 +486,7 @@ class Checker {
               this.error(span, 'pj/shared-channel-end', `Every iteration of this par for holds '${key}'; declare it 'shared chan<${typeStr(v.type.elem)}>'`, { kind: 'make-shared', line: v.decl.span.start.line, col: typeCol, title: `Declare '${v.name}' as shared` });
             }
           }
-        } else this.loop(() => this.stmt(s.body));
+        } else this.clobberingLoop(() => this.stmt(s.body));
         this.pop();
         return;
       }
@@ -528,10 +543,12 @@ class Checker {
       case 'BreakStmt':
         if (this.loopDepth === 0 && this.switchDepth === 0) this.error(s.span, 'pj/type/break', "'break' outside of a loop or switch");
         else if (this.parDepth > 0) this.report(s.span, 'warning', 'pj/compiler-limit', "'break' inside a par branch, even within a loop, is rejected by this ProcessJ build; move the loop into its own procedure");
+        else if (this.staleLabels && this.breakables[this.breakables.length - 1] === 'loop' && this.isProcess()) this.report(s.span, 'info', 'pj/note-loop-labels', LOOP_LABELS_NOTE('break'));
         return;
       case 'ContinueStmt':
         if (this.loopDepth === 0) this.error(s.span, 'pj/type/break', "'continue' outside of a loop");
         else if (this.parDepth > 0) this.report(s.span, 'warning', 'pj/compiler-limit', "'continue' inside a par branch is rejected by this ProcessJ build; move the loop into its own procedure");
+        else if (this.staleLabels && this.isProcess()) this.report(s.span, 'info', 'pj/note-loop-labels', LOOP_LABELS_NOTE('continue'));
         return;
       case 'LabeledStmt':
         return this.stmt(s.stmt);
@@ -540,8 +557,22 @@ class Checker {
 
   private loop(body: () => void): void {
     this.loopDepth++;
+    this.breakables.push('loop');
     body();
+    this.breakables.pop();
     this.loopDepth--;
+  }
+
+  /** Walk a for, par for or do loop: fresh labels inside, and the enclosing loop's labels are left clobbered after it. */
+  private clobberingLoop(body: () => void): void {
+    this.staleLabels = false;
+    this.loop(body);
+    this.staleLabels = true;
+  }
+
+  /** Is the current procedure compiled as a process (state machine) rather than a plain method? main always is. */
+  private isProcess(): boolean {
+    return !!this.proc && (this.proc.name.name === 'main' || hasYieldAnnotation(this.proc) || this.yields.procYields(this.proc));
   }
 
   private condition(e: A.Expr, owner: string): void {
@@ -591,7 +622,7 @@ class Checker {
       if (v.init) {
         if (isPrim(t, 'byte', 'short', 'char') && isIntLiteral(v.init)) this.report(v.init.span, 'info', 'pj/note-narrow-literal', `Note: this ProcessJ build prints a spurious "cannot assign int to ${typeStr(t)}" error for this initialiser; the program still builds`);
         this.checkInit(t, v.init, v.name.name);
-        if (d.isConst && !(isLiteralInit(v.init) && this.onlyConstNames(v.init))) this.error(v.init.span, 'pj/type/const-init', 'A constant can only be initialised with literals and other constants');
+        if (d.isConst && !(isLiteralInit(v.init) && this.onlyConstNames(v.init))) this.error(v.init.span, 'pj/type/const-init', 'A constant can only be initialised with literals and other constants; this ProcessJ build computes it before the procedure runs, so the value would be 0 (or the build fails in a non-suspending procedure)');
       }
       this.declare(v.name, t, d.isConst, false);
     }
@@ -651,6 +682,7 @@ class Checker {
     if (!isLenient(t) && !isIntegral(t) && !isPrim(t, 'string') && t.k !== 'protocol') this.error(s.expr.span, 'pj/type/switch', `Cannot switch on ${typeStr(t)}; use an integer, char, string or protocol value`);
     const seenLabels = new Set<string>();
     this.switchDepth++;
+    this.breakables.push('switch');
     for (const g of s.groups) {
       let tag: string | undefined;
       for (const l of g.labels) {
@@ -687,6 +719,7 @@ class Checker {
         }
       }
     }
+    this.breakables.pop();
     this.switchDepth--;
   }
 
@@ -1599,6 +1632,8 @@ function returnsInside(s: A.Stmt): boolean {
 }
 
 /** Reproduced: par { quick(); c.read(); } prints what follows the par as soon as the first young-generation GC runs. */
+const LOOP_LABELS_NOTE = (kw: string): string =>
+  `Note: this ProcessJ build compiles this '${kw}' as a jump to the exit of the for or do loop that came before it in this loop body (the loop rewriter never restores its labels), so the program hangs or crashes; write that inner loop as a while, or move it into its own procedure`;
 const PAR_GC_NOTE = 'Note: this ProcessJ build can end a par early: once a branch has finished, the next garbage collection counts it twice; if that matters, have each branch signal on a channel read after the par';
 
 function firstLine(span: A.Span, width = 0): A.Span {

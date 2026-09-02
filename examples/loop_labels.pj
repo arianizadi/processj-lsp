@@ -1,0 +1,38 @@
+// expect: none
+// notes: pj/note-loop-labels, pj/note-loop-labels
+import std.*;
+
+// main is always compiled as a suspending process, and in such procedures the
+// compiler's loop rewriter never restores its break/continue labels after a
+// for, par for or do loop. Both jumps below go to the inner for's exit, so
+// this program hangs instead of printing "k 6" and "odd 9".
+public void main(string[] args) {
+    int k = 0;
+    while (true) {
+        int s = 0;
+        for (int i = 0; i < 3; i++) { s = s + i; }
+        k = k + s;
+        if (k > 5) break;
+    }
+    println("k " + k);
+
+    int n = 0; int odd = 0;
+    while (n < 6) {
+        n++;
+        int t = 0;
+        for (int i = 0; i < 2; i++) { t = t + i; }
+        if (n % 2 == 0) continue;
+        odd = odd + n;
+    }
+    println("odd " + odd);
+
+    // Fine: a nested while restores the labels, and a plain method is not rewritten.
+    int m = 0;
+    while (true) {
+        int u = 0;
+        while (u < 3) { u++; }
+        m = m + u;
+        if (m > 5) break;
+    }
+    println("m " + m);
+}

@@ -1,0 +1,17 @@
+// outcome: runs
+import std.*;
+public void consumer(chan<int>.read in) {
+    int k = 0;
+    while (k < 3) {
+        for (int i = 0; i < 10; i++) { if (i == 2) break; k = k + in.read(); }
+    }
+    println("k " + k);
+}
+public void producer(chan<int>.write out) {
+    for (int i = 1; i <= 2; i++) out.write(i);
+}
+public void main(string[] args) {
+    chan<int> c;
+    par { producer(c.write); consumer(c.read); }
+    println("after par");
+}

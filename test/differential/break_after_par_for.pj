@@ -1,0 +1,11 @@
+// outcome: runs-wrong
+import std.*;
+public void main(string[] args) {
+    int k = 0;
+    while (true) {
+        par for (int i = 0; i < 2; i++) { println("i " + i); }
+        k++;
+        if (k > 2) break;
+    }
+    println("k " + k);
+}

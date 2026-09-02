@@ -1,0 +1,13 @@
+// expect: pj/type/const-init
+import std.*;
+
+// A const is compiled as a field initialiser that runs before the procedure's
+// code, so a const computed from a variable is 0 here (and in a procedure that
+// does not suspend, javac rejects the generated code). Constants and literals are fine.
+public void main(string[] args) {
+    int n = 21;
+    const int m = n * 2;
+    const int N = 4;
+    const int M = N * 2 + 1;
+    println("m " + m + " M " + M);
+}

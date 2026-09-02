@@ -343,3 +343,38 @@ test('a correct program produces no diagnostics at all', () => {
   assert.deepEqual(r.messages, []);
   assert.ok(r.types.size > 20, 'expression types recorded');
 });
+
+test('a break or continue after a nested for/do/par-for in a process jumps to the wrong loop; while, switch and plain methods are fine', () => {
+  const hasNote = (r: ReturnType<typeof run>) => r.notes.some((n) => n.endsWith(':pj/note-loop-labels'));
+  const loopBody = (inner: string) => `    int k = 0;\n    while (true) {\n        int s = 0;\n${inner}\n        k = k + 3;\n        if (k > 5) break;\n    }\n    println(k);`;
+  for (const inner of ['        for (int i = 0; i < 3; i++) { s = s + i; }', '        do { s++; } while (s < 3);', '        par for (int i = 0; i < 2; i++) { println(i); }', '        if (k >= 0) { for (int i = 0; i < 3; i++) { s = s + i; } }']) {
+    const r = run(MAIN(loopBody(inner)));
+    assert.ok(hasNote(r), `${inner}: ${r.notes.join(' ')}`);
+  }
+  for (const inner of ['        while (s < 3) { s++; }', '        par { println("x"); println("y"); }']) {
+    const r = run(MAIN(loopBody(inner)));
+    assert.ok(!hasNote(r), `${inner}: ${r.notes.join(' ')}`);
+  }
+  // A break inside the inner for itself is fine (line 7); only the later break in the enclosing loop (line 9) is flagged.
+  const innerBreak = run(MAIN(loopBody('        for (int i = 0; i < 3; i++) { if (i == 2) break; s = s + i; }')));
+  assert.deepEqual(innerBreak.notes.filter((n) => n.endsWith(':pj/note-loop-labels')), ['9:pj/note-loop-labels']);
+  // A break before the for, a switch break after it, and a continue after it.
+  const before = run(MAIN('    int k = 0;\n    while (true) {\n        k++;\n        if (k > 5) break;\n        for (int i = 0; i < 3; i++) { k = k + i; }\n    }'));
+  assert.ok(!hasNote(before), before.messages.join('\n'));
+  const sw = run(MAIN('    int k = 0;\n    while (k < 4) {\n        for (int i = 0; i < 3; i++) { k = k + i; }\n        switch (k) { case 1: k++; break; default: k = k + 2; }\n    }'));
+  assert.ok(!hasNote(sw), sw.messages.join('\n'));
+  const cont = run(MAIN('    int k = 0; int n = 0;\n    while (n < 6) {\n        n++;\n        for (int i = 0; i < 2; i++) { k = k + i; }\n        if (n % 2 == 0) continue;\n        k = k + n;\n    }'));
+  assert.ok(hasNote(cont), cont.messages.join('\n'));
+  // Only procedures compiled as processes are rewritten: a plain method keeps Java's break.
+  const method = run(MAIN('    work();', 'public void work() {\n    int k = 0;\n    while (true) {\n        for (int i = 0; i < 3; i++) { k = k + i; }\n        if (k > 5) break;\n    }\n    println(k);\n}'));
+  assert.ok(!hasNote(method), method.messages.join('\n'));
+  const process = run(MAIN('    chan<int> c;\n    par { c.write(1); c.write(2); c.write(3); consume(c.read); }', 'public void consume(chan<int>.read in) {\n    int k = 0;\n    while (true) {\n        for (int i = 0; i < 3; i++) { k = k + i; }\n        k = k + in.read();\n        if (k > 5) break;\n    }\n    println(k);\n}'));
+  assert.ok(hasNote(process), process.messages.join('\n'));
+});
+
+test('a constant initialised from a variable is reported, with the reason', () => {
+  const r = run(MAIN('    int n = 21;\n    const int m = n * 2;\n    println(m);'));
+  assert.ok(r.messages.some((m) => /const-init|literals and other constants/.test(m) && /value would be 0/.test(m)), r.notes.join(' '));
+  const ok = run(MAIN('    const int N = 4;\n    const int M = N * 2 + 1;\n    println(M);'));
+  assert.ok(!ok.codes.includes('pj/type/const-init'), ok.messages.join('\n'));
+});

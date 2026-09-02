@@ -1,0 +1,11 @@
+// outcome: runs-wrong
+import std.*;
+public void consumer(chan<int>.read in) {
+    int n = in.read();
+    const int m = n * 2;
+    println("n " + n + " m " + m);
+}
+public void main(string[] args) {
+    chan<int> c;
+    par { c.write(21); consumer(c.read); }
+}

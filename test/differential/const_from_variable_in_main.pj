@@ -1,0 +1,7 @@
+// outcome: runs-wrong
+import std.*;
+public void main(string[] args) {
+    int n = 21;
+    const int m = n * 2;
+    println("m " + m);
+}

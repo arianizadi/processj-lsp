@@ -1,0 +1,12 @@
+// outcome: runs
+import std.*;
+public void main(string[] args) {
+    int k = 0; int hits = 0;
+    while (k < 4) {
+        int s = 0;
+        for (int i = 0; i < 3; i++) { s = s + i; }
+        switch (k) { case 1: hits = hits + 10; break; default: hits++; }
+        k++;
+    }
+    println("hits " + hits);
+}
