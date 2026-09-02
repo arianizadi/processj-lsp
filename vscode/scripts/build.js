@@ -25,5 +25,7 @@ fs.writeFileSync(path.join(server, 'package.json'), JSON.stringify({ name: 'proc
 run('npm install --omit=dev --no-audit --no-fund', server);
 
 run(fs.existsSync(path.join(here, 'package-lock.json')) ? 'npm ci --no-audit --no-fund' : 'npm install --no-audit --no-fund', here);
-run('npx tsc -p tsconfig.json', here);
+run('npx tsc -p tsconfig.json --noEmit', here);
+// Bundle the extension with its client library into one file: the .vsix then needs no node_modules.
+run('npx esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=out/extension.js --sourcemap', here);
 console.log('\nBuilt. Next: `npm run package` for a .vsix, or `npm run install-extension` to install it into VS Code.');

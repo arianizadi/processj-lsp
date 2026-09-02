@@ -2,20 +2,36 @@
   "name": "processj-lsp-vscode",
   "displayName": "ProcessJ",
   "description": "ProcessJ language support: diagnostics, type checking, formatting, semantic highlighting, run from the editor.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "arianizadi",
   "license": "Apache-2.0",
-  "repository": { "type": "git", "url": "https://github.com/arianizadi/processj-lsp" },
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Programming Languages", "Linters", "Formatters"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arianizadi/processj-lsp"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters"
+  ],
   "main": "./out/extension.js",
-  "activationEvents": ["onLanguage:processj"],
+  "activationEvents": [
+    "onLanguage:processj"
+  ],
   "contributes": {
     "languages": [
       {
         "id": "processj",
-        "aliases": ["ProcessJ", "processj"],
-        "extensions": [".pj"],
+        "aliases": [
+          "ProcessJ",
+          "processj"
+        ],
+        "extensions": [
+          ".pj"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -64,6 +80,7 @@
     "@types/node": "^26.4.1",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.0.0",
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "esbuild": "^0.25.0"
   }
 }
