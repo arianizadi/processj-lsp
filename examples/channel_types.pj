@@ -1,0 +1,20 @@
+// expect: pj/channel-write-type, pj/type/assign, pj/type/call
+import std.*;
+
+record Point { int x; int y; }
+
+public void consume(chan<Point>.read in) { Point p = in.read(); println(p.x); }
+
+// A `chan<int>` carries ints, so writing a string is an error, and `consume`
+// wants a `chan<Point>.read`, not `chan<int>.read`. Assigning an int to a
+// string is an error too; ProcessJ has no implicit conversion to string.
+public void main(string[] args) {
+    chan<int> c;
+    par {
+        c.write("hello");
+        consume(c.read);
+    }
+    int n = 1;
+    string s = n;
+    println(s);
+}

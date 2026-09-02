@@ -1,0 +1,12 @@
+// expect: pj/parallel-usage
+import std.*;
+
+// Two branches of a par run at the same time. Writing `x` in one and reading
+// it in another is a data race; the compiler's own check for this is disabled.
+public void main(string[] args) {
+    int x = 0;
+    par {
+        x = 1;
+        println("x is " + x);
+    }
+}

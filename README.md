@@ -37,13 +37,49 @@ with syntax errors is left alone (you get a message saying which error to fix
 first). The formatter is idempotent and never changes the parse tree; both are
 checked over the compiler's example corpus in `test/format.test.ts`.
 
-**Diagnostics from the real compiler.** Every edit is run through `ProcessJc` in
-an isolated temp directory. Name errors get token columns, type errors get the
-line and are narrowed to the quoted identifier, and a compiler crash becomes a
-diagnostic carrying the exception.
+**A type checker.** `src/checker` resolves every name to its declaration and
+types every expression, using the declarations of the file, its imports, and the
+standard-library headers (all parsed with the same parser). It reports what the
+compiler's own checker misses or gets wrong, with messages that name the
+problem and, where possible, carry a quick fix:
 
-**Static analysis, instantly on every keystroke.** Each lint recreates a check the
-compiler is missing, has disabled, or gets wrong, and says why:
+```
+Cannot find 'cuont'; did you mean 'count'?
+Cannot initialise 'j' (int) with a value of type long (long does not fit in int without a cast)
+No version of 'show' accepts (string, string): argument 2 ('n') needs int. Available: void show(string s, int n)
+No version of 'reader' accepts (chan<int>) (pass an end of the channel: '.read')
+No version of 'sharedReader' accepts (chan<int>.read) (declare the channel 'shared chan<int>')
+'in' is a read end (chan<int>.read); it cannot write
+Writing string to 'c', which carries int
+'reason' belongs to case quit of Msg, but here 'm' is known to be case 'move' (fields: dx, dy)
+'mvoe' is not a case of protocol Msg (cases: move, quit); did you mean 'move'?
+'main' must return a value of type int
+```
+
+Rules follow what the generated Java actually does: Java widening (`byte` to
+`int` to `long` to `double`, with int literals allowed into `byte`/`short`/`char`),
+records narrow when they `extends`, protocols widen when they `extends`
+(`protocol Message extends Santa_msg` is the union), channel elements are
+invariant for primitives and follow the end's direction for records and
+protocols, `shared read chan<T>` shares only its read side, overloads pick the
+most specific applicable procedure, and a protocol variable is narrowed to its
+case inside `switch` and `if (m is tag)`. Hover shows the type of any expression.
+
+Run over the compiler's own example programs, the checker finds two genuine bugs
+in them (`fullAdder.pj` writes to an end declared as read-only and hands one read
+end to two processes; `integrate.pj` calls a misspelled `prlongln`); the test
+suite pins exactly those.
+
+**Diagnostics from the real compiler.** On open and save (or on every edit with
+`checkOnChange`), the file is run through `ProcessJc` in an isolated temp
+directory. Name errors get token columns, type errors get the line and are
+narrowed to the quoted identifier, and a compiler crash becomes a diagnostic
+carrying the exception. Compiler messages are hidden on lines where the checker
+already reported something more specific.
+
+**Concurrency lints, computed from real scopes and types in the same walk.** Each
+recreates a check the compiler is missing, has disabled, or gets wrong, and says
+why:
 
 | code                       | what it catches                                                                 |
 | -------------------------- | ------------------------------------------------------------------------------- |
@@ -73,11 +109,31 @@ report with the program's output. A program that never finishes is killed after
 compiler produced for the file, the best way to see how a `par` or an `alt`
 becomes a resumable state machine.
 
+**Semantic highlighting.** The server sends semantic tokens for every identifier,
+classified from the parse tree and the checker's resolutions: procedure names,
+records, protocols and their cases, fields, parameters, locals, constants
+(`readonly`), standard-library calls (`defaultLibrary`), and package names.
+Keywords, literals and comments stay with the bundled syntax file. Neovim applies
+the tokens on top of syntax highlighting automatically.
+
+**Cross-file imports.** `import geom.*;` and `import lib.shapes;` resolve to files
+next to the importing file, under the workspace roots, or under the install's
+include directory (which is how `import std.*;` finds the standard library).
+Imported declarations are typed, completed, hovered and navigable; an import that
+resolves nowhere gets a warning saying where it looked. Only what a file imports
+is visible to its checker; the workspace index is used for navigation.
+
 **Navigation.** Completion (locals in scope, procs, records, protocols, the whole
 `std` library with signatures, keywords with explanations, snippets for `par`,
-`alt`, `chan`, ...), hover, go to definition into the workspace and the
-standard-library headers, find references, rename, document outline, folding,
-signature help with `println` overloads.
+`alt`, `chan`, ...; after `p.` the fields of `p`'s record or protocol, after `c.`
+only the operations its channel end allows), hover with expression types, go to
+definition into the workspace and the standard-library headers, find references,
+rename, document outline, folding, signature help with `println` overloads.
+
+**Examples.** `examples/` holds one short program per diagnostic (and two clean
+ones); each announces the codes it produces on its first line and
+`test/examples.test.ts` checks that. They double as a tour of what the server
+catches.
 
 ## Performance
 
@@ -85,16 +141,26 @@ Everything except the compiler run is synchronous on the keystroke path, so it
 has to be fast. `npm run bench` on a laptop:
 
 ```
-   1341 lines      7523 tokens  parse   3.4 ms  symbols   0.8 ms  lint   15.0 ms  format    3.1 ms
-  10024 lines     55109 tokens  parse  10.5 ms  symbols   3.0 ms  lint   53.0 ms  format    7.2 ms
-  50054 lines    273940 tokens  parse  62.2 ms  symbols  47.3 ms  lint  134.9 ms  format  101.6 ms
+   1341 lines      7523 tokens  parse   3.4 ms  symbols   0.9 ms  check   4.1 ms  semantic   1.1 ms  format    4.2 ms
+  10024 lines     55109 tokens  parse  12.7 ms  symbols   3.6 ms  check  14.9 ms  semantic   5.5 ms  format   13.4 ms
+  50054 lines    273940 tokens  parse  45.9 ms  symbols  55.4 ms  check  76.4 ms  semantic  16.5 ms  format  109.5 ms
 ```
 
 (Exact numbers vary by machine; `test/perf.test.ts` enforces budgets on a
 generated 20,000-line file and checks that parse time grows linearly.) The
-server also caches the parse per document version, coalesces lint runs so a
-burst of keystrokes costs one pass, debounces the compiler, and cancels a
+server caches the parse and the check per document version, coalesces lint runs
+so a burst of keystrokes costs one pass, debounces the compiler, and cancels a
 compile the moment a newer edit arrives.
+
+**Disk and change detection.** Everything on the keystroke path runs in memory.
+The only things that touch disk are the compiler runs (a few kilobytes of temp
+files per run, which is why they default to open and save only) and reading
+imported files. Other files are read once and cached by modification time. When
+the editor supports it (Neovim does), the server registers a `**/*.pj` watcher
+and the editor pushes change notifications; there is no polling. A change to a
+file, on disk or in another buffer, re-checks only the open documents that import
+it. Without watcher support the directory walk falls back to at most once every
+5 seconds, and only when a lookup needs it.
 
 ## Requirements
 
@@ -148,7 +214,7 @@ Pass these as `init_options` / `initializationOptions`:
 | `debounceMs`    | `400`   | wait this long after the last keystroke before compiling  |
 | `timeoutMs`     | `20000` | kill the compiler after this long                         |
 | `runTimeoutMs`  | `30000` | kill a program started from Run after this long           |
-| `checkOnChange` | `true`  | `false` to compile only on open and save                  |
+| `checkOnChange` | `false` | `true` to also run the real compiler on every edit         |
 | `lint`          | `true`  | `false` to turn the static analysis off                   |
 
 ## How diagnostics work
@@ -171,9 +237,10 @@ Limits inherited from the compiler:
 - Imports of your own libraries resolve against the compiler's include directory,
   not the buffer's directory.
 
-The lints are token-based and tolerate half-typed code; they can miss things
-(aliasing through procedure calls is not tracked) and are tuned to avoid false
-positives rather than to be complete.
+The lints run on the parse tree with real scopes and types. A whole channel
+passed to a procedure counts as both of its ends being handed away, so aliasing
+through calls is conservative rather than tracked; the rules are tuned to avoid
+false positives rather than to be complete.
 
 ## Layout
 
@@ -182,17 +249,21 @@ src/server.ts       LSP wiring: documents, caches, debounced compiles, every req
 src/parser/ast.ts   AST node types with source spans
 src/parser/parser.ts recursive-descent parser with recovery and "did you mean" suggestions
 src/format.ts       AST printer used for textDocument/formatting
+src/checker/        type model, declaration index, and the checker with the concurrency lints
+src/semantic.ts     semantic tokens from the parse tree and the checker's resolutions
+src/imports.ts      import resolution (file's directory, workspace roots, include directory)
 src/astsymbols.ts   symbols and scoped locals from the parse tree
-src/analysis.ts     the lints, each documented with the compiler line it works around
+src/analysis.ts     lexer-level diagnostics (escape sequences, non-ASCII, empty comments)
 src/tokens.ts       tokenizer that also reports the lexer limits and keeps comments
 src/compiler.ts     runs ProcessJc in an isolated temp home, cancellable
 src/pipeline.ts     full build + run pipeline (ProcessJc, javac, ASM passes, java)
 src/diagnostics.ts  parses compiler output into structured diagnostics
 src/symbols.ts      regex-based extractor, used to top up symbols while a file has syntax errors
 src/library.ts      indexes include/JVM/**/*.pj for std completion and definitions
-src/workspace.ts    mtime-cached index of *.pj files under the workspace
+src/workspace.ts    cache of parsed *.pj files under the workspace, invalidated by editor file events
 src/keywords.ts     keyword list and hover docs
-test/               node:test unit tests; test/fixtures/processj is the compiler's example corpus
+test/               node:test unit tests; test/fixtures holds the compiler's example corpus and std headers
+examples/           one program per diagnostic, self-describing and tested
 scripts/smoke.js    talks LSP over stdio to a real server, ends with a real program run
 scripts/bench.js    parse / lint / format timings on generated large files
 editor/nvim/        AstroNvim plugin spec, plain config, syntax and ftplugin files

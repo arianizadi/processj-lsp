@@ -1,0 +1,10 @@
+// expect: none
+import std.*;
+import lib.geometry;
+
+// `import lib.geometry;` resolves to lib/geometry.pj next to this file, so
+// `Circle` and `area` are known, typed, and navigable.
+public void main(string[] args) {
+    Circle c = new Circle { r = 2.0 };
+    println("area " + area(c));
+}

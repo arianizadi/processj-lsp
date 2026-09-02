@@ -1,0 +1,14 @@
+// expect: pj/type/name, pj/type/unknown-type, pj/type/field
+import std.*;
+
+record Point { int x; int y; }
+
+// Each of these carries a "did you mean" suggestion and a quick fix.
+public void main(string[] args) {
+    int count = 3;
+    println(count);
+    println(cuont);
+    Point p = new Point { x = 1, y = 2 };
+    Pointt q = p;
+    println(p.z + q.x);
+}

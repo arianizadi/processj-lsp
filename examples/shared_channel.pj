@@ -1,0 +1,20 @@
+// expect: pj/shared-channel-end
+import std.*;
+
+public void writer(chan<int>.write out, int v) { out.write(v); }
+
+public void reader(chan<int>.read in) {
+    println(in.read());
+    println(in.read());
+}
+
+// The write end of `c` is handed to two processes at once. Only one process may
+// hold a non-shared end; the quick fix declares the channel `shared`.
+public void main(string[] args) {
+    chan<int> c;
+    par {
+        writer(c.write, 1);
+        writer(c.write, 2);
+        reader(c.read);
+    }
+}

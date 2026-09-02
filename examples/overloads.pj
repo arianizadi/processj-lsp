@@ -1,0 +1,16 @@
+// expect: pj/type/call, pj/type/call
+import std.*;
+
+public int twice(int v) { return v * 2; }
+public long twice(long v) { return v * 2; }
+public void show(string label, int value) { println(label + value); }
+
+// `twice(b)` with a byte picks twice(int) as the most specific overload.
+// `show("n", "x")` fails with an explanation of which argument is wrong, and a
+// misspelled name gets a suggestion with a quick fix.
+public void main(string[] args) {
+    byte b = 3;
+    println(twice(b) + twice(4L));
+    show("n", "x");
+    twise(1);
+}

@@ -1,0 +1,25 @@
+// expect: pj/alt-timeout, pj/multiple-alts, pj/timeout-noop
+import std.*;
+
+public void source(chan<int>.write out) { out.write(7); }
+
+// A timeout guard is compiled as a blocking sleep before the alt; a second alt
+// in the same proc makes javac fail; and in this build timeouts return at once.
+public void main(string[] args) {
+    chan<int> c;
+    timer t;
+    int v = 0;
+    par {
+        source(c.write);
+        {
+            alt {
+                v = c.read() : { println("got " + v); }
+                t.timeout(1000) : { println("timed out"); }
+            }
+            alt {
+                skip : { println("second alt"); }
+            }
+            t.timeout(10);
+        }
+    }
+}

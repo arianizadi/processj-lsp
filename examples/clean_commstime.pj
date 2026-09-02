@@ -1,0 +1,37 @@
+// expect: none
+import std.*;
+
+// The classic CommsTime benchmark: a ring of processes passing a token. Correct
+// ProcessJ that produces no diagnostics; use the ▶ Run code lens to execute it.
+public void prefix(chan<int>.read in, chan<int>.write out) {
+    out.write(0);
+    while (true) out.write(in.read());
+}
+
+public void delta(chan<int>.read in, chan<int>.write out1, chan<int>.write out2) {
+    while (true) {
+        int v = in.read();
+        par {
+            out1.write(v);
+            out2.write(v);
+        }
+    }
+}
+
+public void successor(chan<int>.read in, chan<int>.write out) {
+    while (true) out.write(in.read() + 1);
+}
+
+public void consumer(chan<int>.read in) {
+    for (int i = 0; i < 5; i++) println("received " + in.read());
+}
+
+public void main(string[] args) {
+    chan<int> a, b, c, d;
+    par {
+        prefix(b.read, a.write);
+        delta(a.read, c.write, d.write);
+        successor(c.read, b.write);
+        consumer(d.read);
+    }
+}

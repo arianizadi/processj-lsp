@@ -1,0 +1,21 @@
+// expect: pj/type/field, pj/type/switch
+import std.*;
+
+protocol Msg {
+    move : { int dx; int dy; }
+    quit : { string reason; }
+}
+
+// Inside `case move:` the checker knows `m` holds a `move`, so `m.reason`
+// (a field of `quit`) is an error; `halt` is not a case of Msg at all.
+public void handle(Msg m) {
+    switch (m) {
+        case move: println(m.dx + m.reason); break;
+        case quit: println(m.reason); break;
+        case halt: break;
+    }
+}
+
+public void main(string[] args) {
+    handle(new Msg { move: dx = 1, dy = 2 });
+}

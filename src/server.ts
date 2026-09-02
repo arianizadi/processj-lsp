@@ -5,6 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   CodeAction,
   CodeActionKind,
+  DidChangeWatchedFilesNotification,
+  FileChangeType,
   CodeLens,
   CompletionItem,
   CompletionItemKind,
@@ -47,12 +49,17 @@ import {
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 
-import { analyze, type FixHint, type LintDiagnostic } from './analysis';
+import { lexDiagnostics, type FixHint, type LintDiagnostic } from './analysis';
 import { astSymbols } from './astsymbols';
+import { check, type CheckResult } from './checker/checker';
+import { DeclIndex } from './checker/index';
+import { typeStr } from './checker/types';
 import { compile } from './compiler';
 import { format } from './format';
+import { resolveImports } from './imports';
 import type * as A from './parser/ast';
 import { parse, type ParseResult } from './parser/parser';
+import { semanticTokens, TOKEN_MODIFIERS, TOKEN_TYPES } from './semantic';
 import { findInstall, type Install } from './config';
 import { parseCompilerOutput, type RawDiagnostic } from './diagnostics';
 import { KEYWORD_DOCS, KEYWORDS, LITERALS, PRIMITIVE_TYPES } from './keywords';
@@ -69,7 +76,11 @@ interface Settings {
   debounceMs: number;
   /** Kill the compiler after this long. */
   timeoutMs: number;
-  /** Run the compiler on every change (true) or only on open/save (false). */
+  /**
+   * Run the real compiler on every change (true) or only on open and save (false).
+   * Off by default: the compiler writes temp files and starts a JVM per run, and the
+   * built-in checker already reports most problems as you type.
+   */
   checkOnChange: boolean;
   /** Kill a program started from the "Run" code lens after this long. */
   runTimeoutMs: number;
@@ -85,12 +96,17 @@ const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
 const workspace = new WorkspaceIndex();
 
-let settings: Settings = { debounceMs: 400, timeoutMs: 20_000, checkOnChange: true, runTimeoutMs: 30_000, lint: true };
+let settings: Settings = { debounceMs: 400, timeoutMs: 20_000, checkOnChange: false, runTimeoutMs: 30_000, lint: true };
+let clientWatchesFiles = false;
 let install: Install | undefined;
 let installError: string | undefined;
 let library: LibrarySymbol[] = [];
-let libraryNames = new Set<string>();
 let clientSupportsShowDocument = false;
+/** Parsed standard-library headers, keyed by absolute path. */
+const libraryPrograms = new Map<string, A.Program>();
+const libraryFiles = new Set<string>();
+/** Declarations of `std` alone, for the "add import std.*" hint. */
+let stdIndex = new DeclIndex();
 
 // Per-document state for debounced, cancellable compiles.
 const pending = new Map<string, NodeJS.Timeout>();
@@ -99,6 +115,7 @@ const running = new Map<string, AbortController>();
 const compilerDiags = new Map<string, { version: number; diagnostics: Diagnostic[] }>();
 // Cached parse and symbol extraction keyed by document version.
 const parseCache = new Map<string, { version: number; parsed: ParseResult }>();
+const checkCache = new Map<string, { version: number; checked: CheckResult; index: DeclIndex; importDiags: LintDiagnostic[]; deps: Set<string> }>();
 const symbolCache = new Map<string, { version: number; symbols: PJSymbol[]; locals: PJSymbol[] }>();
 // Lint runs are coalesced so a burst of keystrokes in a large file costs one pass.
 const lintPending = new Map<string, NodeJS.Timeout>();
@@ -112,6 +129,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   const init = (params.initializationOptions ?? {}) as Partial<Settings>;
   settings = { ...settings, ...init };
   clientSupportsShowDocument = !!params.capabilities.window?.showDocument?.support;
+  clientWatchesFiles = !!params.capabilities.workspace?.didChangeWatchedFiles?.dynamicRegistration;
 
   const found = findInstall({ installDir: settings.installDir, javaBin: settings.javaBin });
   if ('error' in found) {
@@ -119,7 +137,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   } else {
     install = found;
     library = indexLibrary(install.includeDir);
-    libraryNames = new Set(library.filter((l) => l.kind === 'proc').map((l) => l.name));
+    loadLibrary(install.includeDir);
   }
 
   const roots = (params.workspaceFolders ?? [])
@@ -150,12 +168,46 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       executeCommandProvider: { commands: [COMMAND_RUN, COMMAND_SHOW_JAVA, COMMAND_BUILD] },
       documentFormattingProvider: true,
       foldingRangeProvider: true,
+      semanticTokensProvider: { legend: { tokenTypes: [...TOKEN_TYPES], tokenModifiers: [...TOKEN_MODIFIERS] }, full: true },
     },
-    serverInfo: { name: 'processj-lsp', version: '0.3.0' },
+    serverInfo: { name: 'processj-lsp', version: '0.4.0' },
   };
 });
 
+/** Parse every header under the include directory once; `std/` headers also form the std index. */
+function loadLibrary(includeDir: string): void {
+  const stack = [includeDir];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) stack.push(full);
+      else if (e.isFile() && e.name.endsWith('.pj')) {
+        try {
+          const program = parse(fs.readFileSync(full, 'utf8')).program;
+          libraryPrograms.set(full, program);
+          libraryFiles.add(full);
+          if (path.basename(path.dirname(full)) === 'std') stdIndex.addProgram(program, full);
+        } catch {
+          /* unreadable header: skip */
+        }
+      }
+    }
+  }
+}
+
 connection.onInitialized(() => {
+  if (clientWatchesFiles) {
+    // The editor tells us when .pj files change on disk; no polling, no repeated directory walks.
+    workspace.watched = true;
+    void connection.client.register(DidChangeWatchedFilesNotification.type, { watchers: [{ globPattern: '**/*.pj' }] });
+  }
   if (install) {
     connection.console.info(`ProcessJ install: ${install.installDir} (java: ${install.javaBin}); ${library.length} library symbols`);
   } else {
@@ -171,7 +223,35 @@ documents.onDidOpen((e) => {
 documents.onDidChangeContent((e) => {
   schedulePublish(e.document);
   if (settings.checkOnChange) scheduleCheck(e.document, settings.debounceMs);
+  // Other open files that import this one see the edited buffer, so re-check them too.
+  const p = safeFileUri(e.document.uri);
+  if (p) republishDependents(p, e.document.uri);
 });
+
+connection.onDidChangeWatchedFiles((params) => {
+  for (const change of params.changes) {
+    const p = safeFileUri(change.uri);
+    if (!p || !p.endsWith('.pj')) continue;
+    if (change.type === FileChangeType.Deleted) workspace.invalidate(p);
+    else if (documents.get(change.uri)) continue; // the editor's buffer is the source of truth while it is open
+    else {
+      workspace.invalidate(p);
+      workspace.add(p);
+    }
+    republishDependents(p);
+  }
+});
+
+/** Re-lint every open document whose imports include `changedPath`. */
+function republishDependents(changedPath: string, exceptUri?: string): void {
+  const abs = path.resolve(changedPath);
+  for (const [uri, entry] of checkCache) {
+    if (uri === exceptUri || !entry.deps.has(abs)) continue;
+    checkCache.delete(uri);
+    const doc = documents.get(uri);
+    if (doc) schedulePublish(doc);
+  }
+}
 documents.onDidSave((e) => scheduleCheck(e.document, 0));
 documents.onDidClose((e) => {
   cancel(e.document.uri);
@@ -179,6 +259,7 @@ documents.onDidClose((e) => {
   if (t) clearTimeout(t);
   lintPending.delete(e.document.uri);
   parseCache.delete(e.document.uri);
+  checkCache.delete(e.document.uri);
   symbolCache.delete(e.document.uri);
   compilerDiags.delete(e.document.uri);
   connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
@@ -231,11 +312,48 @@ function lintDiagnostics(doc: TextDocument): Diagnostic[] {
     const raw: LintDiagnostic = { line: e.line, startCol: e.col, endCol: e.endCol, message: e.message, severity: 'error', code: 'pj/syntax', source: 'parser', fix };
     return makeDiagnostic(doc, raw);
   });
-  if (!settings.lint) return syntax;
-  const { symbols, locals } = symbolsFor(doc);
-  const lints = analyze(doc.getText(), symbols, locals, { libraryNames }).map((d) => makeDiagnostic(doc, d));
-  return [...syntax, ...lints];
+  const lex = lexDiagnostics(doc.getText()).map((d) => makeDiagnostic(doc, d));
+  if (!settings.lint) return [...syntax, ...lex];
+  const { checked, importDiags } = checkFor(doc);
+  return [...syntax, ...lex, ...importDiags.map((d) => makeDiagnostic(doc, d)), ...checked.diagnostics.map((d) => makeDiagnostic(doc, d))];
 }
+
+/** Type-check a document against its own declarations, its imports and the standard library. */
+function checkFor(doc: TextDocument): { checked: CheckResult; index: DeclIndex; importDiags: LintDiagnostic[] } {
+  const cached = checkCache.get(doc.uri);
+  if (cached && cached.version === doc.version) return cached;
+  const parsed = parsedFor(doc);
+  const ownPath = safeFileUri(doc.uri);
+  const resolution = resolveImports(parsed.program, ownPath, workspace.getRoots(), install?.includeDir);
+  const index = new DeclIndex();
+  index.addProgram(parsed.program, ownPath);
+  for (const file of resolution.files) {
+    const open = documents.get(pathToFileURL(file).toString());
+    const program = open && open.uri !== doc.uri ? parsedFor(open).program : (libraryPrograms.get(file) ?? workspace.programFor(file));
+    if (program) index.addProgram(program, file);
+  }
+  const importDiags: LintDiagnostic[] = [];
+  let unresolved = false;
+  for (const r of resolution.imports) {
+    if (r.files.length > 0) continue;
+    unresolved = true;
+    const name = r.import.path.map((p) => p.name).join('.') + (r.import.wildcard ? '.*' : '');
+    const where = install ? '' : ' (no ProcessJ install found, so the standard library is unavailable)';
+    importDiags.push({ line: r.import.span.start.line, startCol: r.import.span.start.col, endCol: r.import.span.end.col, message: `Cannot find import '${name}'${where}; looked in ${r.searched.map((d) => path.basename(d) || d).join(', ')}`, severity: 'warning', code: 'pj/import', source: 'lsp' });
+  }
+  const checked = check(parsed.program, { index, stdIndex, importsStd: resolution.importsStd, unresolvedImports: unresolved });
+  const entry = { version: doc.version, checked, index, importDiags, deps: new Set(resolution.files.map((f) => path.resolve(f))) };
+  checkCache.set(doc.uri, entry);
+  return entry;
+}
+
+connection.languages.semanticTokens.on((params) => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return { data: [] };
+  const parsed = parsedFor(doc);
+  const { checked, index } = checkFor(doc);
+  return { data: semanticTokens(parsed.program, checked, index, { libraryFiles }) };
+});
 
 /** Send the current lints plus the most recent compiler results (if still for this version). */
 function publish(doc: TextDocument): void {
@@ -625,9 +743,27 @@ connection.onCompletion((params: CompletionParams) => {
   const before = line.slice(0, params.position.character);
   const items: CompletionItem[] = [];
 
-  // Member access: `c.` -> channel/timer/barrier operations.
-  if (/[A-Za-z_]\w*\s*\.\s*\w*$/.test(before)) {
+  // Member access: `c.` -> fields of a record, cases' fields of a protocol, or channel/timer/barrier operations.
+  const member = /([A-Za-z_]\w*)\s*\.\s*\w*$/.exec(before);
+  if (member) {
+    const { checked, index } = checkFor(doc);
+    const { symbols } = symbolsFor(doc);
+    const enclosing = symbols.find((s) => s.kind === 'proc' && params.position.line >= s.line && params.position.line <= s.endLine);
+    const v = [...checked.vars].reverse().find((x) => x.name === member[1] && (!enclosing || x.proc === enclosing.name));
+    const t = v?.type ?? index.consts.get(member[1])?.type;
+    if (t?.k === 'record') {
+      for (const [name, ft] of index.recordFields(t.name)) items.push({ label: name, kind: CompletionItemKind.Field, detail: `${typeStr(ft)} ${name}` });
+      return items;
+    }
+    if (t?.k === 'protocol') {
+      for (const [tag, fields] of index.protocolCases(t.name)) for (const [name, ft] of fields) items.push({ label: name, kind: CompletionItemKind.Field, detail: `${typeStr(ft)} ${name}  (case ${tag})` });
+      return items;
+    }
+    if (t?.k === 'array') return [{ label: 'size', kind: CompletionItemKind.Property, detail: 'int: number of elements' }];
+    if (t?.k === 'prim' && t.name === 'string') return [{ label: 'length', kind: CompletionItemKind.Property, detail: 'int: number of characters' }];
+    const wanted = t?.k === 'chan' ? (t.end === 'read' ? ['read()'] : t.end === 'write' ? ['write(...)'] : ['read()', 'write(...)', 'read', 'write']) : t?.k === 'prim' && t.name === 'timer' ? ['timeout(ms)'] : t?.k === 'prim' && t.name === 'barrier' ? ['sync()', 'resign()'] : undefined;
     for (const [label, insert, doc] of MEMBER_COMPLETIONS) {
+      if (wanted && !wanted.includes(label)) continue;
       items.push({ label, kind: CompletionItemKind.Method, insertText: insert, insertTextFormat: InsertTextFormat.Snippet, detail: doc });
     }
     return items;
@@ -733,17 +869,37 @@ connection.onHover((params: HoverParams): Hover | null => {
   if (r.hits.length === 0) {
     const kw = KEYWORD_DOCS[r.word];
     if (kw) return { contents: { kind: MarkupKind.Markdown, value: `**${r.word}**\n\n${kw}` } };
+    const t = typeAtPosition(doc, params.position);
+    if (t) return { contents: { kind: MarkupKind.Markdown, value: `\`\`\`processj\n${t}\n\`\`\`` } };
     return null;
   }
 
+  const exprType = typeAtPosition(doc, params.position);
   const parts = r.hits.slice(0, 6).map((h) => {
     const where = h.origin === 'library' ? `  — std library (${path.basename((h.symbol as LibrarySymbol).file)})` : h.origin === 'workspace' ? `  — ${path.basename(safeFileUri(h.uri) ?? '')}` : '';
     let s = `\`\`\`processj\n${h.symbol.detail}\n\`\`\`${where}`;
     if (h.symbol.doc) s += `\n\n${h.symbol.doc}`;
     return s;
   });
+  if (exprType && !r.hits.some((h) => h.symbol.detail.startsWith(exprType))) parts.unshift(`type: \`${exprType}\``);
   return { contents: { kind: MarkupKind.Markdown, value: parts.join('\n\n---\n\n') } };
 });
+
+/** Type of the smallest expression containing the position, from the checker. */
+function typeAtPosition(doc: TextDocument, pos: Position): string | undefined {
+  const { checked } = checkFor(doc);
+  let best: { size: number; type: string } | undefined;
+  for (const [e, t] of checked.types) {
+    const s = e.span;
+    if (s.start.line > pos.line || s.end.line < pos.line) continue;
+    if (s.start.line === pos.line && s.start.col > pos.character) continue;
+    if (s.end.line === pos.line && s.end.col < pos.character) continue;
+    if (t.k === 'error' || t.k === 'unknown') continue;
+    const size = (s.end.line - s.start.line) * 10_000 + (s.end.col - s.start.col);
+    if (!best || size < best.size) best = { size, type: typeStr(t) };
+  }
+  return best?.type;
+}
 
 /** Every identifier token equal to `name` inside [fromLine, toLine], skipping member names after `.`. */
 function occurrences(text: string, name: string, fromLine: number, toLine: number): Range[] {

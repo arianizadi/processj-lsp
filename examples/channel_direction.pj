@@ -1,0 +1,17 @@
+// expect: pj/channel-direction, pj/channel-direction
+import std.*;
+
+// `in` is declared as a read end, so it cannot write; `out` is a write end and
+// cannot read. The compiler never checks this and generates broken Java.
+public void confused(chan<int>.read in, chan<int>.write out) {
+    in.write(1);
+    int v = out.read();
+    println(v);
+}
+
+public void main(string[] args) {
+    chan<int> c;
+    par {
+        confused(c.read, c.write);
+    }
+}

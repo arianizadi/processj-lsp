@@ -1,0 +1,10 @@
+// expect: pj/channel-no-writer
+import std.*;
+
+// Nothing in `main` ever writes `c` or passes it to another process, so this
+// read blocks forever. With this compiler's scheduler that also pins a core.
+public void main(string[] args) {
+    chan<int> c;
+    int v = c.read();
+    println(v);
+}

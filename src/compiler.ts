@@ -86,7 +86,7 @@ export interface Sandbox {
 
 export function makeSandbox(install: Install, sourcePath: string, text: string): Sandbox {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-'));
-  const home = path.join(root, 'home');
+  const home = path.join(root, '.pjlsp-home');
   const work = path.join(home, 'work');
   fs.mkdirSync(work, { recursive: true });
   fs.writeFileSync(path.join(home, 'processjrc'), `workingdir=work\ninstalldir=${install.installDir}\n`);
@@ -94,6 +94,27 @@ export function makeSandbox(install: Install, sourcePath: string, text: string):
   const fileName = base.endsWith('.pj') ? base : 'buffer.pj';
   const src = path.join(root, fileName);
   fs.writeFileSync(src, text);
+  // The compiler resolves `import a.b;` relative to its working directory before the
+  // include directory, so mirror the file's own directory here with symlinks (no copies):
+  // sibling .pj files and subdirectories become visible exactly as with `pjc`.
+  const dir = path.dirname(sourcePath);
+  if (path.isAbsolute(dir)) {
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      /* buffer without a directory on disk */
+    }
+    for (const e of entries) {
+      if (e.name === fileName || e.name.startsWith('.')) continue;
+      if (!(e.isDirectory() || (e.isFile() && e.name.endsWith('.pj')))) continue;
+      try {
+        fs.symlinkSync(path.join(dir, e.name), path.join(root, e.name));
+      } catch {
+        /* a name clash or unsupported symlinks: the compiler just won't see this entry */
+      }
+    }
+  }
   return {
     root,
     home,

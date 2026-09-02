@@ -11,6 +11,6 @@ vim.lsp.config("processj_ls", {
   filetypes = { "processj" },
   root_markers = { ".git", "processjrc" },
   workspace_required = false,
-  init_options = { debounceMs = 400, timeoutMs = 20000, checkOnChange = true },
+  init_options = { debounceMs = 400, timeoutMs = 20000, checkOnChange = false },
 })
 vim.lsp.enable "processj_ls"

@@ -25,7 +25,7 @@ local server = {
     debounceMs = 400,
     timeoutMs = 20000,
     runTimeoutMs = 30000,
-    checkOnChange = true,
+    checkOnChange = false, -- run the real compiler only on open and save; the built-in checker runs as you type
     lint = true,
   },
 }
