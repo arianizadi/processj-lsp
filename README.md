@@ -60,6 +60,8 @@ npm run install-extension
 
 To update: `git pull`, then run the same command again. Settings are under "ProcessJ" in the settings UI.
 
+Using Remote SSH? Extensions run on the remote machine, so run those commands there (over SSH), then reload the window.
+
 ## Options
 
 Pass them in `opts`:

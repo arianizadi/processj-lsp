@@ -8,6 +8,7 @@ cd processj-lsp/vscode
 npm run install-extension     # builds the server, packages the extension, installs it into VS Code
 ```
 
+In a Remote SSH window the extension runs on the remote machine: clone and run this there.
 Needs Node.js 20+ and the `code` command on PATH (VS Code: "Shell Command: Install 'code' command in PATH").
 To update later: `git pull` and run the same command again.
 
