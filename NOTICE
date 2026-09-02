@@ -1,0 +1,6 @@
+processj-lsp
+Copyright 2026 Arian Izadi
+
+This product includes example programs from the ProcessJ compiler
+(https://github.com/mattunlv/ProcessJ), Copyright University of Nevada, Las Vegas,
+licensed under the Apache License, Version 2.0, in test/fixtures/processj/.

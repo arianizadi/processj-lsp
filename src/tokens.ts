@@ -16,6 +16,15 @@ export interface Token {
   end: number;
 }
 
+export interface CommentToken {
+  kind: 'line' | 'block';
+  text: string;
+  line: number;
+  col: number;
+  endLine: number;
+  endCol: number;
+}
+
 export interface LexIssue {
   line: number;
   col: number;
@@ -33,9 +42,10 @@ const PUNCT = [
   '^', '?', ':', '#', '@',
 ];
 
-export function tokenize(text: string): { tokens: Token[]; issues: LexIssue[] } {
+export function tokenize(text: string): { tokens: Token[]; issues: LexIssue[]; comments: CommentToken[] } {
   const tokens: Token[] = [];
   const issues: LexIssue[] = [];
+  const comments: CommentToken[] = [];
   let i = 0;
   let line = 0;
   let lineStart = 0;
@@ -87,7 +97,10 @@ export function tokenize(text: string): { tokens: Token[]; issues: LexIssue[] } 
 
     // Comments.
     if (c === '/' && text[i + 1] === '/') {
+      const start = i;
+      const startCol = col();
       while (i < n && text[i] !== '\n') i++;
+      comments.push({ kind: 'line', text: text.slice(start, i).replace(/\r$/, ''), line, col: startCol, endLine: line, endCol: col() });
       continue;
     }
     if (c === '/' && text[i + 1] === '*') {
@@ -96,12 +109,16 @@ export function tokenize(text: string): { tokens: Token[]; issues: LexIssue[] } 
         i += 4;
         continue;
       }
+      const start = i;
+      const startLine = line;
+      const startCol = col();
       i += 2;
       while (i < n && !(text[i] === '*' && text[i + 1] === '/')) {
         if (text[i] === '\n') newline();
         i++;
       }
       i += 2;
+      comments.push({ kind: 'block', text: text.slice(start, Math.min(i, n)), line: startLine, col: startCol, endLine: line, endCol: col() });
       continue;
     }
 
@@ -128,7 +145,7 @@ export function tokenize(text: string): { tokens: Token[]; issues: LexIssue[] } 
     }
 
     // Numbers.
-    if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(text[i + 1] ?? ''))) {
+    if (isDigit(code) || (c === '.' && isDigit(text.charCodeAt(i + 1)))) {
       const start = i;
       const startCol = col();
       if (c === '0' && /[xX]/.test(text[i + 1] ?? '')) {
@@ -149,10 +166,10 @@ export function tokenize(text: string): { tokens: Token[]; issues: LexIssue[] } 
     }
 
     // Identifiers and keywords.
-    if (/[A-Za-z_$]/.test(c)) {
+    if (isIdentStart(code)) {
       const start = i;
       const startCol = col();
-      while (i < n && /[A-Za-z0-9_$]/.test(text[i])) i++;
+      while (i < n && isIdentPart(text.charCodeAt(i))) i++;
       const word = text.slice(start, i);
       tokens.push({ kind: KEYWORD_SET.has(word) ? 'keyword' : 'ident', text: word, line, col: startCol, end: startCol + word.length });
       continue;
@@ -173,7 +190,17 @@ export function tokenize(text: string): { tokens: Token[]; issues: LexIssue[] } 
       i++;
     }
   }
-  return { tokens, issues };
+  return { tokens, issues, comments };
+}
+
+function isDigit(c: number): boolean {
+  return c >= 48 && c <= 57;
+}
+function isIdentStart(c: number): boolean {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36;
+}
+function isIdentPart(c: number): boolean {
+  return isIdentStart(c) || isDigit(c);
 }
 
 /** Index of the token that closes the block opened at `openIdx` (which must be `{`, `(` or `[`). */

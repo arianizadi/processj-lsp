@@ -1,16 +1,44 @@
 # processj-lsp
 
 A language server for [ProcessJ](https://github.com/mattunlv/ProcessJ), the CSP-style
-concurrent language from UNLV. It drives the real compiler for diagnostics and adds
-its own static analysis for the concurrency rules the compiler does not check.
+concurrent language from UNLV. It has its own full parser and formatter, drives the
+real compiler for type errors, and adds static analysis for the concurrency rules the
+compiler does not check.
 
 ## What you get
 
+**A real parser with real error messages.** `src/parser` is a recursive-descent
+parser written from the compiler's CUP grammar. It recovers from errors, so every
+problem in a file is reported at once, and each message says what was expected,
+what was found, and what was probably meant:
+
+```
+Unknown statement 'pa'; did you mean 'par'?
+Missing ';' after the variable declaration
+Missing '}' to close the block opened at line 12
+'else' without a matching 'if'
+Unknown type 'itn'; did you mean 'int'?
+An alt guard must store the value: write 'v = c.read()'
+'c.read' names a channel end; to read use '.read()' and to write use '.write(value)'
+'proc' is not accepted by the current compiler; write the return type and name directly
+```
+
+The compiler's own "Syntax error" line is suppressed when the parser has a better
+message for the same problem.
+
+**A formatter.** `textDocument/formatting` prints the parse tree back in a
+canonical layout: 4-space indent, braces on the header line, spaces around
+operators, `chan<int>` without inner spaces, one field per line in records,
+protocol cases on one line, short alt bodies inline. Comments are kept, blank lines
+are preserved up to one, and user parentheses are never added or removed. A file
+with syntax errors is left alone (you get a message saying which error to fix
+first). The formatter is idempotent and never changes the parse tree; both are
+checked over the compiler's example corpus in `test/format.test.ts`.
+
 **Diagnostics from the real compiler.** Every edit is run through `ProcessJc` in
-an isolated temp directory. Syntax errors get the caret column, name errors get
-token columns, type errors get the line and are narrowed to the quoted
-identifier. A compiler crash becomes a diagnostic carrying the exception instead
-of disappearing.
+an isolated temp directory. Name errors get token columns, type errors get the
+line and are narrowed to the quoted identifier, and a compiler crash becomes a
+diagnostic carrying the exception.
 
 **Static analysis, instantly on every keystroke.** Each lint recreates a check the
 compiler is missing, has disabled, or gets wrong, and says why:
@@ -40,14 +68,31 @@ compiler is missing, has disabled, or gets wrong, and says why:
 directory, judged by exit codes rather than by grepping output, then opens a
 report with the program's output. A program that never finishes is killed after
 30 s and flagged as a probable deadlock. Generated Java opens the Java the
-compiler produced for the file, which is the best way to see how a `par` or an
-`alt` becomes a resumable state machine.
+compiler produced for the file, the best way to see how a `par` or an `alt`
+becomes a resumable state machine.
 
-**Navigation.** Completion (locals, procs, records, protocols, the whole `std`
-library with signatures, keywords with explanations, snippets for `par`, `alt`,
-`chan`, ...), hover, go to definition into the workspace and the standard-library
-headers, find references, rename, document outline, signature help with
-`println` overloads.
+**Navigation.** Completion (locals in scope, procs, records, protocols, the whole
+`std` library with signatures, keywords with explanations, snippets for `par`,
+`alt`, `chan`, ...), hover, go to definition into the workspace and the
+standard-library headers, find references, rename, document outline, folding,
+signature help with `println` overloads.
+
+## Performance
+
+Everything except the compiler run is synchronous on the keystroke path, so it
+has to be fast. `npm run bench` on a laptop:
+
+```
+   1341 lines      7523 tokens  parse   3.4 ms  symbols   0.8 ms  lint   15.0 ms  format    3.1 ms
+  10024 lines     55109 tokens  parse  10.5 ms  symbols   3.0 ms  lint   53.0 ms  format    7.2 ms
+  50054 lines    273940 tokens  parse  62.2 ms  symbols  47.3 ms  lint  134.9 ms  format  101.6 ms
+```
+
+(Exact numbers vary by machine; `test/perf.test.ts` enforces budgets on a
+generated 20,000-line file and checks that parse time grows linearly.) The
+server also caches the parse per document version, coalesces lint runs so a
+burst of keystrokes costs one pass, debounces the compiler, and cancels a
+compile the moment a newer edit arrives.
 
 ## Requirements
 
@@ -55,6 +100,8 @@ headers, find references, rename, document outline, signature help with
 - A ProcessJ install with a built `bin/` directory and `resources/jars`. The
   server finds it from `initializationOptions.installDir`, the `PROCESSJ_HOME`
   environment variable, or `installdir=` in `~/processjrc` (the file `pjc` reads).
+  Without one, parsing, lints, formatting and navigation still work; compiler
+  diagnostics and Run are disabled.
 - A JDK on `PATH` (or `JAVA_HOME`). The compiler was built with JDK 11.
 
 ## Install
@@ -64,8 +111,9 @@ git clone https://github.com/arianizadi/processj-lsp ~/Documents/processj-lsp
 cd ~/Documents/processj-lsp
 npm install
 npm run build
-npm test          # unit tests: output parser, symbol extractor, lints
+npm test          # parser corpus, formatter idempotence, lints, output parser, performance budgets
 npm run smoke     # end-to-end against a real ProcessJ install, including a full run
+npm run bench     # timings for generated 1k / 10k / 50k-line files
 ```
 
 `bin/processj-lsp.js --stdio` is the executable editors launch.
@@ -75,9 +123,9 @@ npm run smoke     # end-to-end against a real ProcessJ install, including a full
 **AstroNvim v5:** copy `editor/nvim/lua/plugins/processj.lua` into
 `~/.config/nvim/lua/plugins/` and restart. It registers the `processj` filetype
 for `*.pj`, loads the bundled syntax highlighting, and enables the server.
-Code lenses show with `:lua vim.lsp.codelens.refresh()` and run with
-`:lua vim.lsp.codelens.run()` (AstroNvim binds `<Leader>lL` to refresh codelens
-and `<Leader>ll` to run one).
+Format with `<Leader>lf` (or `:lua vim.lsp.buf.format()`); AstroNvim's
+format-on-save applies to this server too. Code lenses refresh with
+`<Leader>lL` and run with `<Leader>ll`.
 
 **Plain Neovim 0.11+:** see `editor/nvim/plain.lua`; it uses `vim.lsp.config`
 and `vim.lsp.enable`.
@@ -113,35 +161,43 @@ with unit tests pinning real captured output.
 
 Limits inherited from the compiler:
 
-- Fatal errors call `System.exit`, so only the first syntax error is shown.
+- The compiler stops at its first syntax error; the server's own parser reports
+  all of them, so you rarely see the compiler's.
 - Some type errors are printed but do not stop the compiler, and some checks are
   silent. The server shows everything the compiler prints, and the lints cover
   the most damaging gaps.
 - Imports of your own libraries resolve against the compiler's include directory,
   not the buffer's directory.
 
-The lints are token-based, not a full parse, so they tolerate half-typed code.
-They can miss things (aliasing through procedure calls is not tracked) and are
-tuned to avoid false positives rather than to be complete.
+The lints are token-based and tolerate half-typed code; they can miss things
+(aliasing through procedure calls is not tracked) and are tuned to avoid false
+positives rather than to be complete.
 
 ## Layout
 
 ```
-src/server.ts       LSP wiring: documents, debounced compiles, every request handler
+src/server.ts       LSP wiring: documents, caches, debounced compiles, every request handler
+src/parser/ast.ts   AST node types with source spans
+src/parser/parser.ts recursive-descent parser with recovery and "did you mean" suggestions
+src/format.ts       AST printer used for textDocument/formatting
+src/astsymbols.ts   symbols and scoped locals from the parse tree
 src/analysis.ts     the lints, each documented with the compiler line it works around
-src/tokens.ts       tokenizer that also reports the lexer limits
+src/tokens.ts       tokenizer that also reports the lexer limits and keeps comments
 src/compiler.ts     runs ProcessJc in an isolated temp home, cancellable
 src/pipeline.ts     full build + run pipeline (ProcessJc, javac, ASM passes, java)
 src/diagnostics.ts  parses compiler output into structured diagnostics
-src/symbols.ts      regex-based declaration/locals extractor
+src/symbols.ts      regex-based extractor, used to top up symbols while a file has syntax errors
 src/library.ts      indexes include/JVM/**/*.pj for std completion and definitions
 src/workspace.ts    mtime-cached index of *.pj files under the workspace
 src/keywords.ts     keyword list and hover docs
-test/               node:test unit tests
+test/               node:test unit tests; test/fixtures/processj is the compiler's example corpus
 scripts/smoke.js    talks LSP over stdio to a real server, ends with a real program run
+scripts/bench.js    parse / lint / format timings on generated large files
 editor/nvim/        AstroNvim plugin spec, plain config, syntax and ftplugin files
 ```
 
 ## License
 
-MIT
+Apache License 2.0 (see `LICENSE`). The example programs under
+`test/fixtures/processj` come from the ProcessJ compiler repository, also Apache
+2.0, University of Nevada, Las Vegas (see `NOTICE`).

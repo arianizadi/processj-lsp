@@ -34,7 +34,19 @@ export function analyze(text: string, symbols: PJSymbol[], locals: PJSymbol[], o
   }
 
   const procs = symbols.filter((s) => s.kind === 'proc');
-  const ctx: Ctx = { tokens, symbols, locals, procs, out };
+  // First token index for every line, so proc token ranges are O(1) even in very large files.
+  const lastLine = tokens.length ? tokens[tokens.length - 1].line : 0;
+  const lineStart = new Int32Array(lastLine + 2).fill(tokens.length);
+  for (let i = tokens.length - 1; i >= 0; i--) lineStart[tokens[i].line] = i;
+  for (let l = lastLine; l >= 0; l--) if (lineStart[l] === tokens.length) lineStart[l] = lineStart[l + 1];
+  const localsByProc = new Map<string, PJSymbol[]>();
+  for (const l of locals) {
+    if (!l.container) continue;
+    let list = localsByProc.get(l.container);
+    if (!list) localsByProc.set(l.container, (list = []));
+    list.push(l);
+  }
+  const ctx: Ctx = { tokens, symbols, locals, procs, out, lineStart, localsByProc };
 
   lintChannelDirection(ctx);
   lintChannelWriteType(ctx);
@@ -54,6 +66,8 @@ interface Ctx {
   locals: PJSymbol[];
   procs: PJSymbol[];
   out: LintDiagnostic[];
+  lineStart: Int32Array;
+  localsByProc: Map<string, PJSymbol[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,20 +79,37 @@ function report(ctx: Ctx, tok: Token, severity: RawDiagnostic['severity'], code:
 }
 
 function procAt(ctx: Ctx, line: number): PJSymbol | undefined {
-  return ctx.procs.find((p) => line >= p.line && line <= p.endLine);
+  let lo = 0;
+  let hi = ctx.procs.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const p = ctx.procs[mid];
+    if (line < p.line) hi = mid - 1;
+    else if (line > p.endLine) lo = mid + 1;
+    else return p;
+  }
+  return undefined;
 }
 
 function tokenRange(ctx: Ctx, sym: PJSymbol): [number, number] {
-  let a = ctx.tokens.findIndex((t) => t.line >= sym.line);
-  if (a < 0) a = ctx.tokens.length;
-  let b = a;
-  while (b < ctx.tokens.length && ctx.tokens[b].line <= sym.endLine) b++;
-  return [a, b];
+  const n = ctx.tokens.length;
+  const a = sym.line < ctx.lineStart.length ? ctx.lineStart[sym.line] : n;
+  const b = sym.endLine + 1 < ctx.lineStart.length ? ctx.lineStart[sym.endLine + 1] : n;
+  return [Math.min(a, n), Math.min(Math.max(a, b), n)];
+}
+
+/** The token that starts at (line, col), found through the per-line index. */
+function tokenAt(ctx: Ctx, line: number, col: number): Token | undefined {
+  if (line >= ctx.lineStart.length) return undefined;
+  for (let i = ctx.lineStart[line]; i < ctx.tokens.length && ctx.tokens[i].line === line; i++) {
+    if (ctx.tokens[i].col === col) return ctx.tokens[i];
+  }
+  return undefined;
 }
 
 /** Locals (and params) visible in a proc, with the declared type text. */
 function localsOf(ctx: Ctx, proc: PJSymbol): PJSymbol[] {
-  return ctx.locals.filter((l) => l.container === proc.name);
+  return ctx.localsByProc.get(proc.name) ?? [];
 }
 
 function isParam(l: PJSymbol): boolean {
@@ -375,7 +406,7 @@ function lintUnusedAndShadowed(ctx: Ctx): void {
         if (t.line === l.line && t.col === l.startCol) continue;
         uses++;
       }
-      const declTok = tokens.find((t) => t.line === l.line && t.col === l.startCol);
+      const declTok = tokenAt(ctx, l.line, l.startCol);
       if (!declTok) continue;
       if (uses === 0) {
         report(ctx, declTok, isParam(l) ? 'info' : 'warning', 'pj/unused', `'${l.name}' is never used`);
@@ -453,7 +484,7 @@ function lintAlts(ctx: Ctx): void {
     if (alts > 0) {
       for (const l of localsOf(ctx, proc)) {
         if (l.name === 'index' || l.name === 'btemp') {
-          const declTok = tokens.find((t) => t.line === l.line && t.col === l.startCol);
+          const declTok = tokenAt(ctx, l.line, l.startCol);
           if (declTok) report(ctx, declTok, 'warning', 'pj/reserved-alt-name', `'${l.name}' is also the name of a variable the alt code generator creates; references may silently bind to the generated one. Rename it.`);
         }
       }

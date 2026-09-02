@@ -12,6 +12,8 @@ import {
   Diagnostic,
   DiagnosticSeverity,
   DocumentSymbol,
+  FoldingRange,
+  FoldingRangeKind,
   Hover,
   InsertTextFormat,
   Location,
@@ -31,8 +33,10 @@ import {
   type CodeLensParams,
   type CompletionParams,
   type DefinitionParams,
+  type DocumentFormattingParams,
   type DocumentSymbolParams,
   type ExecuteCommandParams,
+  type FoldingRangeParams,
   type HoverParams,
   type InitializeParams,
   type InitializeResult,
@@ -44,7 +48,11 @@ import {
 import { TextDocument } from 'vscode-languageserver-textdocument';
 
 import { analyze, type FixHint, type LintDiagnostic } from './analysis';
+import { astSymbols } from './astsymbols';
 import { compile } from './compiler';
+import { format } from './format';
+import type * as A from './parser/ast';
+import { parse, type ParseResult } from './parser/parser';
 import { findInstall, type Install } from './config';
 import { parseCompilerOutput, type RawDiagnostic } from './diagnostics';
 import { KEYWORD_DOCS, KEYWORDS, LITERALS, PRIMITIVE_TYPES } from './keywords';
@@ -89,8 +97,12 @@ const pending = new Map<string, NodeJS.Timeout>();
 const running = new Map<string, AbortController>();
 // Last compiler diagnostics per document, so lints (which are instant) can be merged with them.
 const compilerDiags = new Map<string, { version: number; diagnostics: Diagnostic[] }>();
-// Cached symbol extraction keyed by document version.
+// Cached parse and symbol extraction keyed by document version.
+const parseCache = new Map<string, { version: number; parsed: ParseResult }>();
 const symbolCache = new Map<string, { version: number; symbols: PJSymbol[]; locals: PJSymbol[] }>();
+// Lint runs are coalesced so a burst of keystrokes in a large file costs one pass.
+const lintPending = new Map<string, NodeJS.Timeout>();
+const LINT_DELAY_MS = 40;
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -136,8 +148,10 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       codeActionProvider: { codeActionKinds: [CodeActionKind.QuickFix] },
       codeLensProvider: { resolveProvider: false },
       executeCommandProvider: { commands: [COMMAND_RUN, COMMAND_SHOW_JAVA, COMMAND_BUILD] },
+      documentFormattingProvider: true,
+      foldingRangeProvider: true,
     },
-    serverInfo: { name: 'processj-lsp', version: '0.2.0' },
+    serverInfo: { name: 'processj-lsp', version: '0.3.0' },
   };
 });
 
@@ -151,21 +165,37 @@ connection.onInitialized(() => {
 });
 
 documents.onDidOpen((e) => {
-  publish(e.document);
+  schedulePublish(e.document);
   scheduleCheck(e.document, 0);
 });
 documents.onDidChangeContent((e) => {
-  symbolCache.delete(e.document.uri);
-  publish(e.document);
+  schedulePublish(e.document);
   if (settings.checkOnChange) scheduleCheck(e.document, settings.debounceMs);
 });
 documents.onDidSave((e) => scheduleCheck(e.document, 0));
 documents.onDidClose((e) => {
   cancel(e.document.uri);
+  const t = lintPending.get(e.document.uri);
+  if (t) clearTimeout(t);
+  lintPending.delete(e.document.uri);
+  parseCache.delete(e.document.uri);
   symbolCache.delete(e.document.uri);
   compilerDiags.delete(e.document.uri);
   connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
 });
+
+function schedulePublish(doc: TextDocument): void {
+  const t = lintPending.get(doc.uri);
+  if (t) clearTimeout(t);
+  lintPending.set(
+    doc.uri,
+    setTimeout(() => {
+      lintPending.delete(doc.uri);
+      const current = documents.get(doc.uri);
+      if (current) publish(current);
+    }, LINT_DELAY_MS),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Diagnostics: instant lints + debounced compiler runs, merged
@@ -195,9 +225,14 @@ function scheduleCheck(doc: TextDocument, delayMs: number): void {
 }
 
 function lintDiagnostics(doc: TextDocument): Diagnostic[] {
-  if (!settings.lint) return [];
+  const parsed = parsedFor(doc);
+  const syntax: Diagnostic[] = parsed.errors.map((e) =>
+    makeDiagnostic(doc, { line: e.line, startCol: e.col, endCol: e.endCol, message: e.message, severity: 'error', code: 'pj/syntax', source: 'parser' }),
+  );
+  if (!settings.lint) return syntax;
   const { symbols, locals } = symbolsFor(doc);
-  return analyze(doc.getText(), symbols, locals, { libraryNames }).map((d) => makeDiagnostic(doc, d));
+  const lints = analyze(doc.getText(), symbols, locals, { libraryNames }).map((d) => makeDiagnostic(doc, d));
+  return [...syntax, ...lints];
 }
 
 /** Send the current lints plus the most recent compiler results (if still for this version). */
@@ -211,7 +246,11 @@ function publish(doc: TextDocument): void {
 /** Drop compiler messages that a lint already explains on the same line. */
 function mergeDiagnostics(lints: Diagnostic[], compiler: Diagnostic[]): Diagnostic[] {
   const lintLines = new Set(lints.filter((l) => l.severity === DiagnosticSeverity.Error).map((l) => l.range.start.line));
-  const kept = compiler.filter((c) => !(lintLines.has(c.range.start.line) && /Symbol .* not found|Unknown name expression|No suitable procedure/.test(String(c.message))));
+  const haveSyntax = lints.some((l) => l.code === 'pj/syntax');
+  const kept = compiler.filter((c) => {
+    if (haveSyntax && c.code === 'syntax') return false; // ours says what is wrong; the compiler's only says "Syntax error"
+    return !(lintLines.has(c.range.start.line) && /Symbol .* not found|Unknown name expression|No suitable procedure/.test(String(c.message)));
+  });
   return [...lints, ...kept];
 }
 
@@ -283,7 +322,7 @@ function makeDiagnostic(doc: TextDocument, raw: RawDiagnostic | LintDiagnostic):
     message,
     severity,
     code: raw.code,
-    source: raw.source === 'lsp' ? 'processj-lint' : 'processj',
+    source: raw.source === 'lsp' ? 'processj-lint' : raw.source === 'parser' && raw.code === 'pj/syntax' ? 'processj-parser' : 'processj',
     data: fix ? { fix } : undefined,
   };
 }
@@ -411,16 +450,109 @@ async function showReport(name: string, content: string): Promise<string> {
 // Symbols, completion, hover, definition, references, rename, signature help
 // ---------------------------------------------------------------------------
 
+function parsedFor(doc: TextDocument): ParseResult {
+  const cached = parseCache.get(doc.uri);
+  if (cached && cached.version === doc.version) return cached.parsed;
+  const parsed = parse(doc.getText());
+  parseCache.set(doc.uri, { version: doc.version, parsed });
+  return parsed;
+}
+
 function symbolsFor(doc: TextDocument): { symbols: PJSymbol[]; locals: PJSymbol[] } {
   const cached = symbolCache.get(doc.uri);
   if (cached && cached.version === doc.version) return cached;
-  const text = doc.getText();
-  const symbols = extractSymbols(text);
-  const locals = extractLocals(text, symbols);
+  const parsed = parsedFor(doc);
+  const { symbols, locals } = astSymbols(parsed);
+  if (parsed.errors.length > 0) {
+    // While the file is mid-edit the tree may be missing pieces; top up from the tolerant regex scan.
+    const text = doc.getText();
+    const have = new Set([...symbols, ...locals].map((s) => `${s.kind}|${s.name}|${s.line}`));
+    for (const s of extractSymbols(text)) if (!have.has(`${s.kind}|${s.name}|${s.line}`)) symbols.push(s);
+    for (const l of extractLocals(text, symbols)) if (!have.has(`${l.kind}|${l.name}|${l.line}`)) locals.push(l);
+  }
   const entry = { version: doc.version, symbols, locals };
   symbolCache.set(doc.uri, entry);
   return entry;
 }
+
+// ---------------------------------------------------------------------------
+// Formatting and folding (AST based)
+// ---------------------------------------------------------------------------
+
+connection.onDocumentFormatting((params: DocumentFormattingParams): TextEdit[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+  const indent = params.options.insertSpaces === false ? '\t' : ' '.repeat(params.options.tabSize || 4);
+  const result = format(doc.getText(), { indent });
+  if (!result.text) {
+    const n = result.errors.length;
+    connection.window.showWarningMessage(`ProcessJ: not formatted, fix ${n} syntax error${n === 1 ? '' : 's'} first (line ${result.errors[0].line + 1}: ${result.errors[0].message})`);
+    return [];
+  }
+  if (result.text === doc.getText()) return [];
+  const end = doc.positionAt(doc.getText().length);
+  return [TextEdit.replace(Range.create(Position.create(0, 0), end), result.text)];
+});
+
+connection.onFoldingRanges((params: FoldingRangeParams): FoldingRange[] => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return [];
+  const parsed = parsedFor(doc);
+  const out: FoldingRange[] = [];
+  const add = (span: A.Span, kind?: FoldingRangeKind) => {
+    if (span.end.line > span.start.line) out.push({ startLine: span.start.line, endLine: span.end.line - 1 >= span.start.line ? span.end.line - 1 : span.end.line, kind });
+  };
+  for (const c of parsed.comments) if (c.kind === 'block') add({ start: { line: c.line, col: c.col }, end: { line: c.endLine + 1, col: 0 } }, FoldingRangeKind.Comment);
+  const stmt = (s: A.Stmt): void => {
+    switch (s.kind) {
+      case 'Block':
+        add(s.span);
+        s.stmts.forEach(stmt);
+        return;
+      case 'ParBlock':
+      case 'SeqBlock':
+        add(s.span);
+        s.body.stmts.forEach(stmt);
+        return;
+      case 'IfStmt':
+        stmt(s.then);
+        if (s.else) stmt(s.else);
+        return;
+      case 'WhileStmt':
+      case 'DoStmt':
+      case 'ForStmt':
+      case 'ClaimStmt':
+        stmt(s.body);
+        return;
+      case 'SwitchStmt':
+        add(s.span);
+        for (const g of s.groups) g.stmts.forEach(stmt);
+        return;
+      case 'AltStmt':
+        add(s.span);
+        for (const c of s.cases) {
+          if (c.nested) stmt(c.nested);
+          if (c.body) stmt(c.body);
+        }
+        return;
+      case 'LabeledStmt':
+        stmt(s.stmt);
+        return;
+      default:
+        return;
+    }
+  };
+  for (const d of parsed.program.decls) {
+    add(d.span);
+    if (d.kind === 'ProcDecl' && d.body) d.body.stmts.forEach(stmt);
+  }
+  if (parsed.program.imports.length > 1) {
+    const first = parsed.program.imports[0].span;
+    const last = parsed.program.imports[parsed.program.imports.length - 1].span;
+    add({ start: first.start, end: { line: last.end.line + 1, col: 0 } }, FoldingRangeKind.Imports);
+  }
+  return out;
+});
 
 connection.onDocumentSymbol((params: DocumentSymbolParams) => {
   const doc = documents.get(params.textDocument.uri);
