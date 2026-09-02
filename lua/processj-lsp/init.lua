@@ -31,8 +31,19 @@ function M.default_config()
       runTimeoutMs = 30000,
       checkOnChange = false, -- run the real compiler only on open and save; the checker runs as you type
       lint = true,
+      codeLens = false, -- no inline "Run | Build" text; use :ProcessJRun and :ProcessJBuild instead
     },
   }
+end
+
+--- Send a server command for the current buffer.
+local function exec(command)
+  local client = vim.lsp.get_clients({ bufnr = 0, name = "processj_ls" })[1]
+  if not client then
+    vim.notify("processj-lsp: no ProcessJ server attached to this buffer", vim.log.levels.WARN)
+    return
+  end
+  client:exec_cmd({ command = command, arguments = { vim.uri_from_bufnr(0) } }, { bufnr = 0 })
 end
 
 --- Is the server built? Reports what to do if not.
@@ -61,6 +72,8 @@ function M.setup(opts)
   local config = vim.tbl_deep_extend("force", M.default_config(), opts or {})
   vim.lsp.config("processj_ls", config)
   vim.lsp.enable "processj_ls"
+  vim.api.nvim_create_user_command("ProcessJRun", function() exec "processj.run" end, { desc = "Compile and run the current ProcessJ file" })
+  vim.api.nvim_create_user_command("ProcessJBuild", function() exec "processj.build" end, { desc = "Compile the current ProcessJ file" })
   -- AstroNvim applies its LSP keymaps (<Leader>la, <Leader>lf, gd, ...) from AstroLSP's
   -- on_attach, which only runs for servers AstroLSP started itself. Run it for ours too.
   vim.api.nvim_create_autocmd("LspAttach", {

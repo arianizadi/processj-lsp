@@ -86,6 +86,8 @@ interface Settings {
   runTimeoutMs: number;
   /** Turn the built-in static analysis on or off. */
   lint: boolean;
+  /** Offer the Run / Build code lenses above main (editors that render lenses inline may prefer commands). */
+  codeLens: boolean;
 }
 
 const COMMAND_RUN = 'processj.run';
@@ -95,7 +97,7 @@ const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
 const workspace = new WorkspaceIndex();
 
-let settings: Settings = { debounceMs: 400, timeoutMs: 20_000, checkOnChange: false, runTimeoutMs: 30_000, lint: true };
+let settings: Settings = { debounceMs: 400, timeoutMs: 20_000, checkOnChange: false, runTimeoutMs: 30_000, lint: true, codeLens: true };
 let clientWatchesFiles = false;
 let install: Install | undefined;
 let installError: string | undefined;
@@ -163,7 +165,7 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       documentSymbolProvider: true,
       signatureHelpProvider: { triggerCharacters: ['(', ','], retriggerCharacters: [','] },
       codeActionProvider: { codeActionKinds: [CodeActionKind.QuickFix] },
-      codeLensProvider: { resolveProvider: false },
+      codeLensProvider: settings.codeLens ? { resolveProvider: false } : undefined,
       executeCommandProvider: { commands: [COMMAND_RUN, COMMAND_BUILD] },
       documentFormattingProvider: true,
       foldingRangeProvider: true,
