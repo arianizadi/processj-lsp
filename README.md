@@ -6,7 +6,7 @@ A language server for [ProcessJ](https://github.com/mattunlv/ProcessJ), packaged
 
 - Errors as you type, with messages that say what to fix and often a one-key fix
 - A type checker that knows channels, records, protocols and `par`
-- Formatting, semantic highlighting, hover, go to definition, rename, completion
+- Formatting, semantic highlighting, hover, exact rename/references, fuzzy workspace search, scope-aware completion with auto-imports
 - ▶ Run: compile and run the current file from the editor
 
 ## Install
@@ -35,7 +35,9 @@ Open any `.pj` file. That's it.
 | a ProcessJ install, with `installdir=/path/to/ProcessJ` in `~/processjrc` | only for compiler diagnostics and ▶ Run; everything else works without it |
 | a JDK on PATH | same: only for the compiler |
 
-If a `.pj` file opens with no diagnostics at all, run `:checkhealth vim.lsp`. If it says the server is not built, run `:Lazy build processj-lsp`.
+If a `.pj` file opens with no diagnostics at all, run `:checkhealth processj-lsp`. It checks the Node
+version, server build, optional ProcessJ/JDK setup, and whether the client attached. If the server is not
+built, run `:Lazy build processj-lsp`.
 
 ## Using it
 
@@ -59,6 +61,12 @@ npm run install-extension
 ```
 
 To update: `git pull`, then run the same command again. Settings are under "ProcessJ" in the settings UI.
+Each successful GitHub Actions run also publishes a ready-to-install VSIX artifact if you do not want to build locally.
+
+Open a `.pj` file and use the play button in the editor title, the **▶ Run** code lens above `main`, or
+**ProcessJ: Run Current File** from the Command Palette. The language status menu shows whether the server
+is ready; click it for logs. Settings take effect automatically, and **ProcessJ: Restart Language Server**
+is available when troubleshooting. Unsaved ProcessJ editors work too after choosing the ProcessJ language mode.
 
 Using Remote SSH? Extensions run on the remote machine, so run those commands there (over SSH), then reload the window.
 
@@ -72,15 +80,20 @@ opts = {
     installDir = "~/Documents/ProcessJ", -- instead of ~/processjrc
     checkOnChange = true,                -- also run the real compiler on every edit (default: open and save)
     lint = false,                        -- turn the static analysis off
+    codeLens = false,                    -- hide the inline Run / Build actions
   },
 }
 ```
+
+VS Code exposes these plus the compiler debounce and timeout, Java path, server path, and protocol tracing
+under **Settings → ProcessJ**; no JSON editing or window reload is required.
 
 ## Good to know
 
 - The real compiler only runs on open and save, in a temp directory. Your `~/workingpj` is never touched.
 - The checker finds things the compiler does not: data races in `par`, a channel end used by two processes, a process reading its own channel, branches whose reads and writes cannot pair up, loops that starve every other process, `skip` shadowing the guards after it in a `pri alt`. See `examples/` for one small program per message.
-- Files that import each other are re-checked when either changes; nothing is polled.
+- Files that import each other are re-checked when either changes. Neovim and VS Code push file events;
+  simpler clients fall back to an on-demand workspace refresh at most once every 5 seconds.
 - More: [docs/DETAILS.md](docs/DETAILS.md) covers every feature, the numbers, and how it works.
 
 ## Developing

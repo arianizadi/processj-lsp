@@ -13,9 +13,11 @@
 import type { LintDiagnostic } from '../analysis';
 import type { FixHint } from '../analysis';
 import type * as A from '../parser/ast';
+import { identToString, qualifierToString } from '../parser/ast';
+import { PRIMITIVE_TYPES } from '../keywords';
 import { suggest } from '../parser/parser';
 import { DeclIndex, signatureStr, type ProcSig } from './index';
-import { hasYieldAnnotation, YieldAnalysis } from './yields';
+import { YieldAnalysis, yieldAnnotationEdit } from './yields';
 import { assignable, endOf, isIntegral, isLenient, isNumeric, isPrim, isReference, isSubtype, promote, sameType, T, typeStr, whyNotAssignable, type Type } from './types';
 
 export interface VarInfo {
@@ -219,10 +221,10 @@ class Checker {
   private checkTypeKnown(node: A.TypeNode): void {
     if (node.kind === 'ArrayType') return this.checkTypeKnown(node.elem);
     if (node.kind === 'ChanType') return this.checkTypeKnown(node.elem);
-    if (node.kind !== 'NamedType' || node.name.name === '<missing>') return;
+    if (node.kind !== 'NamedType' || node.name.name === '<missing>' || node.name.qualifier?.length) return;
     const name = node.name.name;
     if (this.index.isKnownType(name) || this.opts.unresolvedImports) return;
-    const s = suggest(name, [...this.index.records.keys(), ...this.index.protocols.keys()]);
+    const s = suggest(name, [...this.index.records.keys(), ...this.index.protocols.keys(), ...PRIMITIVE_TYPES]);
     this.report(node.span, 'warning', 'pj/type/unknown-type', `Unknown type '${name}'${s ? `; did you mean '${s}'?` : ' (not declared here, in an import, or in std)'}`, s ? { kind: 'edit', title: `Change to '${s}'`, line: node.name.span.start.line, col: node.name.span.start.col, endCol: node.name.span.end.col, text: s } : undefined);
   }
 
@@ -232,55 +234,111 @@ class Checker {
 
   program(p: A.Program): void {
     const seenProcs = new Map<string, A.ProcDecl>();
+    const seenTop = new Map<string, { kind: 'procedure' | 'record' | 'protocol' | 'constant' | 'extern type'; id: A.Ident }>();
+    const procGroups = new Map<string, A.ProcDecl[]>();
+    const noteTop = (id: A.Ident, kind: 'procedure' | 'record' | 'protocol' | 'constant' | 'extern type'): void => {
+      const prev = seenTop.get(id.name);
+      if (!prev) {
+        seenTop.set(id.name, { kind, id });
+        return;
+      }
+      if (kind === 'procedure' && prev.kind === 'procedure') return;
+      this.error(id.span, 'pj/type/duplicate', `Top-level name '${id.name}' is already used by a ${prev.kind} on line ${prev.id.span.start.line + 1}`);
+    };
     for (const d of p.decls) {
       switch (d.kind) {
         case 'RecordDecl': {
+          noteTop(d.name, 'record');
           const seen = new Set<string>();
           for (const m of d.members) {
             this.checkTypeKnown(m.type);
+            this.checkCompilable(m.type);
             if (seen.has(m.name.name)) this.error(m.name.span, 'pj/type/duplicate', `Field '${m.name.name}' is declared twice in record '${d.name.name}'`);
             seen.add(m.name.name);
           }
+          const parents = new Set<string>();
           for (const e of d.extends) {
+            const parentName = identToString(e);
+            if (parents.has(parentName)) this.error(e.span, 'pj/type/duplicate', `'${parentName}' appears more than once in the extends clause of record '${d.name.name}'`);
+            parents.add(parentName);
+            if (e.qualifier?.length) continue;
             if (!this.index.records.has(e.name)) this.error(e.span, 'pj/type/unknown-type', `'${d.name.name}' extends '${e.name}', which is not a record`);
             else if (this.index.extendsName(e.name, d.name.name)) this.error(e.span, 'pj/type/cycle', `Record '${d.name.name}' extends itself through '${e.name}'`);
           }
           break;
         }
         case 'ProtocolDecl': {
+          noteTop(d.name, 'protocol');
           const seen = new Set<string>();
           for (const c of d.cases ?? []) {
             if (seen.has(c.name.name)) this.error(c.name.span, 'pj/type/duplicate', `Case '${c.name.name}' is declared twice in protocol '${d.name.name}'`);
             seen.add(c.name.name);
-            for (const m of c.members) this.checkTypeKnown(m.type);
+            const fields = new Set<string>();
+            for (const m of c.members) {
+              this.checkTypeKnown(m.type);
+              this.checkCompilable(m.type);
+              if (fields.has(m.name.name)) this.warn(m.name.span, 'pj/type/duplicate', `Field '${m.name.name}' is declared twice in case '${c.name.name}' of protocol '${d.name.name}' (accepted by this compiler build, but ambiguous to readers and tools)`);
+              fields.add(m.name.name);
+            }
           }
+          const parents = new Set<string>();
           for (const e of d.extends) {
+            const parentName = identToString(e);
+            if (parents.has(parentName)) this.warn(e.span, 'pj/type/duplicate', `'${parentName}' appears more than once in the extends clause of protocol '${d.name.name}' (accepted by this compiler build, but redundant)`);
+            parents.add(parentName);
+            if (e.qualifier?.length) continue;
             if (!this.index.protocols.has(e.name)) this.error(e.span, 'pj/type/unknown-type', `'${d.name.name}' extends '${e.name}', which is not a protocol`);
+            else if (this.index.extendsName(e.name, d.name.name)) this.error(e.span, 'pj/type/cycle', `Protocol '${d.name.name}' extends itself through '${e.name}'`);
           }
           break;
         }
         case 'ConstDecl': {
           const type = this.resolveType(d.type);
           for (const v of d.declarators) {
+            noteTop(v.name, 'constant');
             if (!v.init) {
               if (!d.modifiers.includes('native')) this.error(v.name.span, 'pj/type/const-init', `Constant '${v.name.name}' needs an initialiser`);
               continue;
             }
-            const vt: Type = v.dims > 0 ? { k: 'array', elem: type, dims: v.dims } : type;
+            const vt: Type = v.dims > 0 ? { k: 'array', elem: type.k === 'array' ? type.elem : type, dims: (type.k === 'array' ? type.dims : 0) + v.dims } : type;
             this.checkInit(vt, v.init, v.name.name);
             if (!(isLiteralInit(v.init) && this.onlyConstNames(v.init))) this.error(v.init.span, 'pj/type/const-init', 'A constant can only be initialised with literals and other constants');
           }
           break;
         }
         case 'ProcDecl': {
+          noteTop(d.name, 'procedure');
+          const group = procGroups.get(d.name.name);
+          if (group) group.push(d);
+          else procGroups.set(d.name.name, [d]);
+          if (d.modifiers.includes('mobile') && !isPrim(this.index.resolve(d.returnType), 'void')) {
+            this.error(d.returnType.span, 'pj/type/mobile', `Mobile procedure '${d.name.name}' must return void`);
+          }
+          for (const implemented of d.implements) {
+            if (implemented.qualifier?.length) continue;
+            if (this.index.procs.has(implemented.name)) continue;
+            const nonProc = this.index.records.has(implemented.name) || this.index.protocols.has(implemented.name) || this.index.consts.has(implemented.name) || this.index.externs.has(implemented.name);
+            this.error(implemented.span, 'pj/type/implements', nonProc ? `'${implemented.name}' is not a procedure and cannot be implemented` : `Cannot find the procedure '${implemented.name}' named in the implements clause`);
+          }
           const key = `${d.name.name}(${d.params.map((x) => typeStr(this.index.resolve(x.type))).join(',')})`;
           const prev = seenProcs.get(key);
           if (prev) this.error(d.name.span, 'pj/type/duplicate', `Procedure '${d.name.name}' with the same parameter types is already declared at line ${prev.name.span.start.line + 1}`);
           seenProcs.set(key, d);
           break;
         }
+        case 'ExternDecl':
+          noteTop(d.name, 'extern type');
+          break;
         default:
           break;
+      }
+    }
+    for (const [name, group] of procGroups) {
+      // This compiler diagnoses a mobile declaration only when an earlier
+      // declaration already owns the name. A later ordinary overload after the
+      // first mobile declaration is accepted (despite a contrary source comment).
+      for (const d of group.slice(1)) {
+        if (d.modifiers.includes('mobile')) this.error(d.name.span, 'pj/type/mobile', `Mobile procedure '${name}' cannot be overloaded; give each mobile procedure a unique name`);
       }
     }
     for (const d of p.decls) {
@@ -289,9 +347,8 @@ class Checker {
     }
     for (const d of p.decls) if (d.kind === 'ProcDecl') this.procDecl(d);
     for (const d of this.yields.needingAnnotation(p)) {
-      if (hasYieldAnnotation(d) || !d.body) continue;
-      const at = d.body.span.start;
-      this.report(d.name.span, 'warning', 'pj/needs-yield-annotation', `'${d.name.name}' suspends only through the procedures it calls; mark it [yield=true] so it is compiled as a suspending process`, { kind: 'edit', title: 'Add [yield=true]', line: at.line, col: at.col, endCol: at.col, text: '[yield=true] ' });
+      const at = yieldAnnotationEdit(d);
+      this.report(d.name.span, 'warning', 'pj/needs-yield-annotation', `'${d.name.name}' suspends only through the procedures it calls, which this ProcessJ build does not notice; mark it [yield=true] so it is compiled as a suspending process`, { kind: 'edit', title: 'Add [yield=true]', line: at.line, col: at.col, endCol: at.col, text: at.text });
     }
   }
 
@@ -323,6 +380,7 @@ class Checker {
     this.enrolled = new Set();
     this.syncs = [];
     this.pendingSims = [];
+    const firstVar = this.allVars.length;
     this.push();
     for (const p of d.params) {
       const t = this.resolveType(p.type);
@@ -336,15 +394,19 @@ class Checker {
       this.pop();
     }
     this.pop();
-    this.finishProc(d);
+    this.finishProc(d, firstVar);
     this.proc = undefined;
   }
 
-  private finishProc(d: A.ProcDecl): void {
-    for (const v of this.allVars) {
-      if (v.proc !== d.name.name || v.uses > 0) continue;
-      if (v.isParam && v.name === 'args') continue;
-      this.report(v.decl.span, v.isParam ? 'info' : 'warning', 'pj/unused', `'${v.name}' is never used`);
+  private finishProc(d: A.ProcDecl, firstVar: number): void {
+    // Only this overload's variables: procedure names repeat across overloads.
+    // A bodiless (native) declaration cannot use its parameters at all.
+    if (d.body) {
+      for (const v of this.allVars.slice(firstVar)) {
+        if (v.uses > 0) continue;
+        if (v.isParam && v.name === 'args') continue;
+        this.report(v.decl.span, v.isParam ? 'info' : 'warning', 'pj/unused', `'${v.name}' is never used`);
+      }
     }
     for (const [v, use] of this.chanUses) {
       if (use.bare) continue;
@@ -367,7 +429,7 @@ class Checker {
   /** A loop that never ends (constant-true condition) and cannot suspend starves every other process. */
   private checkStarvingLoop(loopSpan: A.Span, cond: A.Expr | undefined, body: A.Stmt, keyword: string): void {
     if (cond && !isTrueLiteral(cond)) return;
-    if (containsExit(body) || this.yields.stmtYields(body, true)) return;
+    if (containsExit(body) || this.yields.stmtYields(body, 'calls')) return;
     const head: A.Span = { start: loopSpan.start, end: { line: loopSpan.start.line, col: loopSpan.start.col + keyword.length } };
     this.warn(head, 'pj/starving-loop', `This loop never ends and never communicates, so no other process ever runs again (the scheduler is cooperative). Add a channel operation, timeout or alt.`);
   }
@@ -405,7 +467,9 @@ class Checker {
       case 'SkipStmt':
         return;
       case 'StopStmt':
+        return;
       case 'SuspendStmt':
+        if (!this.proc?.modifiers.includes('mobile')) this.error(s.span, 'pj/type/suspend', "'suspend' can only appear in a mobile procedure");
         return;
       case 'LocalDecl':
         return this.localDecl(s);
@@ -623,7 +687,7 @@ class Checker {
       if (e.kind === 'ArrayLiteral') this.arrayLiteral(e, elemType, name);
       else {
         const t = this.expr(e);
-        if (!this.assignableExpr(elemType, t, e)) this.error(e.span, 'pj/type/assign', `Element of type ${typeStr(t)} does not fit in ${typeStr(expected)}`);
+        if (!sameType(elemType, t) && !this.assignableExpr(elemType, t, e)) this.error(e.span, 'pj/type/assign', `Element of type ${typeStr(t)} does not fit in ${typeStr(expected)}`);
       }
     }
     this.types.set(lit, expected);
@@ -690,13 +754,15 @@ class Checker {
   private narrowing(cond: A.Expr): [VarInfo, string] | undefined {
     let e = cond;
     while (e.kind === 'ParenExpr') e = e.expr;
-    if (e.kind !== 'IsExpr' || e.expr.kind !== 'NameExpr') return undefined;
+    if (e.kind !== 'IsExpr' || e.expr.kind !== 'NameExpr' || e.typeName.qualifier?.length) return undefined;
     const v = this.resolutions.get(e.expr);
     return v ? [v, e.typeName.name] : undefined;
   }
 
-  private altStmt(s: A.AltStmt): void {
-    this.altCount++;
+  private altStmt(s: A.AltStmt, nested = false): void {
+    // The compiler merges a nested non-replicated alt into its parent, so only
+    // top-level and replicated alts count towards the one-alt limit.
+    if (!nested || s.replicated) this.altCount++;
     if (this.altCount === 2) this.error({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + (s.isPri ? 7 : 3) } }, 'pj/multiple-alts', `A procedure can contain only one alt; move this one into its own procedure`);
     this.insideAlt++;
     this.push();
@@ -718,7 +784,7 @@ class Checker {
     }
     for (const c of s.cases) {
       if (c.nested) {
-        this.altStmt(c.nested);
+        this.altStmt(c.nested, true);
         continue;
       }
       this.push();
@@ -908,7 +974,8 @@ class Checker {
         return false;
       case 'Invocation': {
         if (e.target) return false;
-        const cands = this.index.procs.get(e.name.name) ?? [];
+        const chosen = this.calls.get(e);
+        const cands = chosen ? [chosen] : this.index.procs.get(e.name.name) ?? [];
         if (cands.some((c) => this.yields.procYields(c.decl))) return false;
         return e.args.every((a) => this.exprOps(a, ops) && this.types.get(a)?.k !== 'chan');
       }
@@ -922,7 +989,7 @@ class Checker {
       case 'CastExpr':
         return this.exprOps(e.expr, ops);
       case 'TernaryExpr':
-        return this.exprOps(e.cond, ops) && !this.yields.exprYields(e.then, true) && !this.yields.exprYields(e.else, true);
+        return this.exprOps(e.cond, ops) && !this.yields.exprYields(e.then, 'calls') && !this.yields.exprYields(e.else, 'calls');
       case 'RecordAccess':
         return this.exprOps(e.target, ops);
       case 'ArrayAccess':
@@ -1043,6 +1110,9 @@ class Checker {
         if (isLenient(a)) return b;
         if (isLenient(b)) return a;
         if (isNumeric(a) && isNumeric(b)) return promote(a, b);
+        // `assignable` rejects whole channels even against themselves; identical
+        // branch types are trivially compatible.
+        if (sameType(a, b)) return a;
         if (assignable(a, b, this.index)) return a;
         if (assignable(b, a, this.index)) return b;
         return this.error(e.span, 'pj/type/ternary', `The two branches of '?:' have different types: ${typeStr(a)} and ${typeStr(b)}`);
@@ -1059,6 +1129,7 @@ class Checker {
       case 'IsExpr': {
         const t = this.expr(e.expr);
         this.report(e.span, 'warning', 'pj/compiler-limit', "'is' cannot be compiled by this ProcessJ build; use 'switch' on the protocol value instead");
+        if (e.typeName.qualifier?.length) return T.boolean;
         if (isLenient(t)) return T.boolean;
         if (t.k !== 'protocol') return this.error(e.span, 'pj/type/is', `'is' tests a protocol value for its case; ${exprText(e.expr)} is ${typeStr(t)}`);
         const cases = this.index.protocolCases(t.name);
@@ -1132,6 +1203,10 @@ class Checker {
         for (const x of e.elements) this.expr(x);
         return T.unknown;
       case 'RecordLiteral': {
+        if (e.typeName.qualifier?.length) {
+          for (const field of e.fields) this.expr(field.value);
+          return { k: 'unknown', name: identToString(e.typeName) };
+        }
         const rt = this.index.named(e.typeName.name);
         if (rt.k !== 'record') {
           for (const f of e.fields) this.expr(f.value);
@@ -1154,9 +1229,18 @@ class Checker {
           seen.add(f.name.name);
           if (!this.assignableExpr(ft, vt, f.value)) this.error(f.value.span, 'pj/type/assign', `Field '${f.name.name}' is ${typeStr(ft)}, but this value is ${typeStr(vt)}${why(ft, vt)}`);
         }
+        const missing = [...fields.keys()].filter((name) => !seen.has(name));
+        if (missing.length) {
+          const names = missing.map((name) => `'${name}'`).join(', ');
+          this.warn(e.typeName.span, 'pj/missing-field', `Record '${rt.name}' leaves ${missing.length === 1 ? 'field' : 'fields'} ${names} at ${missing.length === 1 ? 'its' : 'their'} default value`);
+        }
         return rt;
       }
       case 'ProtocolLiteral': {
+        if (e.typeName.qualifier?.length) {
+          for (const field of e.fields) this.expr(field.value);
+          return { k: 'unknown', name: identToString(e.typeName) };
+        }
         const pt = this.index.named(e.typeName.name);
         if (pt.k !== 'protocol') {
           for (const f of e.fields) this.expr(f.value);
@@ -1184,10 +1268,25 @@ class Checker {
           seen.add(f.name.name);
           if (!this.assignableExpr(ft, vt, f.value)) this.error(f.value.span, 'pj/type/assign', `Field '${f.name.name}' is ${typeStr(ft)}, but this value is ${typeStr(vt)}${why(ft, vt)}`);
         }
+        const missing = [...fields.keys()].filter((name) => !seen.has(name));
+        if (missing.length) {
+          const names = missing.map((name) => `'${name}'`).join(', ');
+          this.warn(e.tag.span, 'pj/missing-field', `Case '${e.tag.name}' of ${pt.name} leaves ${missing.length === 1 ? 'field' : 'fields'} ${names} at ${missing.length === 1 ? 'its' : 'their'} default value`);
+        }
         return pt;
       }
-      case 'NewMobile':
+      case 'NewMobile': {
+        if (e.typeName.qualifier?.length) return { k: 'unknown', name: identToString(e.typeName) };
+        const candidates = this.index.procs.get(e.typeName.name);
+        if (!candidates?.length) {
+          if (!this.opts.unresolvedImports) return this.error(e.typeName.span, 'pj/type/mobile', `Cannot find a procedure named '${e.typeName.name}' to create as a mobile process`);
+          return T.unknown;
+        }
+        const mobile = candidates.filter((p) => p.decl.modifiers.includes('mobile'));
+        if (mobile.length === 0) return this.error(e.typeName.span, 'pj/type/mobile', `'${e.typeName.name}' is not a mobile procedure`);
+        if (mobile.length > 1) return this.error(e.typeName.span, 'pj/type/mobile', `Mobile procedure '${e.typeName.name}' is overloaded, so the process type is ambiguous`);
         return T.unknown;
+      }
     }
   }
 
@@ -1253,6 +1352,7 @@ class Checker {
   private lvalue(target: A.Expr): Type {
     if (target.kind === 'NameExpr') {
       const t = this.name(target);
+      this.types.set(target, t);
       const v = this.resolutions.get(target);
       if (v) {
         v.uses--; // being assigned is not a use
@@ -1385,11 +1485,11 @@ class Checker {
     const m = e.member.name;
     if (isLenient(t)) return T.unknown;
     if (t.k === 'array') {
-      if (m === 'size' || m === 'length') return T.int;
+      if (m === 'size') return T.int;
       return this.error(e.member.span, 'pj/type/field', `Arrays have '.size', not '.${m}'`);
     }
     if (isPrim(t, 'string')) {
-      if (m === 'length' || m === 'size') return T.int;
+      if (m === 'length') return T.int;
       return this.error(e.member.span, 'pj/type/field', `Strings have '.length', not '.${m}'`);
     }
     if (t.k === 'record') {
@@ -1444,7 +1544,9 @@ class Checker {
       const s = suggest(n, [...this.index.procs.keys()]);
       return this.error(e.name.span, 'pj/type/call', `Cannot find a procedure named '${n}'${s ? `; did you mean '${s}'?` : ''}`, s ? { kind: 'edit', title: `Change to '${s}'`, line: e.name.span.start.line, col: e.name.span.start.col, endCol: e.name.span.end.col, text: s } : undefined);
     }
-    const applicable = cands.filter((c) => c.params.length === args.length && c.params.every((p, i) => this.assignableExpr(p, args[i], e.args[i])));
+    // The compiler matches arguments with plain assignment compatibility: `f(1)`
+    // does not select `f(byte)`, and with only `f(byte)` declared it is an error.
+    const applicable = cands.filter((c) => c.params.length === args.length && c.params.every((p, i) => assignable(p, args[i], this.index)));
     if (applicable.length === 0) {
       const argList = args.map(typeStr).join(', ');
       const sameArity = cands.filter((c) => c.params.length === args.length);
@@ -1668,8 +1770,8 @@ function why(to: Type, from: Type): string {
 
 function explainMismatch(sig: ProcSig, args: Type[]): string {
   for (let i = 0; i < args.length; i++) {
-    if (!isLenient(args[i]) && typeStr(sig.params[i]) !== typeStr(args[i])) {
-      const w = whyNotAssignable(sig.params[i], args[i]);
+    const w = whyNotAssignable(sig.params[i], args[i]);
+    if (!isLenient(args[i]) && (typeStr(sig.params[i]) !== typeStr(args[i]) || w)) {
       return `: argument ${i + 1} ('${sig.paramNames[i]}') needs ${typeStr(sig.params[i])}${w ? `, ${w}` : ''}`;
     }
   }
@@ -1680,7 +1782,7 @@ function explainMismatch(sig: ProcSig, args: Type[]): string {
 export function exprText(e: A.Expr): string {
   switch (e.kind) {
     case 'NameExpr':
-      return `${e.qualifier?.length ? e.qualifier.map((q) => q.name).join('::') + '::' : ''}${e.name.name}`;
+      return `${qualifierToString(e.qualifier)}${e.name.name}`;
     case 'RecordAccess':
       return `${exprText(e.target)}.${e.member.name}`;
     case 'ChanEnd':
@@ -1690,7 +1792,7 @@ export function exprText(e: A.Expr): string {
     case 'Literal':
       return e.text;
     case 'Invocation':
-      return `${e.name.name}(...)`;
+      return `${e.target ? exprText(e.target) + '.' : ''}${qualifierToString(e.qualifier)}${e.name.name}(...)`;
     case 'ChanRead':
       return `${exprText(e.target)}.read()`;
     case 'ParenExpr':

@@ -19,7 +19,7 @@ Unknown statement 'pa'; did you mean 'par'?
 Missing ';' after the variable declaration
 Missing '}' to close the block opened at line 12
 'else' without a matching 'if'
-Unknown type 'itn'; did you mean 'int'?
+Unknown statement 'retrun'; did you mean 'return'?
 An alt guard must store the value: write 'v = c.read()'
 'c.read' names a channel end; to read use '.read()' and to write use '.write(value)'
 'proc' is not accepted by the current compiler; write the return type and name directly
@@ -103,7 +103,7 @@ why:
 | `pj/read-placement`        | a channel read inside `?:` or inside a write's value; it must be its own statement (quick fix hoists it) |
 | `pj/call-as-condition`     | a bare call as the whole `if`/`while` condition; compare its result (quick fix adds `== true`) |
 | `pj/compiler-limit`        | a feature this ProcessJ build cannot compile, at the point of use: arrays of channels, variables holding a channel end, `claim`, nested record literals, record/protocol literals as call arguments, protocol parameters, `is`, assigning `null`, `break`/`continue` anywhere inside a par branch, a loop with `break` inside a switch case, records/protocols that refer to themselves through fields. The program is fine; it just will not build with this compiler |
-| `pj/needs-yield-annotation` | a procedure that suspends only through the procedures it calls; quick fix adds `[yield=true]`. The server also adds it in its private copy before every compiler run, so Run works regardless |
+| `pj/needs-yield-annotation` | a procedure that suspends only through the procedures it calls, which the compiler's own yield pass never follows (it marks a procedure only for communication in its own body, a channel-end, barrier or timer parameter, `suspend`, or being `main`); quick fix adds `[yield=true]` right after the parameter list. The server also adds it in its private copy before every compiler run, so Run works regardless |
 | `pj/shadows-parameter`     | a local with the same name as a parameter (silently accepted)                      |
 | `pj/unused`                | unused locals and parameters                                                        |
 | `pj/missing-import`        | `println` without `import std.*;`; quick fix adds the import                       |
@@ -127,14 +127,28 @@ next to the importing file, under the workspace roots, or under the install's
 include directory (which is how `import std.*;` finds the standard library).
 Imported declarations are typed, completed, hovered and navigable; an import that
 resolves nowhere gets a warning saying where it looked. Only what a file imports
-is visible to its checker; the workspace index is used for navigation.
+is visible to its checker; the workspace index is used for navigation and
+auto-import candidates. Selecting an unimported workspace or standard-library
+declaration from completion inserts the narrow import without disturbing the
+existing package, pragma, or import header.
 
-**Navigation.** Completion (locals in scope, procs, records, protocols, the whole
-`std` library with signatures, keywords with explanations, snippets for `par`,
-`alt`, `chan`, ...; after `p.` the fields of `p`'s record or protocol, after `c.`
-only the operations its channel end allows), hover with expression types, go to
-definition into the workspace and the standard-library headers, find references,
-rename, document outline, folding, signature help with `println` overloads.
+**Navigation.** Completion is scope- and declaration-order-aware: an inner local
+shadows the outer one, declarations below the cursor are not offered, and locals
+from another overload never leak in. It also includes imported procedures,
+records, protocols and constants; keywords with explanations; snippets for
+`par`, `alt`, `chan`, ...; and type-directed members (`p.` gets record/protocol
+fields while a channel end gets only the operations its direction allows).
+Unimported workspace candidates are prefix-filtered and capped at 200 per
+response; an incomplete result asks the editor to narrow/requery instead of
+allocating the entire workspace on every keystroke.
+
+Hover shows expression types, signature help presents overloads, and go to
+definition reaches workspace and standard-library declarations. References,
+rename, and document highlights follow checker identities for shadowed locals
+and the exact selected procedure overload rather than text-matching equal names;
+ambiguous fields, cases, recovery-only symbols, and qualified-name cases fail
+closed instead of risking an unrelated rename. Fuzzy workspace-symbol search,
+document outline, and folding complete the navigation surface.
 
 **Examples.** `examples/` holds one short program per diagnostic (and two clean
 ones); each announces the codes it produces on its first line and
@@ -147,26 +161,41 @@ Everything except the compiler run is synchronous on the keystroke path, so it
 has to be fast. `npm run bench` on a laptop:
 
 ```
-   1341 lines      7523 tokens  parse   3.4 ms  symbols   0.9 ms  check   4.1 ms  semantic   1.1 ms  format    4.2 ms
-  10024 lines     55109 tokens  parse  12.7 ms  symbols   3.6 ms  check  14.9 ms  semantic   5.5 ms  format   13.4 ms
-  50054 lines    273940 tokens  parse  45.9 ms  symbols  55.4 ms  check  76.4 ms  semantic  16.5 ms  format  109.5 ms
+   1341 lines      7523 tokens  parse   3.3 ms  symbols   0.8 ms  check   4.9 ms  semantic   1.0 ms  format    4.1 ms
+  10024 lines     55109 tokens  parse  13.5 ms  symbols   1.8 ms  check  15.2 ms  semantic   5.6 ms  format   16.6 ms
+  50054 lines    273940 tokens  parse  88.9 ms  symbols   7.3 ms  check  76.4 ms  semantic  16.2 ms  format   76.7 ms
 ```
 
-(Exact numbers vary by machine; `test/perf.test.ts` enforces budgets on a
-generated 20,000-line file and checks that parse time grows linearly.) The
-server caches the parse and the check per document version, coalesces lint runs
-so a burst of keystrokes costs one pass, debounces the compiler, and cancels a
-compile the moment a newer edit arrives.
+(Exact numbers vary by machine; these are warm, steady-state runs rather than
+guarantees. `test/perf.test.ts` enforces generous CI budgets on a generated
+20,000-line file and checks that parse time grows linearly.)
+
+A separate completion stress run indexed 1,500 files with 30,000 declarations.
+The cold request, including the initial workspace walk, took 118 ms; warm
+requests took 1.79–3.69 ms and returned 278 items / 55.8 KiB with
+`isIncomplete: true`. Before prefix filtering and the 200 auto-import budget,
+the same warm request took 109–123 ms and returned 30,078 items / 6.53 MiB.
+
+The server caches parsing, checking, symbols and semantic inputs per document
+version, coalesces lint bursts into one pass, and routes real-compiler JVM work
+through a latest-wins queue with two workers. A newer edit cancels stale work;
+the queue bounds CPU/memory when many files open together without serializing
+all compiler feedback.
 
 **Disk and change detection.** Everything on the keystroke path runs in memory.
-The only things that touch disk are the compiler runs (a few kilobytes of temp
-files per run, which is why they default to open and save only) and reading
-imported files. Other files are read once and cached by modification time. When
-the editor supports it (Neovim does), the server registers a `**/*.pj` watcher
-and the editor pushes change notifications; there is no polling. A change to a
-file, on disk or in another buffer, re-checks only the open documents that import
-it. Without watcher support the directory walk falls back to at most once every
-5 seconds, and only when a lookup needs it.
+The only things that touch disk are compiler runs (a few kilobytes of temporary
+files, which is why they default to open and save only) and the bounded workspace
+index. Files are parsed once and cached by modification time, change time, and
+size; name and occurrence indexes serve later completion/navigation requests.
+Unsaved open buffers overlay their on-disk entries.
+
+When the editor supports dynamic file watching (Neovim and the bundled VS Code
+extension do), the server registers one `**/*.pj` watcher and the editor pushes
+changes; there is no polling or duplicate client-side watcher. A changed file
+re-checks only open documents that import it. For a simpler LSP client without
+watcher support, a lookup may refresh the workspace at most once every 5 seconds;
+the fallback walk is depth/file bounded and never treats a home directory or
+filesystem root as a project.
 
 ## Setup
 
@@ -200,8 +229,9 @@ return {
 Restart Neovim (or run `:Lazy sync`). lazy.nvim clones the repository, runs the
 build, and the plugin registers the `processj` filetype for `*.pj`, bundled
 syntax highlighting and indentation, and the language server from its own
-checkout. Open any `.pj` file; `:checkhealth vim.lsp` should list `processj_ls`
-as attached. If it says the server is not built, run `:Lazy build processj-lsp`.
+checkout. Open any `.pj` file; `:checkhealth processj-lsp` checks the Node version,
+server build, optional ProcessJ/JDK setup, and whether `processj_ls` attached. If
+it says the server is not built, run `:Lazy build processj-lsp`.
 
 `opts` is merged into the server configuration. Useful keys:
 
@@ -232,13 +262,28 @@ vim.opt.runtimepath:append(vim.fn.expand "~/.local/share/processj-lsp")
 require("processj-lsp").setup {}
 ```
 
-### 4. Other editors
+### 4. VS Code
+
+Build and install the bundled extension from the repository:
+
+```sh
+cd vscode
+npm run install-extension
+```
+
+The play button in the editor title and the code lens above `main` run the current file. Run, Build,
+Restart Language Server, and Show Language Server Output are also available under **ProcessJ** in the
+Command Palette. The language-status menu reports Starting, Ready, or Stopped and opens the server log.
+All ProcessJ settings apply automatically; use `processj.trace.server = verbose` when protocol-level logs
+are needed. An untitled editor also gets language features after changing its language mode to ProcessJ.
+
+### 5. Other editors
 
 The server speaks standard LSP over stdio: launch
 `node <checkout>/bin/processj-lsp.js --stdio` for files of language id
 `processj` (extension `.pj`). Pass the options below as `initializationOptions`.
 
-### 5. Developing
+### 6. Developing
 
 ```sh
 git clone https://github.com/arianizadi/processj-lsp
@@ -266,6 +311,7 @@ Pass these as `init_options` / `initializationOptions`:
 | `runTimeoutMs`  | `30000` | kill a program started from Run after this long           |
 | `checkOnChange` | `false` | `true` to also run the real compiler on every edit         |
 | `lint`          | `true`  | `false` to turn the static analysis off                   |
+| `codeLens`      | `true`  | `false` to hide the inline Run and Build actions          |
 
 ## How diagnostics work
 
@@ -303,6 +349,7 @@ src/checker/        type model, declaration index, and the checker with the conc
 src/semantic.ts     semantic tokens from the parse tree and the checker's resolutions
 src/imports.ts      import resolution (file's directory, workspace roots, include directory)
 src/astsymbols.ts   symbols and scoped locals from the parse tree
+src/navigation.ts   binding-aware local scopes, declaration/reference spans and type uses
 src/analysis.ts     lexer-level diagnostics (escape sequences, non-ASCII, empty comments)
 src/tokens.ts       tokenizer that also reports the lexer limits and keeps comments
 src/compiler.ts     runs ProcessJc in an isolated temp home, cancellable
@@ -310,7 +357,9 @@ src/pipeline.ts     full build + run pipeline (ProcessJc, javac, ASM passes, jav
 src/diagnostics.ts  parses compiler output into structured diagnostics
 src/symbols.ts      regex-based extractor, used to top up symbols while a file has syntax errors
 src/library.ts      indexes include/JVM/**/*.pj for std completion and definitions
-src/workspace.ts    cache of parsed *.pj files under the workspace, invalidated by editor file events
+src/workspace.ts    bounded parsed/symbol/occurrence index, invalidated by editor file events
+src/taskqueue.ts    debounced latest-wins compiler queue with bounded concurrency
+src/settings.ts     defaults and validation for untrusted initialization options
 src/keywords.ts     keyword list and hover docs
 test/               node:test unit tests; test/fixtures holds the compiler's example corpus and std headers
 examples/           one program per diagnostic, self-describing and tested

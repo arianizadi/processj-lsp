@@ -5,6 +5,8 @@
  * help all come back. Requires a working ProcessJ install (see README).
  */
 const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -28,7 +30,9 @@ server.stdout.on('data', (chunk) => {
     const body = JSON.parse(buffer.subarray(headerEnd + 4, headerEnd + 4 + len).toString());
     buffer = buffer.subarray(headerEnd + 4 + len);
     if (body.id !== undefined && waiting.has(body.id)) {
-      waiting.get(body.id)(body);
+      const pending = waiting.get(body.id);
+      clearTimeout(pending.timer);
+      pending.resolve(body);
       waiting.delete(body.id);
     } else if (body.id !== undefined && body.method) {
       // A request from the server (window/showDocument): acknowledge it.
@@ -40,6 +44,14 @@ server.stdout.on('data', (chunk) => {
     }
   }
 });
+server.on('exit', (code, signal) => {
+  const error = new Error(`language server exited (${signal ?? code ?? 'unknown'})`);
+  for (const pending of waiting.values()) {
+    clearTimeout(pending.timer);
+    pending.reject(error);
+  }
+  waiting.clear();
+});
 
 function send(msg) {
   const json = JSON.stringify(msg);
@@ -47,8 +59,13 @@ function send(msg) {
 }
 function request(method, params) {
   const id = nextId++;
-  return new Promise((resolve) => {
-    waiting.set(id, resolve);
+  return new Promise((resolve, reject) => {
+    const timeoutMs = method === 'workspace/executeCommand' ? 180000 : 30000;
+    const timer = setTimeout(() => {
+      waiting.delete(id);
+      reject(new Error(`timed out waiting for ${method}`));
+    }, timeoutMs);
+    waiting.set(id, { resolve, reject, timer });
     send({ jsonrpc: '2.0', id, method, params });
   });
 }
@@ -113,7 +130,8 @@ public void main(string[] args) {
   check(diag.params.diagnostics.some((d) => d.range.start.line === 10 && /string/.test(d.message)), 'int-to-string assignment reported on line 11');
 
   const completion = await request('textDocument/completion', { textDocument: { uri }, position: { line: 11, character: 4 } });
-  const labels = new Set(completion.result.map((i) => i.label));
+  const completionItems = Array.isArray(completion.result) ? completion.result : completion.result.items;
+  const labels = new Set(completionItems.map((i) => i.label));
   check(labels.has('println') && labels.has('inc') && labels.has('Point') && labels.has('par') && labels.has('c'), 'completion lists library, proc, record, keyword and local');
 
   const hover = await request('textDocument/hover', { textDocument: { uri }, position: { line: 11, character: 20 } });
@@ -124,6 +142,9 @@ public void main(string[] args) {
 
   const libDef = await request('textDocument/definition', { textDocument: { uri }, position: { line: 11, character: 6 } });
   check(Array.isArray(libDef.result) && libDef.result.some((l) => /io\.pj$/.test(l.uri)), 'definition of println points into std/io.pj');
+
+  const libHover = await request('textDocument/hover', { textDocument: { uri }, position: { line: 11, character: 6 } });
+  check(/println/.test(libHover.result?.contents?.value ?? '') && /std library \(io\.pj\)/.test(libHover.result.contents.value), 'hover on println shows its stdlib signature and source');
 
   const sig = await request('textDocument/signatureHelp', { textDocument: { uri }, position: { line: 11, character: 12 } });
   check(sig.result && sig.result.signatures.length >= 8, `signature help lists println overloads (${sig.result?.signatures.length ?? 0})`);
@@ -157,6 +178,42 @@ public void main(string[] args) {
   const fix = fixes.result.find((a) => a.title === "Change to 'par'");
   check(!!fix && fix.edit.changes[uri4][0].newText === 'par', "code action: Change to 'par'");
 
+  // A compiler result depends on imported files as well as the open document
+  // version. Saving an import must clear stale compiler errors and queue a
+  // fresh compiler pass even though the importer text itself did not change.
+  const dependencyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-smoke-deps-'));
+  try {
+    const libDir = path.join(dependencyRoot, 'lib');
+    fs.mkdirSync(libDir);
+    const dependency = path.join(libDir, 'tools.pj');
+    fs.writeFileSync(dependency, 'package lib;\npublic int existing() { return 1; }\npublic string importedFoo() { return "old"; }\n');
+    const dependencyUri = pathToFileURL(path.join(dependencyRoot, 'DependencyUser.pj')).toString();
+    notify('textDocument/didOpen', {
+      textDocument: {
+        uri: dependencyUri,
+        languageId: 'processj',
+        version: 1,
+        text: 'import lib.*;\npublic int useDependency() { return importedFoo(); }\n',
+      },
+    });
+    const initialDependency = await waitForDiagnostics(dependencyUri, true);
+    check(initialDependency.params.diagnostics.some((d) => d.severity === 1), 'dependency: mismatched imported API is diagnosed');
+    await waitFor('window/logMessage', 60000, (n) => /checked DependencyUser\.pj/.test(n.params.message));
+    for (let i = notifications.length - 1; i >= 0; i--) {
+      if (notifications[i].method === 'textDocument/publishDiagnostics' && notifications[i].params.uri === dependencyUri) notifications.splice(i, 1);
+    }
+
+    fs.writeFileSync(dependency, 'package lib;\npublic int existing() { return 1; }\npublic int importedFoo() { return 2; }\n');
+    notify('workspace/didChangeWatchedFiles', { changes: [{ uri: pathToFileURL(dependency).toString(), type: 2 }] });
+    const refreshedDependency = await waitFor('textDocument/publishDiagnostics', 60000, (n) => n.params.uri === dependencyUri);
+    check(!refreshedDependency.params.diagnostics.some((d) => d.source === 'processj'), 'dependency: stale compiler errors disappear immediately after import save');
+    await waitFor('window/logMessage', 60000, (n) => /checked DependencyUser\.pj/.test(n.params.message));
+    check(true, 'dependency: import save queues a fresh compiler pass');
+    notify('textDocument/didClose', { textDocument: { uri: dependencyUri } });
+  } finally {
+    fs.rmSync(dependencyRoot, { recursive: true, force: true });
+  }
+
   // Full pipeline: build + run a valid program through the Run command.
   const uri3 = pathToFileURL(path.join(__dirname, 'SmokeHello.pj')).toString();
   const HELLO = 'import std.*;\n\npublic void main(string[] args) {\n    chan<int> c;\n    par {\n        c.write(41);\n        println("value " + (c.read() + 1));\n    }\n}\n';
@@ -166,7 +223,7 @@ public void main(string[] args) {
   check(member.result.some((i) => i.label === 'read()'), 'member completion after "c." offers read()');
   const ran = await request('workspace/executeCommand', { command: 'processj.run', arguments: [uri3] });
   const reportPath = typeof ran.result === 'string' ? ran.result : '';
-  const report = reportPath ? require('node:fs').readFileSync(reportPath, 'utf8') : '';
+  const report = reportPath ? fs.readFileSync(reportPath, 'utf8') : '';
   console.log(report.split('\n').map((l) => `    ${l}`).join('\n'));
   check(/value 42/.test(report), 'run: program output captured through the full pipeline');
   check(notifications.some((n) => n.method === 'window/showDocument'), 'run: server asked the editor to open the report');

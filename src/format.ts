@@ -8,7 +8,7 @@
  * User parentheses are kept as written; nothing is added or removed.
  */
 import type * as A from './parser/ast';
-import { typeToString } from './parser/ast';
+import { identToString, qualifierToString, typeToString } from './parser/ast';
 import { parse } from './parser/parser';
 import type { CommentToken } from './tokens';
 
@@ -95,13 +95,13 @@ class Printer {
         else this.line(level, t.startsWith('*') ? ` ${t}` : t);
       });
     }
-    this.lastSrcLine = c.endLine;
+    this.lastSrcLine = Math.max(this.lastSrcLine, c.endLine);
   }
 
-  /** Append a line comment that sits on the same source line as the node just printed. */
+  /** Append a comment that sits on the same source line as the node just printed (a block comment only when it ends there too). */
   private trailing(endLine: number): void {
     const c = this.nextComment();
-    if (c && c.kind === 'line' && c.line === endLine && this.out.length > 0) {
+    if (c && c.line === endLine && c.endLine === endLine && this.out.length > 0) {
       this.out[this.out.length - 1] += `  ${c.text.trimEnd()}`;
       this.ci++;
     }
@@ -162,7 +162,7 @@ class Printer {
       case 'ProcDecl': {
         const params = d.params.map((p) => `${p.isConst ? 'const ' : ''}${typeToString(p.type)} ${p.name.name}`).join(', ');
         const ann = d.annotations.length ? ` [${d.annotations.map((a) => `${a.name} = ${a.value}`).join(', ')}]` : '';
-        const impl = d.implements.length ? ` implements ${d.implements.map((i) => i.name).join(', ')}` : '';
+        const impl = d.implements.length ? ` implements ${d.implements.map(identToString).join(', ')}` : '';
         const head = `${this.mods(d.modifiers)}${typeToString(d.returnType)} ${d.name.name}(${params})${ann}${impl}`;
         if (!d.body) {
           this.line(0, `${head};`);
@@ -173,7 +173,7 @@ class Printer {
         return;
       }
       case 'RecordDecl': {
-        const ext = d.extends.length ? ` extends ${d.extends.map((i) => i.name).join(', ')}` : '';
+        const ext = d.extends.length ? ` extends ${d.extends.map(identToString).join(', ')}` : '';
         this.line(0, `${this.mods(d.modifiers)}record ${d.name.name}${ext} {`);
         this.lastSrcLine = d.span.start.line;
         this.fields(d.members, 1, d.span.end);
@@ -181,7 +181,7 @@ class Printer {
         return;
       }
       case 'ProtocolDecl': {
-        const ext = d.extends.length ? ` extends ${d.extends.map((i) => i.name).join(', ')}` : '';
+        const ext = d.extends.length ? ` extends ${d.extends.map(identToString).join(', ')}` : '';
         if (!d.cases) {
           this.line(0, `${this.mods(d.modifiers)}protocol ${d.name.name}${ext};`);
           return;
@@ -253,8 +253,20 @@ class Printer {
       this.blockBody(s, level);
     } else {
       this.line(level, header);
-      this.stmt(s, level + 1);
+      this.subStatement(s, level + 1);
     }
+  }
+
+  /** A lone statement under a header: its own comments come before it and a same-line comment stays with it. */
+  private subStatement(s: A.Stmt, level: number): void {
+    // The header line just printed is not a gap: nothing under it starts with a blank line.
+    const comment = this.nextComment();
+    const first = comment && this.before(comment, s.span.start) ? comment.line : s.span.start.line;
+    this.lastSrcLine = Math.max(this.lastSrcLine, first - 1);
+    this.flushBefore(s.span.start, level);
+    this.stmt(s, level);
+    this.lastSrcLine = Math.max(this.lastSrcLine, s.span.end.line);
+    this.trailing(s.span.end.line);
   }
 
   private stmt(s: A.Stmt, level: number): void {
@@ -374,11 +386,11 @@ class Printer {
         return;
       }
       this.line(level, '} else');
-      this.stmt(s.else, level + 1);
+      this.subStatement(s.else, level + 1);
       return;
     }
     this.line(level, header);
-    this.stmt(s.then, level + 1);
+    this.subStatement(s.then, level + 1);
     if (!s.else) return;
     if (s.else.kind === 'IfStmt') {
       this.ifChain(s.else, level, `else if (${this.expr(s.else.cond, level)})`);
@@ -390,7 +402,7 @@ class Printer {
       return;
     }
     this.line(level, 'else');
-    this.stmt(s.else, level + 1);
+    this.subStatement(s.else, level + 1);
   }
 
   private alt(s: A.AltStmt, level: number): void {
@@ -442,6 +454,7 @@ class Printer {
     if (b.stmts.length > 1 || !this.noCommentsInside(b.span)) return false;
     if (b.stmts.length === 1 && !isSimple(b.stmts[0])) return false;
     const text = this.inlineBlock(b, level);
+    if (text.includes('\n')) return false; // an extended rendezvous somewhere inside
     return this.ind(level).length + prefixWidth + text.length <= this.maxWidth;
   }
 
@@ -464,13 +477,18 @@ class Printer {
       case 'Literal':
         return e.text;
       case 'NameExpr':
-        return `${e.qualifier?.length ? e.qualifier.map((q) => q.name).join('::') + '::' : ''}${e.name.name}`;
+        return `${qualifierToString(e.qualifier)}${e.name.name}`;
       case 'ParenExpr':
         return `(${this.expr(e.expr, level)})`;
       case 'BinaryExpr':
         return `${this.expr(e.left, level)} ${e.op} ${this.expr(e.right, level)}`;
-      case 'UnaryExpr':
-        return e.prefix ? `${e.op}${this.expr(e.operand, level)}` : `${this.expr(e.operand, level)}${e.op}`;
+      case 'UnaryExpr': {
+        const operand = this.expr(e.operand, level);
+        if (!e.prefix) return `${operand}${e.op}`;
+        // `- -x` and `+ +x` would re-lex as decrement/increment without the space.
+        const sep = (e.op === '-' || e.op === '+') && operand.startsWith(e.op) ? ' ' : '';
+        return `${e.op}${sep}${operand}`;
+      }
       case 'AssignExpr':
         return `${this.expr(e.target, level)} ${e.op} ${this.expr(e.value, level)}`;
       case 'TernaryExpr':
@@ -478,9 +496,9 @@ class Printer {
       case 'CastExpr':
         return `(${typeToString(e.type)}) ${this.expr(e.expr, level)}`;
       case 'IsExpr':
-        return `${this.expr(e.expr, level)} is ${e.typeName.name}`;
+        return `${this.expr(e.expr, level)} is ${identToString(e.typeName)}`;
       case 'Invocation': {
-        const q = e.qualifier?.length ? e.qualifier.map((i) => i.name).join('::') + '::' : '';
+        const q = qualifierToString(e.qualifier);
         const t = e.target ? this.expr(e.target, level) + '.' : '';
         return `${t}${q}${e.name.name}(${e.args.map((a) => this.expr(a, level)).join(', ')})`;
       }
@@ -515,13 +533,13 @@ class Printer {
       case 'ArrayLiteral':
         return e.elements.length ? `{ ${e.elements.map((x) => this.expr(x, level)).join(', ')} }` : '{ }';
       case 'RecordLiteral':
-        return `new ${e.typeName.name} { ${e.fields.map((f) => `${f.name.name} = ${this.expr(f.value, level)}`).join(', ')} }`;
+        return `new ${identToString(e.typeName)} { ${e.fields.map((f) => `${f.name.name} = ${this.expr(f.value, level)}`).join(', ')} }`;
       case 'ProtocolLiteral': {
         const fields = e.fields.map((f) => `${f.name.name} = ${this.expr(f.value, level)}`).join(', ');
-        return `new ${e.typeName.name} { ${e.tag.name}:${fields ? ' ' + fields : ''} }`;
+        return `new ${identToString(e.typeName)} { ${e.tag.name}:${fields ? ' ' + fields : ''} }`;
       }
       case 'NewMobile':
-        return `new mobile(${e.typeName.name})`;
+        return `new mobile(${identToString(e.typeName)})`;
       case 'ErrorExpr':
         return '<error>';
     }

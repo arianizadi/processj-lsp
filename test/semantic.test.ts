@@ -46,3 +46,23 @@ test('semantic tokens classify declarations, parameters, fields, cases and calls
   const data = semanticTokens(parsed.program, checked, index);
   for (let i = 0; i < data.length; i += 5) assert.ok(data[i] >= 0 && data[i + 1] >= 0 && data[i + 2] > 0);
 });
+
+test('qualified-name package segments are semantic namespaces', () => {
+  const src = [
+    'void f() implements acme.api::work {',
+    '    acme.api::work();',
+    '    acme.model::Thing[] values;',
+    '}',
+  ].join('\n');
+  const parsed = parse(src);
+  assert.deepEqual(parsed.errors, []);
+  const index = new DeclIndex();
+  index.addProgram(parsed.program, 'qualified.pj');
+  const checked = check(parsed.program, { index, unresolvedImports: true });
+  const toks = decodeTokens(semanticTokens(parsed.program, checked, index));
+  const spelling = (token: (typeof toks)[number]) => src.split('\n')[token.line].slice(token.col, token.col + token.len);
+  const packages = toks.filter((token) => spelling(token) === 'acme' || spelling(token) === 'api' || spelling(token) === 'model');
+  assert.equal(packages.length, 6);
+  assert.ok(packages.every((token) => token.type === 'namespace'));
+  assert.equal(toks.find((token) => spelling(token) === 'Thing')?.type, 'struct');
+});

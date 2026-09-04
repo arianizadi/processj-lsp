@@ -9,7 +9,7 @@ const FIXTURES = path.join(__dirname, '..', '..', 'test', 'fixtures', 'processj'
 
 /** Structural view of a program with positions removed, for before/after comparison. */
 function shape(text: string): unknown {
-  return JSON.parse(JSON.stringify(parse(text).program, (k, v) => (k === 'span' ? undefined : v)));
+  return JSON.parse(JSON.stringify(parse(text).program, (k, v) => (k === 'span' || k === 'annotationsSpan' || k === 'headerEnd' ? undefined : v)));
 }
 
 test('formatting every example program is idempotent and preserves the parse tree', () => {
@@ -128,4 +128,91 @@ test('refuses to format a file with syntax errors', () => {
   const r = format('public void main(string[] args) {\n    int x = ;\n}\n');
   assert.equal(r.text, undefined);
   assert.equal(r.errors.length, 1);
+});
+
+test('formatting preserves dotted package qualifiers in every supported position', () => {
+  const src = [
+    'record R extends pkg.base::Base { int value; }',
+    'protocol P extends pkg.base::Parent { item: { int value; } }',
+    'void run(P p, R r) implements pkg.api::work {',
+    'pkg.api::work();',
+    'R copy=new pkg.types::R{value=1};',
+    'P event=new pkg.types::P{item:value=1};',
+    'boolean matches=p is pkg.types::item;',
+    'R casted=(pkg.types::R)r;',
+    'pkg.types::R[] values;',
+    'R process=new mobile(pkg.tasks::worker);',
+    '}',
+  ].join('\n');
+  const result = format(src);
+  assert.deepEqual(result.errors, []);
+  assert.ok(result.text);
+  assert.match(result.text, /extends pkg\.base::Base/);
+  assert.match(result.text, /implements pkg\.api::work/);
+  assert.match(result.text, /pkg\.api::work\(\)/);
+  assert.match(result.text, /new pkg\.types::R/);
+  assert.match(result.text, /new pkg\.types::P/);
+  assert.match(result.text, /is pkg\.types::item/);
+  assert.match(result.text, /\(pkg\.types::R\) r/);
+  assert.match(result.text, /pkg\.types::R\[\] values/);
+  assert.match(result.text, /new mobile\(pkg\.tasks::worker\)/);
+  assert.doesNotMatch(result.text, /pkg::(?:api|base|types|tasks)::/);
+  assert.deepEqual(shape(result.text), shape(src));
+});
+
+/** Format, failing loudly if the input was refused. */
+function fmt(src: string): string {
+  const r = format(src);
+  assert.ok(r.text, r.errors.map((e) => `${e.line + 1}: ${e.message}`).join('; '));
+  return r.text;
+}
+
+test('nested prefix operators keep a separating space so they never re-lex as ++ or --', () => {
+  const src = 'public void main(string[] args) {\n    int x = 1;\n    int y = - -x;\n    int z = + +x;\n    int w = - --x;\n    int v = !!(x > 0) ? 1 : 2;\n}\n';
+  const once = fmt(src);
+  assert.match(once, /int y = - -x;/);
+  assert.match(once, /int z = \+ \+x;/);
+  assert.match(once, /int w = - --x;/);
+  assert.match(once, /!!\(x > 0\)/);
+  assert.deepEqual(shape(once), shape(src));
+  assert.equal(fmt(once), once);
+});
+
+test('an inline alt body never hides a multi-line extended rendezvous', () => {
+  const src = 'public void f(chan<int>.read c) {\n    int v;\n    alt {\n        v = c.read() : { int x = c.read({ a(); b(); }); }\n    }\n}\n';
+  const once = fmt(src);
+  assert.deepEqual(shape(once), shape(src));
+  assert.equal(fmt(once), once);
+  for (const line of once.split('\n')) assert.ok(!/^\S/.test(line) || /^(public|}|$)/.test(line), `statement printed at column 0: ${line}`);
+});
+
+test('comments around single-statement branches stay attached to their statement', () => {
+  const src = [
+    'public void main(string[] args) {',
+    '    int a = 1;',
+    '    int x = 0;',
+    '    int y = 0;',
+    '    if (a > 0)',
+    '        x = 1; // c1',
+    '    else',
+    '        y = 2; // c2',
+    '    while (a > 9)',
+    '        // about y',
+    '        y = 3;',
+    '    int z = /* hi */ 1;',
+    '    z++; /* note */',
+    '    y++;',
+    '}',
+    '',
+  ].join('\n');
+  const once = fmt(src);
+  const lines = once.split('\n');
+  assert.ok(lines.includes('        x = 1;  // c1'), once);
+  assert.ok(lines.includes('        y = 2;  // c2'), once);
+  assert.equal(lines[lines.indexOf('        // about y') + 1], '        y = 3;', once ?? '');
+  assert.ok(lines.includes('    int z = 1;  /* hi */'), once);
+  assert.ok(lines.includes('    z++;  /* note */'), once);
+  assert.ok(!once.includes('\n\n'), `no invented blank lines:\n${once}`);
+  assert.equal((once.match(/\/\/|\/\*/g) ?? []).length, 5, 'every comment kept');
+  assert.equal(fmt(once), once);
 });

@@ -13,7 +13,8 @@
     "bin",
     "dist/src",
     "editor",
-    "README.md"
+    "README.md",
+    "NOTICE"
   ],
   "scripts": {
     "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
@@ -21,7 +22,8 @@
     "test": "npm run build && node --test dist/test/*.test.js",
     "smoke": "npm run build && node scripts/smoke.js",
     "bench": "npm run build && node scripts/bench.js",
-    "validate": "npm run build && node scripts/validate.js"
+    "validate": "npm run build && node scripts/validate.js",
+    "prepack": "npm run build"
   },
   "engines": {
     "node": ">=20"

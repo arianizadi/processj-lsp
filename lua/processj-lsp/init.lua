@@ -10,6 +10,7 @@
 local M = {}
 
 M.did_setup = false
+M.config = nil
 
 --- Root of this plugin (the git checkout lazy.nvim made), derived from this file's path.
 function M.root()
@@ -61,6 +62,8 @@ end
 function M.setup(opts)
   if M.did_setup then return end
   M.did_setup = true
+  local config = vim.tbl_deep_extend("force", M.default_config(), opts or {})
+  M.config = config
   if vim.fn.executable "node" ~= 1 then
     vim.notify("processj-lsp: `node` is not on PATH; the server cannot start", vim.log.levels.ERROR)
     return
@@ -69,7 +72,6 @@ function M.setup(opts)
     vim.notify("processj-lsp: needs Neovim 0.11 or newer (vim.lsp.config)", vim.log.levels.ERROR)
     return
   end
-  local config = vim.tbl_deep_extend("force", M.default_config(), opts or {})
   vim.lsp.config("processj_ls", config)
   vim.lsp.enable "processj_ls"
   vim.api.nvim_create_user_command("ProcessJRun", function() exec "processj.run" end, { desc = "Compile and run the current ProcessJ file" })

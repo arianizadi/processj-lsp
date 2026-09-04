@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { astSymbols } from '../src/astsymbols';
+import { parse } from '../src/parser/parser';
 import { extractLocals, extractSymbols, maskCommentsAndStrings, wordAt } from '../src/symbols';
 
 const SAMPLE = `import std.*;
@@ -108,5 +110,52 @@ test('native library declarations without bodies end on their own line', () => {
 test('wordAt finds identifier boundaries', () => {
   assert.deepEqual(wordAt('    out.write(42);', 6), { word: 'out', start: 4, end: 7 });
   assert.deepEqual(wordAt('    out.write(42);', 9), { word: 'write', start: 8, end: 13 });
+  assert.deepEqual(wordAt('    $value++;', 8), { word: '$value', start: 4, end: 10 });
   assert.equal(wordAt('    out.write(42);', 3), undefined);
+});
+
+test('tolerant symbol extraction accepts compiler-valid dollar identifiers', () => {
+  const source = 'record $Point {\n    int $x;\n}\npublic void $work(int $arg) { int $local = $arg; }\n';
+  const symbols = extractSymbols(source);
+  assert.deepEqual(symbols.map((symbol) => [symbol.kind, symbol.name]), [['record', '$Point'], ['proc', '$work']]);
+  assert.deepEqual(symbols[0].children?.map((field) => field.name), ['$x']);
+  assert.deepEqual(extractLocals(source, symbols).map((local) => local.name), ['$arg', '$local']);
+});
+
+test('locals survive an unparseable procedure header while record fields stay fields', () => {
+  const source = 'const int N\nvoid f(int a,\n       int b) {\n    int x = 1;\n}\nrecord R {\n    int q;\n}\n';
+  const locals = extractLocals(source, extractSymbols(source));
+  assert.deepEqual(locals.map((local) => [local.name, local.container]), [['a', undefined], ['b', undefined], ['x', undefined]]);
+});
+
+test('tolerant extraction reports the exact column of every name', () => {
+  const text = ['const int t = 1;', 'record re {', '    int i;', '}', 'protocol pro {', '    r : { int x; }', '}', 'void f(int i, int n) {', '    int t;', '    for (int i = 0; i < n; i++) { }', '    int u = 1, tu = 2;', '}', ''].join('\n');
+  const symbols = extractSymbols(text);
+  const at = (name: string, kind: string) => {
+    const all = [...symbols, ...symbols.flatMap((s) => s.children ?? [])];
+    const s = all.find((x) => x.name === name && x.kind === kind);
+    return s ? `${s.line}:${s.startCol}-${s.endCol}` : 'missing';
+  };
+  assert.equal(at('t', 'const'), '0:10-11');
+  assert.equal(at('re', 'record'), '1:7-9');
+  assert.equal(at('i', 'field'), '2:8-9');
+  assert.equal(at('pro', 'protocol'), '4:9-12');
+  assert.equal(at('r', 'case'), '5:4-5');
+  assert.equal(at('f', 'proc'), '7:5-6');
+  const locals = extractLocals(text, symbols).map((l) => `${l.name}@${l.line}:${l.startCol}`);
+  assert.deepEqual(locals, ['i@7:11', 'n@7:18', 't@8:8', 'i@9:13', 'u@10:8']);
+});
+
+test('a protocol whose first case is called record is still a protocol', () => {
+  const [sym] = extractSymbols('protocol Msg {\n    record : { int x; }\n    other : { }\n}\n');
+  assert.equal(sym.kind, 'protocol');
+  assert.deepEqual(sym.children?.map((c) => c.name), ['record', 'other']);
+});
+
+test('AST symbols: a trailing comment on the previous line is not a doc comment, and locals inside nested rendezvous blocks are found', () => {
+  const src = 'const int N = 1; // number of workers\npublic void f() { }\n// Documented.\npublic void g(chan<int>.read c, chan<int>.read d) {\n    c.write(d.read({ int t = 1; }));\n    int u = (d.read({ int w = 2; }));\n}\n';
+  const { symbols, locals } = astSymbols(parse(src));
+  assert.equal(symbols.find((s) => s.name === 'f')?.doc, undefined);
+  assert.equal(symbols.find((s) => s.name === 'g')?.doc, 'Documented.');
+  assert.deepEqual(locals.map((l) => l.name).sort(), ['c', 'd', 't', 'u', 'w']);
 });

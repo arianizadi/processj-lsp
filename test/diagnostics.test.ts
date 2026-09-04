@@ -49,6 +49,21 @@ test('PJBugManager messages carry token columns and survive ANSI colour', () => 
   assert.equal(diagnostics[0].file, '/Users/me/proj/name.pj');
 });
 
+test('PJBugManager locations tolerate blank separator lines', () => {
+  const out = [
+    "error[405]: Symbol 'x' not found",
+    '',
+    '[+] /p/name.pj:8',
+    '',
+    " ### Token: 'x', line 8 [5:5] (kind: 115)",
+  ].join('\n');
+  const { diagnostics } = parseCompilerOutput(out, '');
+  assert.deepEqual(
+    diagnostics.map((d) => [d.file, d.line, d.startCol, d.endCol]),
+    [['/p/name.pj', 7, 4, 5]],
+  );
+});
+
 test('legacy type checker messages parse even when glued together on one line', () => {
   const out =
     'typ.pj:4: Cannot assign value of type int to variable of type byte.\n' +
@@ -117,4 +132,28 @@ test('unparseable failure surfaces the last meaningful line', () => {
   const { diagnostics } = parseCompilerOutput(out, '');
   assert.equal(diagnostics.length, 1);
   assert.match(diagnostics[0].message, /Something odd happened/);
+});
+
+test('unparseable launch failure surfaces stderr', () => {
+  const { diagnostics } = parseCompilerOutput('-- Setting absolute path\n', 'java: command not found\n');
+  assert.equal(diagnostics.length, 1);
+  assert.match(diagnostics[0].message, /java: command not found/);
+});
+
+test('otherwise identical imported-file diagnostics are not deduplicated', () => {
+  const out = [
+    'one.pj:4: Unknown name.',
+    'Error number: 3029',
+    'two.pj:4: Unknown name.',
+    'Error number: 3029',
+  ].join('\n');
+  const { diagnostics } = parseCompilerOutput(out, '');
+  assert.deepEqual(diagnostics.map((d) => d.file), ['one.pj', 'two.pj']);
+});
+
+test('a legacy message without an error number keeps its line', () => {
+  const out = '/tmp/x/cast.pj:5: Illegal Expression in cast - Type names only\n';
+  const { diagnostics, succeeded } = parseCompilerOutput(out, '');
+  assert.equal(succeeded, false);
+  assert.deepEqual(diagnostics.map((d) => [d.line, d.message, d.file]), [[4, 'Illegal Expression in cast - Type names only', '/tmp/x/cast.pj']]);
 });

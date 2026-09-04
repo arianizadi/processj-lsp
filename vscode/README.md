@@ -12,8 +12,21 @@ In a Remote SSH window the extension runs on the remote machine: clone and run t
 Needs Node.js 20+ and the `code` command on PATH (VS Code: "Shell Command: Install 'code' command in PATH").
 To update later: `git pull` and run the same command again.
 
+Each successful GitHub Actions run also uploads a ready-to-install `processj.vsix` artifact. Download it,
+unzip the artifact, and choose "Extensions: Install from VSIX" if you do not want to build locally.
+
 `npm run package` only produces `processj-lsp-vscode-<version>.vsix`, which you can install with
 "Extensions: Install from VSIX" or share.
 
-Settings (File > Preferences > Settings, search "ProcessJ"): `processj.installDir`, `processj.checkOnChange`,
-`processj.lint`, `processj.serverPath`.
+Open a `.pj` file and use any of:
+
+- the play button in the editor title or the **▶ Run** code lens above `main`
+- **ProcessJ: Run Current File** / **ProcessJ: Build Current File** in the Command Palette
+- the ProcessJ language-status entry to see whether the server is ready and open its output
+- **ProcessJ: Restart Language Server** if you are troubleshooting
+
+Settings live under File > Preferences > Settings; search for "ProcessJ". They cover the ProcessJ and Java
+locations, live compiler checking, lints, code lenses, compiler debounce and timeouts, server path, and LSP
+protocol tracing. Changes apply automatically without reloading the VS Code window.
+
+Scratch buffers are supported: open an untitled file and choose **ProcessJ** with "Change Language Mode".

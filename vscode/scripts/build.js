@@ -7,6 +7,8 @@ const path = require('node:path');
 
 const here = path.resolve(__dirname, '..');
 const root = path.resolve(here, '..');
+// VSIX packaging only sees files below vscode/, so include the repository license explicitly.
+fs.copyFileSync(path.join(root, 'LICENSE'), path.join(here, 'LICENSE'));
 const run = (cmd, cwd) => {
   console.log(`$ ${cmd}   (in ${path.relative(root, cwd) || '.'})`);
   execSync(cmd, { cwd, stdio: 'inherit' });
@@ -21,7 +23,7 @@ fs.mkdirSync(path.join(server, 'dist'), { recursive: true });
 fs.cpSync(path.join(root, 'bin'), path.join(server, 'bin'), { recursive: true });
 fs.cpSync(path.join(root, 'dist', 'src'), path.join(server, 'dist', 'src'), { recursive: true });
 const rootPkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-fs.writeFileSync(path.join(server, 'package.json'), JSON.stringify({ name: 'processj-lsp-server', private: true, main: 'dist/src/server.js', dependencies: rootPkg.dependencies }, null, 2));
+fs.writeFileSync(path.join(server, 'package.json'), JSON.stringify({ name: 'processj-lsp-server', version: rootPkg.version, private: true, main: 'dist/src/server.js', dependencies: rootPkg.dependencies }, null, 2));
 run('npm install --omit=dev --no-audit --no-fund', server);
 
 run(fs.existsSync(path.join(here, 'package-lock.json')) ? 'npm ci --no-audit --no-fund' : 'npm install --no-audit --no-fund', here);

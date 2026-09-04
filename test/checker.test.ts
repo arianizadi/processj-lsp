@@ -242,10 +242,67 @@ test('pri alt with skip before other guards, trivial alt and par, unreachable co
 });
 
 test('a procedure that suspends only through calls gets a [yield=true] quick fix', () => {
+  // The compiler marks main itself, so only twice() needs the annotation.
   const r = run('import std.*;\n\npublic void wait1() { timer t; t.timeout(1); }\n\npublic void twice() { wait1(); wait1(); }\n\npublic void marked() [yield=true] { wait1(); }\n\npublic void main(string[] args) { twice(); marked(); println("ok"); }\n');
   const hits = r.diagnostics.filter((d) => d.code === 'pj/needs-yield-annotation');
-  assert.deepEqual(hits.map((d) => d.line + 1), [5, 9]);
-  assert.deepEqual(hits[0].fix, { kind: 'edit', title: 'Add [yield=true]', line: 4, col: 20, endCol: 20, text: '[yield=true] ' });
+  assert.deepEqual(hits.map((d) => d.line + 1), [5]);
+  // Inserted right after the parameter list, where the grammar puts annotations.
+  assert.deepEqual(hits[0].fix, { kind: 'edit', title: 'Add [yield=true]', line: 4, col: 19, endCol: 19, text: ' [yield=true]' });
+});
+
+test('the yield annotation respects implements clauses, existing annotations and the compiler\'s own marking rules', () => {
+  const src = [
+    'void g(chan<int>.read c) { c.read(); }',
+    'void f(chan<int>.read c) implements g { g(c); }', // channel-end parameter: the compiler marks it
+    'record R { chan<int>.read in; }',
+    'void viaRecord(R r) implements g { g(r.in); }', // needs the annotation, before `implements`
+    'void annotated(R r) [foo=1] { g(r.in); }', // needs it inside the existing list
+    'void initOnly(R r) { int x = r.in.read(); println(x); }', // direct read in an initialiser: marked by the compiler
+    'mobile void m(R r) { g(r.in); suspend; }', // suspend: marked by the compiler
+    'void b(barrier w) { g2(w); }', // barrier parameter: marked by the compiler
+    'void g2(barrier w) { w.sync(); }',
+    'void loopInit(R r) { for (int v = r.in.read(); v < 10; v = r.in.read()) { println(v); } }',
+    'void viaLoop(R r) { loopInit(r); }', // suspends through a call whose only reads sit in a for header
+    'public void main(string[] args) { }',
+  ].join('\n') + '\n';
+  const r = run('import std.*;\n' + src);
+  const hits = r.diagnostics.filter((d) => d.code === 'pj/needs-yield-annotation').map((d) => [d.line, d.fix]);
+  assert.deepEqual(hits, [
+    [4, { kind: 'edit', title: 'Add [yield=true]', line: 4, col: 19, endCol: 19, text: ' [yield=true]' }],
+    [5, { kind: 'edit', title: 'Add [yield=true]', line: 5, col: 21, endCol: 21, text: 'yield=true, ' }],
+    [11, { kind: 'edit', title: 'Add [yield=true]', line: 11, col: 17, endCol: 17, text: ' [yield=true]' }],
+  ]);
+});
+
+test('yield analysis survives call cycles: every member of a cycle that reaches a read yields', () => {
+  const r = run('import std.*;\nrecord R { chan<int>.read in; }\nvoid x(R r) { y(r); z(r); }\nvoid y(R r) { x(r); }\nvoid z(R r) { println(r.in.read()); }\npublic void main(string[] args) { }\n');
+  const hits = r.diagnostics.filter((d) => d.code === 'pj/needs-yield-annotation').map((d) => d.line);
+  assert.deepEqual(hits, [2, 3]);
+});
+
+test('unused reports are per overload and skip native declarations', () => {
+  const r = run('public void foo(int a) { int dead = 1; }\npublic void foo(long b) { int other = 2; }\npublic native void bar(int x);\npublic void main(string[] args) { foo(1); foo(2L); }\n');
+  const unused = r.diagnostics.filter((d) => d.code === 'pj/unused').map((d) => `${d.line}:${/'(\w+)'/.exec(d.message)![1]}`);
+  assert.deepEqual(unused, ['0:a', '0:dead', '1:b', '1:other']);
+});
+
+test('assignment targets are typed, so hover and references see them', () => {
+  const r = run('const int N = 4;\npublic void main(string[] args) { int x = 0; x = 1; x++; }\n');
+  const targets = [...r.types.entries()].filter(([e]) => e.kind === 'NameExpr' && e.name.name === 'x').map(([e, t]) => `${e.span.start.col}:${t.k === 'prim' ? t.name : t.k}`);
+  assert.deepEqual(targets, ['45:int', '52:int']);
+  assert.ok(!r.diagnostics.some((d) => d.severity === 'error'), r.diagnostics.map((d) => d.message).join('; '));
+});
+
+test('overloads are matched like the compiler: no literal narrowing when choosing a candidate', () => {
+  const r = run('public void f(byte b) { }\npublic void f(int i) { }\npublic void g(byte b) { }\npublic void main(string[] args) { f(1); g(1); }\n');
+  const chosen = [...r.calls.values()].map((sig) => `${sig.name}(${sig.params.map((p) => (p.k === 'prim' ? p.name : p.k)).join(',')})`);
+  assert.deepEqual(chosen, ['f(int)']);
+  assert.match(r.diagnostics.find((d) => d.code === 'pj/type/call')!.message, /No version of 'g' accepts \(int\)/);
+});
+
+test('a nested alt is one alt to the compiler', () => {
+  const r = run('public void f(chan<int>.read a, chan<int>.read b) { int x; alt { x = a.read() : { } alt { x = b.read() : { } } } }\npublic void main(string[] args) { }\n');
+  assert.deepEqual(r.diagnostics.filter((d) => d.code === 'pj/multiple-alts'), []);
 });
 
 test('reads that must be their own statement: inside ?:, inside a write value; calls as whole conditions', () => {
@@ -348,4 +405,103 @@ test('a constant initialised from a variable is reported, with the reason', () =
   assert.ok(r.messages.some((m) => /const-init|literals and other constants/.test(m) && /value would be 0/.test(m)), r.notes.join(' '));
   const ok = run(MAIN('    const int N = 4;\n    const int M = N * 2 + 1;\n    println(M);'));
   assert.ok(!ok.codes.includes('pj/type/const-init'), ok.messages.join('\n'));
+});
+
+test('top-level declarations, inheritance, and protocol fields are checked before bodies', () => {
+  const r = run([
+    'record Base { }',
+    'record Child extends Base, Base { }',
+    'protocol Parent { tag: { int value; int value; } }',
+    'protocol Both extends Parent, Parent;',
+    'protocol Left extends Right;',
+    'protocol Right extends Left;',
+    'int occupied = 1;',
+    'record occupied { }',
+  ].join('\n'));
+  assert.ok(r.messages.some((m) => /'Base' appears more than once.*record 'Child'/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /Field 'value' is declared twice in case 'tag'/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /'Parent' appears more than once.*protocol 'Both'/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /Protocol '(Left|Right)' extends itself/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /Top-level name 'occupied' is already used by a constant/.test(m)), r.messages.join('\n'));
+  const acceptedCompilerQuirks = r.diagnostics.filter((d) => /accepted by this compiler build/.test(d.message));
+  assert.equal(acceptedCompilerQuirks.length, 2, r.messages.join('\n'));
+  assert.ok(acceptedCompilerQuirks.every((d) => d.severity === 'warning'), r.messages.join('\n'));
+});
+
+test('numeric literal types follow the compiler lexer longest-match rules', () => {
+  const ok = run('void f() { double fallback = 09; int hexF = 0xff; int hexD = 0xd; int octal = 077; }');
+  assert.deepEqual(ok.errors, [], ok.messages.join('\n'));
+
+  const bad = run('void f() { int value = 09; }');
+  assert.ok(bad.messages.some((m) => /Cannot initialise 'value'.*type double/.test(m)), bad.messages.join('\n'));
+});
+
+test('mobile procedures, suspend, and implements clauses get compiler-aligned diagnostics', () => {
+  const r = run([
+    'mobile int wrongReturn() { return 1; }',
+    'void worker(int n) { }',
+    'mobile void worker(long n) { suspend; }',
+    'void ordinary() { suspend; }',
+    'record Data { }',
+    'void missingImpl() implements absent { }',
+    'void wrongImpl() implements Data { }',
+  ].join('\n'));
+  assert.ok(r.messages.some((m) => /Mobile procedure 'wrongReturn' must return void/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /Mobile procedure 'worker' cannot be overloaded/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /'suspend' can only appear in a mobile procedure/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /Cannot find the procedure 'absent'.*implements/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /'Data' is not a procedure and cannot be implemented/.test(m)), r.messages.join('\n'));
+
+  // Verified against the real compiler: it permits ordinary overloads that
+  // follow the first mobile declaration, but rejects a later mobile overload.
+  const ordering = run([
+    'mobile void first(int n) { }',
+    'void first(long n) { }',
+    'void second(int n) { }',
+    'mobile void second(long n) { }',
+  ].join('\n'));
+  assert.equal(ordering.diagnostics.filter((d) => d.code === 'pj/type/mobile').length, 1, ordering.messages.join('\n'));
+});
+
+test('aggregate defaults, exact built-in fields, and non-assignable whole channels are explained', () => {
+  const r = run([
+    'record Pair { int left; int right; }',
+    'protocol Event { data: { int id; string text; } }',
+    'void take(chan<int> c) { }',
+    'void f() {',
+    '    Pair p = new Pair { left = 1 };',
+    '    Event e = new Event { data: id = 2 };',
+    '    int[] values = new int[2];',
+    '    int badArrayField = values.length;',
+    '    int badStringField = "x".size;',
+    '    chan<int> first;',
+    '    chan<int> second;',
+    '    boolean pickFirst = true;',
+    '    chan<int> alias = first;',
+    '    take(first);',
+    '    int v = (pickFirst ? first : second).read();',
+    '}',
+  ].join('\n'));
+  assert.equal(r.diagnostics.filter((d) => d.code === 'pj/missing-field').length, 2, r.messages.join('\n'));
+  assert.ok(!r.diagnostics.some((d) => d.code === 'pj/type/ternary'), 'identical channel types are compatible branches');
+  assert.ok(r.messages.some((m) => /Arrays have '.size', not '.length'/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /Strings have '.length', not '.size'/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /Cannot initialise 'alias'.*whole channels cannot be assigned or passed/.test(m)), r.messages.join('\n'));
+  assert.ok(r.messages.some((m) => /No version of 'take' accepts \(chan<int>\).*pass the required .read or .write end/.test(m)), r.messages.join('\n'));
+});
+
+test('a call mismatch blames the first argument that actually fails', () => {
+  const r = run(['void f(int a, string s) { }', 'void g(int a, int b) { }', 'void main() { f(1, 2); int x = 1; g(x, "s"); }'].join('\n'));
+  const calls = r.messages.filter((m) => /No version of/.test(m));
+  assert.equal(calls.length, 2, r.messages.join('\n'));
+  assert.match(calls[0], /argument 2 \('s'\) needs string/);
+  assert.match(calls[1], /argument 2 \('b'\) needs int/);
+  assert.ok(!calls.some((m) => /does not fit in int without a cast/.test(m)), calls.join('\n'));
+});
+
+test('an unknown lower-case type gets a primitive suggestion from the checker, not the parser', () => {
+  const r = run('public void main(string[] args) { itn y = 2; y++; }\n');
+  const d = r.diagnostics.find((x) => x.code === 'pj/type/unknown-type');
+  assert.match(d?.message ?? '', /Unknown type 'itn'; did you mean 'int'\?/);
+  assert.equal(d?.fix?.text, 'int');
 });

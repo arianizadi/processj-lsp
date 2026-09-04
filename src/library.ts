@@ -43,7 +43,7 @@ function indexHeader(file: string): LibrarySymbol[] {
   } catch {
     return [];
   }
-  const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(text)?.[1] ?? '';
+  const pkg = /^\s*package\s+([A-Za-z0-9_$.]+)\s*;/m.exec(text)?.[1] ?? '';
   const module = path.basename(file, '.pj');
   return extractSymbols(text)
     .filter((s) => s.kind === 'proc' || s.kind === 'const' || s.kind === 'record' || s.kind === 'protocol')

@@ -12,6 +12,9 @@
   "engines": {
     "vscode": "^1.85.0"
   },
+  "extensionKind": [
+    "workspace"
+  ],
   "categories": [
     "Programming Languages",
     "Linters",
@@ -19,7 +22,11 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
-    "onLanguage:processj"
+    "onLanguage:processj",
+    "onCommand:processj.runCurrentFile",
+    "onCommand:processj.buildCurrentFile",
+    "onCommand:processj.restartServer",
+    "onCommand:processj.showOutput"
   ],
   "contributes": {
     "languages": [
@@ -42,13 +49,57 @@
         "path": "./syntaxes/processj.tmLanguage.json"
       }
     ],
+    "commands": [
+      {
+        "command": "processj.runCurrentFile",
+        "title": "Run Current File",
+        "category": "ProcessJ",
+        "icon": "$(play)",
+        "enablement": "editorLangId == processj"
+      },
+      {
+        "command": "processj.buildCurrentFile",
+        "title": "Build Current File",
+        "category": "ProcessJ",
+        "icon": "$(tools)",
+        "enablement": "editorLangId == processj"
+      },
+      {
+        "command": "processj.restartServer",
+        "title": "Restart Language Server",
+        "category": "ProcessJ",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "processj.showOutput",
+        "title": "Show Language Server Output",
+        "category": "ProcessJ",
+        "icon": "$(output)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "processj.runCurrentFile",
+          "when": "editorLangId == processj",
+          "group": "navigation@1"
+        }
+      ]
+    },
     "configuration": {
       "title": "ProcessJ",
       "properties": {
         "processj.installDir": {
           "type": "string",
           "default": "",
-          "description": "ProcessJ install directory (with bin/ and resources/jars). Empty: use installdir from ~/processjrc or $PROCESSJ_HOME."
+          "scope": "machine-overridable",
+          "description": "ProcessJ install directory (with bin/ and resources/jars). Empty: use installdir from ~/processjrc or $PROCESSJ_HOME. Changes restart the server automatically."
+        },
+        "processj.javaBin": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "description": "Java executable used for compiler diagnostics and Run. Empty: use $JAVA_HOME/bin/java or java on PATH."
         },
         "processj.checkOnChange": {
           "type": "boolean",
@@ -60,10 +111,47 @@
           "default": true,
           "description": "Run the built-in type checker and concurrency lints."
         },
+        "processj.codeLens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Run and Build code lenses above main. The commands remain available from the editor title and Command Palette when disabled."
+        },
+        "processj.debounceMs": {
+          "type": "integer",
+          "default": 400,
+          "minimum": 0,
+          "maximum": 60000,
+          "description": "Milliseconds to wait after the last edit before starting a compiler check when checkOnChange is enabled."
+        },
+        "processj.timeoutMs": {
+          "type": "integer",
+          "default": 20000,
+          "minimum": 100,
+          "maximum": 600000,
+          "description": "Maximum duration in milliseconds for one compiler diagnostic run."
+        },
+        "processj.runTimeoutMs": {
+          "type": "integer",
+          "default": 30000,
+          "minimum": 100,
+          "maximum": 3600000,
+          "description": "Maximum duration in milliseconds for a program launched with ProcessJ: Run Current File."
+        },
         "processj.serverPath": {
           "type": "string",
           "default": "",
-          "description": "Path to processj-lsp.js. Empty: use the server bundled by the build script."
+          "scope": "machine-overridable",
+          "description": "Path to processj-lsp.js (a leading ~ is supported). Empty: use the bundled server. Changes restart the language client automatically."
+        },
+        "processj.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace messages exchanged with the ProcessJ language server in the ProcessJ Language Server Trace output channel."
         }
       }
     }

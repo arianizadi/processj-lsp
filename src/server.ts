@@ -6,6 +6,8 @@ import {
   CodeAction,
   CodeActionKind,
   DidChangeWatchedFilesNotification,
+  DidChangeWorkspaceFoldersNotification,
+  type WorkspaceFoldersChangeEvent,
   FileChangeType,
   CodeLens,
   CompletionItem,
@@ -13,7 +15,11 @@ import {
   createConnection,
   Diagnostic,
   DiagnosticSeverity,
+  DiagnosticTag,
+  DocumentHighlight,
+  DocumentHighlightKind,
   DocumentSymbol,
+  ErrorCodes,
   FoldingRange,
   FoldingRangeKind,
   Hover,
@@ -24,6 +30,7 @@ import {
   Position,
   ProposedFeatures,
   Range,
+  ResponseError,
   SignatureHelp,
   SignatureInformation,
   SymbolKind,
@@ -36,6 +43,7 @@ import {
   type CompletionParams,
   type DefinitionParams,
   type DocumentFormattingParams,
+  type DocumentHighlightParams,
   type DocumentSymbolParams,
   type ExecuteCommandParams,
   type FoldingRangeParams,
@@ -46,14 +54,15 @@ import {
   type ReferenceParams,
   type RenameParams,
   type SignatureHelpParams,
+  type WorkspaceSymbolParams,
 } from 'vscode-languageserver/node';
 import { TextDocument } from 'vscode-languageserver-textdocument';
 
 import { type FixHint, type LintDiagnostic } from './analysis';
 import { astSymbols } from './astsymbols';
-import { check, type CheckResult } from './checker/checker';
-import { DeclIndex, signatureStr } from './checker/index';
-import { typeStr } from './checker/types';
+import { check, type CheckResult, type VarInfo } from './checker/checker';
+import { DeclIndex, sameSignature, signatureStr, type ProcSig } from './checker/index';
+import { typeStr, type Type } from './checker/types';
 import { compile } from './compiler';
 import { format } from './format';
 import { importDiagnostics, resolveImports } from './imports';
@@ -64,41 +73,24 @@ import { findInstall, type Install } from './config';
 import { parseCompilerOutput, type RawDiagnostic } from './diagnostics';
 import { KEYWORD_DOCS, KEYWORDS, LITERALS, PRIMITIVE_TYPES } from './keywords';
 import { indexLibrary, type LibrarySymbol } from './library';
+import { containsPosition, namedTypeSpans, variableAt, variableSpans, visibleVariables } from './navigation';
 import { build, formatReport, run } from './pipeline';
+import { DEFAULT_SETTINGS, normalizeSettings, type Settings } from './settings';
 import { extractLocals, extractSymbols, wordAt, type PJSymbol } from './symbols';
-import { tokenize } from './tokens';
 import { WorkspaceIndex } from './workspace';
-
-interface Settings {
-  installDir?: string;
-  javaBin?: string;
-  /** Delay after the last keystroke before the compiler runs. */
-  debounceMs: number;
-  /** Kill the compiler after this long. */
-  timeoutMs: number;
-  /**
-   * Run the real compiler on every change (true) or only on open and save (false).
-   * Off by default: the compiler writes temp files and starts a JVM per run, and the
-   * built-in checker already reports most problems as you type.
-   */
-  checkOnChange: boolean;
-  /** Kill a program started from the "Run" code lens after this long. */
-  runTimeoutMs: number;
-  /** Turn the built-in static analysis on or off. */
-  lint: boolean;
-  /** Offer the Run / Build code lenses above main (editors that render lenses inline may prefer commands). */
-  codeLens: boolean;
-}
+import { LatestTaskQueue } from './taskqueue';
 
 const COMMAND_RUN = 'processj.run';
 const COMMAND_BUILD = 'processj.build';
+const SERVER_VERSION = packageVersion();
 
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
 const workspace = new WorkspaceIndex();
 
-let settings: Settings = { debounceMs: 400, timeoutMs: 20_000, checkOnChange: false, runTimeoutMs: 30_000, lint: true, codeLens: true };
+let settings: Settings = { ...DEFAULT_SETTINGS };
 let clientWatchesFiles = false;
+let clientSupportsWorkspaceFolders = false;
 let install: Install | undefined;
 let installError: string | undefined;
 let library: LibrarySymbol[] = [];
@@ -109,17 +101,28 @@ const libraryFiles = new Set<string>();
 /** Declarations of `std` alone, for the "add import std.*" hint. */
 let stdIndex = new DeclIndex();
 
-// Per-document state for debounced, cancellable compiles.
-const pending = new Map<string, NodeJS.Timeout>();
-const running = new Map<string, AbortController>();
+// Real compiler runs start JVMs, so keep only the latest run per document and
+// bound cross-document concurrency. Two workers nearly halve batch time without
+// the latency and memory spike seen when every open document starts one at once.
+const compilerQueue = new LatestTaskQueue<string>(2, (error) => connection.console.error(`compiler check failed: ${String(error)}`));
 // Last compiler diagnostics per document, so lints (which are instant) can be merged with them.
 const compilerDiags = new Map<string, { version: number; diagnostics: Diagnostic[] }>();
 // Cached parse and symbol extraction keyed by document version.
 const parseCache = new Map<string, { version: number; parsed: ParseResult }>();
-const checkCache = new Map<string, { version: number; checked: CheckResult; index: DeclIndex; importDiags: LintDiagnostic[]; deps: Set<string> }>();
+interface Analysis {
+  checked: CheckResult;
+  index: DeclIndex;
+  importDiags: LintDiagnostic[];
+  deps: Set<string>;
+}
+
+const checkCache = new Map<string, Analysis & { version: number }>();
 const symbolCache = new Map<string, { version: number; symbols: PJSymbol[]; locals: PJSymbol[] }>();
 // Lint runs are coalesced so a burst of keystrokes in a large file costs one pass.
 const lintPending = new Map<string, NodeJS.Timeout>();
+// TextDocuments emits onDidChangeContent once as part of every didOpen. Track
+// that synthetic event so it cannot cancel the required open-time compiler run.
+const openingDocuments = new Set<string>();
 const LINT_DELAY_MS = 40;
 
 // ---------------------------------------------------------------------------
@@ -127,10 +130,10 @@ const LINT_DELAY_MS = 40;
 // ---------------------------------------------------------------------------
 
 connection.onInitialize((params: InitializeParams): InitializeResult => {
-  const init = (params.initializationOptions ?? {}) as Partial<Settings>;
-  settings = { ...settings, ...init };
+  settings = normalizeSettings(params.initializationOptions);
   clientSupportsShowDocument = !!params.capabilities.window?.showDocument?.support;
   clientWatchesFiles = !!params.capabilities.workspace?.didChangeWatchedFiles?.dynamicRegistration;
+  clientSupportsWorkspaceFolders = !!params.capabilities.workspace?.workspaceFolders;
 
   const found = findInstall({ installDir: settings.installDir, javaBin: settings.javaBin });
   if ('error' in found) {
@@ -163,6 +166,8 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       referencesProvider: true,
       renameProvider: { prepareProvider: true },
       documentSymbolProvider: true,
+      documentHighlightProvider: true,
+      workspaceSymbolProvider: true,
       signatureHelpProvider: { triggerCharacters: ['(', ','], retriggerCharacters: [','] },
       codeActionProvider: { codeActionKinds: [CodeActionKind.QuickFix] },
       codeLensProvider: settings.codeLens ? { resolveProvider: false } : undefined,
@@ -170,8 +175,9 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
       documentFormattingProvider: true,
       foldingRangeProvider: true,
       semanticTokensProvider: { legend: { tokenTypes: [...TOKEN_TYPES], tokenModifiers: [...TOKEN_MODIFIERS] }, full: true },
+      workspace: { workspaceFolders: { supported: true, changeNotifications: true } },
     },
-    serverInfo: { name: 'processj-lsp', version: '0.4.0' },
+    serverInfo: { name: 'processj-lsp', version: SERVER_VERSION },
   };
 });
 
@@ -207,8 +213,16 @@ connection.onInitialized(() => {
   if (clientWatchesFiles) {
     // The editor tells us when .pj files change on disk; no polling, no repeated directory walks.
     workspace.watched = true;
-    void connection.client.register(DidChangeWatchedFilesNotification.type, { watchers: [{ globPattern: '**/*.pj' }] });
+    void connection.client.register(DidChangeWatchedFilesNotification.type, { watchers: [{ globPattern: '**/*.pj' }] }).catch((error) => {
+      workspace.watched = false;
+      connection.console.warn(`could not register ProcessJ file watcher; falling back to polling: ${String(error)}`);
+    });
   }
+  // When the client advertises workspace folders, vscode-languageserver's own
+  // WorkspaceFoldersFeature registers a handler for the same notification
+  // during `initialize`, replacing the raw one below. Subscribe through the
+  // feature in that case so folder changes still reach us.
+  if (clientSupportsWorkspaceFolders) connection.workspace.onDidChangeWorkspaceFolders(applyWorkspaceFolderChange);
   if (install) {
     connection.console.info(`ProcessJ install: ${install.installDir} (java: ${install.javaBin}); ${library.length} library symbols`);
   } else {
@@ -217,45 +231,111 @@ connection.onInitialized(() => {
   }
 });
 
+// Use the raw notification registration: the convenience `connection.workspace`
+// getter throws during startup when a client does not advertise workspace-folder
+// support, while accepting the protocol notification itself is harmless.
+connection.onNotification(DidChangeWorkspaceFoldersNotification.type, (params) => applyWorkspaceFolderChange(params.event));
+
+function applyWorkspaceFolderChange(event: WorkspaceFoldersChangeEvent): void {
+  const removed = new Set(event.removed.map((folder) => safeFileUri(folder.uri)).filter((file): file is string => !!file).map((file) => path.resolve(file)));
+  const roots = workspace.getRoots().filter((root) => !removed.has(path.resolve(root)));
+  for (const folder of event.added) {
+    const file = safeFileUri(folder.uri);
+    if (file && !roots.some((root) => path.resolve(root) === path.resolve(file))) roots.push(file);
+  }
+  workspace.setRoots(roots);
+  republishAll();
+}
+
 documents.onDidOpen((e) => {
+  openingDocuments.add(e.document.uri);
   schedulePublish(e.document);
   scheduleCheck(e.document, 0);
-});
-documents.onDidChangeContent((e) => {
-  schedulePublish(e.document);
-  if (settings.checkOnChange) scheduleCheck(e.document, settings.debounceMs);
-  // Other open files that import this one see the edited buffer, so re-check them too.
+  // Hot-exit/session restore can open an imported file already containing
+  // unsaved text, without a subsequent didChange. Make existing importers swap
+  // their disk snapshot for the newly authoritative editor buffer immediately.
   const p = safeFileUri(e.document.uri);
   if (p) republishDependents(p, e.document.uri);
 });
-
-connection.onDidChangeWatchedFiles((params) => {
-  for (const change of params.changes) {
-    const p = safeFileUri(change.uri);
-    if (!p || !p.endsWith('.pj')) continue;
-    if (change.type === FileChangeType.Deleted) workspace.invalidate(p);
-    else if (documents.get(change.uri)) continue; // the editor's buffer is the source of truth while it is open
-    else {
-      workspace.invalidate(p);
-      workspace.add(p);
-    }
-    republishDependents(p);
+documents.onDidChangeContent((e) => {
+  schedulePublish(e.document);
+  const opening = openingDocuments.delete(e.document.uri);
+  if (!opening) {
+    if (settings.checkOnChange) scheduleCheck(e.document, settings.debounceMs);
+    else compilerQueue.cancel(e.document.uri); // any active open-time result is now guaranteed to be stale
+    // Other open files that import this one see the edited buffer, so re-check them too.
+    const p = safeFileUri(e.document.uri);
+    if (p) republishDependents(p, e.document.uri);
   }
 });
 
+connection.onDidChangeWatchedFiles((params) => {
+  let refreshAll = false;
+  const changed = new Set<string>();
+  for (const change of params.changes) {
+    const p = safeFileUri(change.uri);
+    if (!p || !p.endsWith('.pj')) continue;
+    workspace.invalidate(p);
+    // Keep the saved disk snapshot current even while the document is open.
+    // Lookups overlay the editor buffer until close.
+    if (change.type !== FileChangeType.Deleted) workspace.add(p);
+    // A newly created file may satisfy a wildcard import, while a deleted file
+    // can disappear before a lint-disabled document ever cached its old deps.
+    // Both events are rare, so conservatively refresh/recompile every open file.
+    if (change.type === FileChangeType.Created || change.type === FileChangeType.Deleted) refreshAll = true;
+    else changed.add(p);
+  }
+  // Refresh at most once per notification: a branch switch delivers many
+  // changes at once, and every extra schedule would abort the compiler run the
+  // previous one had just started.
+  if (refreshAll) republishAll(true);
+  else for (const p of changed) republishDependents(p, undefined, true);
+});
+
 /** Re-lint every open document whose imports include `changedPath`. */
-function republishDependents(changedPath: string, exceptUri?: string): void {
+function republishDependents(changedPath: string, exceptUri?: string, recompile = false): void {
   const abs = path.resolve(changedPath);
-  for (const [uri, entry] of checkCache) {
-    if (uri === exceptUri || !entry.deps.has(abs)) continue;
-    checkCache.delete(uri);
-    const doc = documents.get(uri);
-    if (doc) schedulePublish(doc);
+  for (const doc of documents.all()) {
+    const uri = doc.uri;
+    if (uri === exceptUri) continue;
+    // Even with lints disabled there may be compiler output to invalidate. If
+    // no analysis exists, resolve only the imports instead of running a full
+    // checker pass merely to answer this dependency question.
+    const cached = checkCache.get(uri);
+    const deps = cached?.deps ?? new Set(resolveImports(parsedFor(doc).program, safeFileUri(uri), workspace.getRoots(), install?.includeDir).files.map((file) => path.resolve(file)));
+    if (!deps.has(abs)) continue;
+    invalidate(doc, recompile);
   }
 }
-documents.onDidSave((e) => scheduleCheck(e.document, 0));
+
+function republishAll(recompile = false): void {
+  for (const doc of documents.all()) invalidate(doc, recompile);
+}
+
+/** Drop the cached analysis and re-lint; compiler output stays until a fresh run replaces it. */
+function invalidate(doc: TextDocument, recompile: boolean): void {
+  checkCache.delete(doc.uri);
+  // The compiler reads imported files from disk, not from editor buffers, so
+  // its last result stays accurate until a new run is scheduled. Then never
+  // merge messages from the old dependency snapshot.
+  if (recompile) {
+    compilerDiags.delete(doc.uri);
+    scheduleCheck(doc, 0);
+  }
+  schedulePublish(doc);
+}
+documents.onDidSave((e) => {
+  scheduleCheck(e.document, 0);
+  // Without file-watch notifications nothing else tells importers that the
+  // file they compile against has changed on disk.
+  if (!workspace.watched) {
+    const p = safeFileUri(e.document.uri);
+    if (p) republishDependents(p, e.document.uri, true);
+  }
+});
 documents.onDidClose((e) => {
-  cancel(e.document.uri);
+  openingDocuments.delete(e.document.uri);
+  compilerQueue.cancel(e.document.uri);
   const t = lintPending.get(e.document.uri);
   if (t) clearTimeout(t);
   lintPending.delete(e.document.uri);
@@ -263,7 +343,11 @@ documents.onDidClose((e) => {
   checkCache.delete(e.document.uri);
   symbolCache.delete(e.document.uri);
   compilerDiags.delete(e.document.uri);
-  connection.sendDiagnostics({ uri: e.document.uri, diagnostics: [] });
+  connection.sendDiagnostics({ uri: e.document.uri, version: e.document.version, diagnostics: [] });
+  const closedPath = safeFileUri(e.document.uri);
+  // Importers may have been checked against unsaved contents. Once the overlay
+  // disappears, immediately restore their view of the on-disk file.
+  if (closedPath) republishDependents(closedPath, e.document.uri);
 });
 
 function schedulePublish(doc: TextDocument): void {
@@ -283,61 +367,60 @@ function schedulePublish(doc: TextDocument): void {
 // Diagnostics: instant lints + debounced compiler runs, merged
 // ---------------------------------------------------------------------------
 
-function cancel(uri: string): void {
-  const t = pending.get(uri);
-  if (t) {
-    clearTimeout(t);
-    pending.delete(uri);
-  }
-  running.get(uri)?.abort();
-  running.delete(uri);
-}
-
 function scheduleCheck(doc: TextDocument, delayMs: number): void {
   if (!install) return;
-  const t = pending.get(doc.uri);
-  if (t) clearTimeout(t);
-  pending.set(
-    doc.uri,
-    setTimeout(() => {
-      pending.delete(doc.uri);
-      void runCheck(doc.uri);
-    }, delayMs),
-  );
+  compilerQueue.schedule(doc.uri, delayMs, (signal) => runCheck(doc.uri, signal));
 }
 
 function lintDiagnostics(doc: TextDocument): Diagnostic[] {
   const parsed = parsedFor(doc);
+  const lexical: Diagnostic[] = parsed.lexIssues.map((issue) => makeDiagnostic(doc, {
+    line: issue.line,
+    startCol: issue.col,
+    endCol: issue.end,
+    message: issue.message,
+    severity: 'error',
+    code: issue.code,
+    source: 'lsp',
+  }));
   const syntax: Diagnostic[] = parsed.errors.map((e) => {
     const fix: FixHint | undefined = e.fix ? { kind: 'edit', title: e.fix.title, line: e.fix.line, col: e.fix.col, endCol: e.fix.endCol, text: e.fix.text } : undefined;
     const raw: LintDiagnostic = { line: e.line, startCol: e.col, endCol: e.endCol, message: e.message, severity: 'error', code: 'pj/syntax', source: 'parser', fix };
     return makeDiagnostic(doc, raw);
   });
-  if (!settings.lint) return syntax;
+  // Lexer issues and syntax errors are build blockers, not optional style
+  // lints, so they remain visible when the richer checker is disabled.
+  if (!settings.lint) return [...lexical, ...syntax];
   const { checked, importDiags } = checkFor(doc);
-  return [...syntax, ...importDiags.map((d) => makeDiagnostic(doc, d)), ...checked.diagnostics.map((d) => makeDiagnostic(doc, d))];
+  return [...lexical, ...syntax, ...importDiags.map((d) => makeDiagnostic(doc, d)), ...checked.diagnostics.map((d) => makeDiagnostic(doc, d))];
 }
 
 /** Type-check a document against its own declarations, its imports and the standard library. */
-function checkFor(doc: TextDocument): { checked: CheckResult; index: DeclIndex; importDiags: LintDiagnostic[] } {
+function checkFor(doc: TextDocument): Analysis {
   const cached = checkCache.get(doc.uri);
   if (cached && cached.version === doc.version) return cached;
   const parsed = parsedFor(doc);
   const ownPath = safeFileUri(doc.uri);
-  const resolution = resolveImports(parsed.program, ownPath, workspace.getRoots(), install?.includeDir);
+  const analysis = analyzeProgram(parsed.program, ownPath, doc.getText());
+  const entry = { version: doc.version, ...analysis };
+  checkCache.set(doc.uri, entry);
+  return entry;
+}
+
+/** Analyze an on-disk program for a rare cross-file reference request. */
+function analyzeProgram(program: A.Program, ownPath: string | undefined, text?: string): Analysis {
+  const resolution = resolveImports(program, ownPath, workspace.getRoots(), install?.includeDir);
   const index = new DeclIndex();
-  index.addProgram(parsed.program, ownPath);
+  index.addProgram(program, ownPath);
   for (const file of resolution.files) {
-    const open = documents.get(pathToFileURL(file).toString());
-    const program = open && open.uri !== doc.uri ? parsedFor(open).program : (libraryPrograms.get(file) ?? workspace.programFor(file));
-    if (program) index.addProgram(program, file);
+    const open = documentForPath(file);
+    const imported = open ? parsedFor(open).program : (libraryPrograms.get(file) ?? workspace.programFor(file));
+    if (imported) index.addProgram(imported, file);
   }
   const importDiags: LintDiagnostic[] = importDiagnostics(resolution, !!install);
   const unresolved = resolution.imports.some((r) => r.files.length === 0);
-  const checked = check(parsed.program, { index, stdIndex, importsStd: resolution.importsStd, unresolvedImports: unresolved, text: doc.getText() });
-  const entry = { version: doc.version, checked, index, importDiags, deps: new Set(resolution.files.map((f) => path.resolve(f))) };
-  checkCache.set(doc.uri, entry);
-  return entry;
+  const checked = check(program, { index, stdIndex, importsStd: resolution.importsStd, unresolvedImports: unresolved, text });
+  return { checked, index, importDiags, deps: new Set(resolution.files.map((f) => path.resolve(f))) };
 }
 
 connection.languages.semanticTokens.on((params) => {
@@ -353,7 +436,7 @@ function publish(doc: TextDocument): void {
   const lints = lintDiagnostics(doc);
   const fromCompiler = compilerDiags.get(doc.uri);
   const compiler = fromCompiler && fromCompiler.version === doc.version ? fromCompiler.diagnostics : [];
-  connection.sendDiagnostics({ uri: doc.uri, diagnostics: mergeDiagnostics(lints, compiler) });
+  connection.sendDiagnostics({ uri: doc.uri, version: doc.version, diagnostics: mergeDiagnostics(lints, compiler) });
 }
 
 /** Drop compiler messages that a lint already explains on the same line. */
@@ -367,19 +450,14 @@ function mergeDiagnostics(lints: Diagnostic[], compiler: Diagnostic[]): Diagnost
   return [...lints, ...kept];
 }
 
-async function runCheck(uri: string): Promise<void> {
+async function runCheck(uri: string, signal: AbortSignal): Promise<void> {
   const doc = documents.get(uri);
   if (!doc || !install) return;
 
-  running.get(uri)?.abort();
-  const controller = new AbortController();
-  running.set(uri, controller);
-
   const version = doc.version;
   const sourcePath = safeFileUri(uri) ?? 'buffer.pj';
-  const result = await compile(install, sourcePath, doc.getText(), { timeoutMs: settings.timeoutMs, signal: controller.signal });
+  const result = await compile(install, sourcePath, doc.getText(), { timeoutMs: settings.timeoutMs, signal });
 
-  if (running.get(uri) === controller) running.delete(uri);
   if (result.aborted) return;
   const current = documents.get(uri);
   if (!current || current.version !== version) return; // a newer check is on its way
@@ -416,7 +494,7 @@ function makeDiagnostic(doc: TextDocument, raw: RawDiagnostic | LintDiagnostic):
 
   // The type checker gives only a line; if the message quotes an identifier, narrow to it.
   if (raw.startCol === undefined) {
-    const quoted = /'([A-Za-z_]\w*)'/.exec(raw.message);
+    const quoted = /'([A-Za-z_$][A-Za-z0-9_$]*)'/.exec(raw.message);
     if (quoted) {
       const idx = indexOfWord(text, quoted[1]);
       if (idx >= 0) {
@@ -425,7 +503,11 @@ function makeDiagnostic(doc: TextDocument, raw: RawDiagnostic | LintDiagnostic):
       }
     }
   }
-  if (end <= start) end = start + 1;
+  // Compiler columns occasionally point one character past a shortened editor
+  // buffer. Keep every published position valid for strict LSP clients.
+  start = Math.min(Math.max(start, 0), text.length);
+  end = Math.min(Math.max(end, start), text.length);
+  if (end === start && start < text.length) end++;
 
   const severity =
     // Notes go out as Information, not Hint: VS Code draws hints as faint dots and keeps them out of the Problems panel.
@@ -437,6 +519,7 @@ function makeDiagnostic(doc: TextDocument, raw: RawDiagnostic | LintDiagnostic):
     severity,
     code: raw.code,
     source: raw.source === 'lsp' ? 'processj-lint' : raw.source === 'parser' && raw.code === 'pj/syntax' ? 'processj-parser' : 'processj',
+    tags: raw.code === 'pj/unused' || raw.code === 'pj/unreachable' ? [DiagnosticTag.Unnecessary] : undefined,
     data: fix ? { fix } : undefined,
   };
 }
@@ -491,7 +574,9 @@ connection.onCodeLens((params: CodeLensParams): CodeLens[] => {
   return lenses;
 });
 
-const runsDir = path.join(os.tmpdir(), 'processj-lsp-runs');
+// One private directory per server process: reports keep a stable name so the
+// editor reuses the tab, without writing to a path another user could pre-create.
+let runsDir: string | undefined;
 
 connection.onExecuteCommand(async (params: ExecuteCommandParams) => {
   const uri = String(params.arguments?.[0] ?? '');
@@ -536,7 +621,7 @@ connection.onExecuteCommand(async (params: ExecuteCommandParams) => {
 
 /** Write text to a stable per-file path under the temp dir and ask the editor to open it. */
 async function showReport(name: string, content: string): Promise<string> {
-  fs.mkdirSync(runsDir, { recursive: true });
+  if (!runsDir || !fs.existsSync(runsDir)) runsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-runs-'));
   const target = path.join(runsDir, name);
   fs.writeFileSync(target, content);
   if (clientSupportsShowDocument) {
@@ -661,6 +746,97 @@ connection.onDocumentSymbol((params: DocumentSymbolParams) => {
   return symbolsFor(doc).symbols.map((s) => toDocumentSymbol(doc, s));
 });
 
+/** Binding-aware highlights in the active document. */
+connection.onDocumentHighlight((params: DocumentHighlightParams): DocumentHighlight[] | null => {
+  const doc = documents.get(params.textDocument.uri);
+  if (!doc) return null;
+  const resolved = resolve(doc, params.position);
+  if (!resolved || resolved.hits.length === 0 || !resolved.hits[0].exact) return null;
+  const hit = resolved.hits[0];
+  if (hit.variable) {
+    return variableSpans(checkFor(doc).checked, hit.variable).map((span, index) => ({
+      range: rangeFor(span),
+      kind: index === 0 ? DocumentHighlightKind.Write : DocumentHighlightKind.Text,
+    }));
+  }
+
+  // Top-level highlighting follows the same exact overload/type/constant
+  // identity as references and rename, but stays document-local and therefore
+  // never pays for a workspace scan on cursor movement.
+  if (hit.symbol.kind === 'field' || hit.symbol.kind === 'case' || hit.symbol.detail.startsWith('extern ')) return null;
+  const analysis = checkFor(doc);
+  const program = parsedFor(doc).program;
+  const targetFile = safeFileUri(hit.uri);
+  let spans: A.Span[] = [];
+  if (hit.symbol.kind === 'proc') {
+    if (!hit.procedure) return null;
+    if (hit.uri === doc.uri) spans.push(hit.procedure.decl.name.span);
+    spans.push(...procedureReferenceSpans(program, analysis, resolved.word, targetFile, hit.uri, doc.uri, hit.procedure));
+  } else if (hit.symbol.kind === 'record' || hit.symbol.kind === 'protocol') {
+    const boundFile = indexedBindingFile(analysis, hit.symbol.kind, resolved.word);
+    if (!(hit.uri === doc.uri || (targetFile && sameFile(boundFile, targetFile)))) return null;
+    if (hit.uri === doc.uri) spans.push(...declarationSpans(program, resolved.word, hit.symbol.kind));
+    spans.push(...namedTypeSpans(program, resolved.word));
+  } else if (hit.symbol.kind === 'const') {
+    const boundFile = indexedBindingFile(analysis, hit.symbol.kind, resolved.word);
+    if (!(hit.uri === doc.uri || (targetFile && sameFile(boundFile, targetFile)))) return null;
+    if (hit.uri === doc.uri) spans.push(...declarationSpans(program, resolved.word, hit.symbol.kind));
+    spans.push(...constantReferenceSpans(analysis, resolved.word));
+  } else {
+    return null;
+  }
+  const seen = new Set<string>();
+  return spans
+    .sort((a, b) => a.start.line - b.start.line || a.start.col - b.start.col)
+    .filter((span) => {
+      const key = `${span.start.line}:${span.start.col}:${span.end.line}:${span.end.col}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .map((span) => ({ range: rangeFor(span), kind: DocumentHighlightKind.Text }));
+});
+
+connection.onWorkspaceSymbol((params: WorkspaceSymbolParams) => {
+  const query = params.query.trim().toLowerCase();
+  const candidates: Array<{ score: number; symbol: PJSymbol; uri: string }> = [];
+  const openPaths = new Set(documents.all().map((doc) => safeFileUri(doc.uri)).filter((file): file is string => !!file).map((file) => path.resolve(file)));
+  const add = (symbol: PJSymbol, uri: string) => {
+    const score = symbolMatchScore(query, symbol.name, symbol.detail);
+    if (score >= 0) candidates.push({ score, symbol, uri });
+    for (const child of symbol.children ?? []) add(child, uri);
+  };
+  for (const { file, symbol } of workspace.all()) {
+    if (!openPaths.has(path.resolve(file))) add(symbol, pathToFileURL(file).toString());
+  }
+  for (const doc of documents.all()) for (const symbol of symbolsFor(doc).symbols) add(symbol, doc.uri);
+  candidates.sort((a, b) => b.score - a.score || a.symbol.name.localeCompare(b.symbol.name) || a.uri.localeCompare(b.uri));
+  return candidates.slice(0, 200).map(({ symbol, uri }) => ({
+    name: symbol.name,
+    kind: symbolKind(symbol),
+    location: Location.create(uri, Range.create(symbol.line, symbol.startCol, symbol.line, symbol.endCol)),
+    containerName: symbol.container,
+  }));
+});
+
+/** Prefixes rank first, then word fragments, then ordered fuzzy matches. */
+function symbolMatchScore(query: string, name: string, detail: string): number {
+  if (!query) return 0;
+  const candidate = name.toLowerCase();
+  if (candidate === query) return 1000;
+  if (candidate.startsWith(query)) return 800 - (candidate.length - query.length);
+  const at = candidate.indexOf(query);
+  if (at >= 0) return 600 - at;
+  if (detail.toLowerCase().includes(query)) return 300;
+  let qi = 0;
+  let gap = 0;
+  for (let i = 0; i < candidate.length && qi < query.length; i++) {
+    if (candidate[i] === query[qi]) qi++;
+    else if (qi > 0) gap++;
+  }
+  return qi === query.length ? 400 - gap : -1;
+}
+
 function toDocumentSymbol(doc: TextDocument, s: PJSymbol): DocumentSymbol {
   const endLine = Math.min(s.endLine, doc.lineCount - 1);
   return {
@@ -690,10 +866,8 @@ const MEMBER_COMPLETIONS: Array<[string, string, string]> = [
   ['write(...)', 'write($0)', 'Write a value to the channel (blocks until a reader arrives)'],
   ['read', 'read', 'The reading end of this channel'],
   ['write', 'write', 'The writing end of this channel'],
-  ['timeout(ms)', 'timeout($0)', 'Block for the given milliseconds, or use as an alt guard'],
   ['sync()', 'sync()', 'Wait on this barrier until every enrolled process has synced'],
   ['resign()', 'resign()', 'Resign from this barrier'],
-  ['size', 'size', 'Length of an array'],
 ];
 
 const SNIPPETS: Array<[string, string, string]> = [
@@ -720,16 +894,31 @@ connection.onCompletion((params: CompletionParams) => {
   if (!doc) return [];
   const line = lineText(doc, params.position.line);
   const before = line.slice(0, params.position.character);
+  const prefix = /[A-Za-z0-9_$]*$/.exec(before)?.[0].toLowerCase() ?? '';
   const items: CompletionItem[] = [];
 
   // Member access: `c.` -> fields of a record, cases' fields of a protocol, or channel/timer/barrier operations.
-  const member = /([A-Za-z_]\w*)\s*\.\s*\w*$/.exec(before);
-  if (member) {
+  const dot = /\.\s*[A-Za-z0-9_$]*$/.exec(before);
+  const receiverText = dot ? before.slice(0, dot.index).trimEnd() : '';
+  if (dot && /[A-Za-z0-9_$)\]]$/.test(receiverText)) {
     const { checked, index } = checkFor(doc);
-    const { symbols } = symbolsFor(doc);
-    const enclosing = symbols.find((s) => s.kind === 'proc' && params.position.line >= s.line && params.position.line <= s.endLine);
-    const v = [...checked.vars].reverse().find((x) => x.name === member[1] && (!enclosing || x.proc === enclosing.name));
-    const t = v?.type ?? index.consts.get(member[1])?.type;
+    // The checker has typed every expression, including `a[i]` and `f(x)`, so
+    // the widest expression ending at the dot is the receiver.
+    let t = receiverTypeAt(checked, params.position.line, receiverText.length);
+    const chain = /([A-Za-z_$][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*)$/.exec(receiverText);
+    if (!t && chain) {
+      // Mid-edit the tree may lack the receiver: fall back to the spelled chain.
+      const [head, ...fields] = chain[1].split('.').map((part) => part.trim());
+      const v = variableAt(checked, { line: params.position.line, character: chain.index })
+        ?? visibleVariables(parsedFor(doc).program, checked, params.position).find((candidate) => candidate.name === head);
+      t = v?.type ?? index.consts.get(head)?.type;
+      for (const field of fields) {
+        if (t?.k === 'record') t = index.recordFields(t.name).get(field);
+        else if (t?.k === 'protocol') t = [...index.protocolCases(t.name).values()].map((caseFields) => caseFields.get(field)).find((ft) => ft);
+        else t = undefined;
+        if (!t) break;
+      }
+    }
     if (t?.k === 'record') {
       for (const [name, ft] of index.recordFields(t.name)) items.push({ label: name, kind: CompletionItemKind.Field, detail: `${typeStr(ft)} ${name}` });
       return items;
@@ -740,33 +929,43 @@ connection.onCompletion((params: CompletionParams) => {
     }
     if (t?.k === 'array') return [{ label: 'size', kind: CompletionItemKind.Property, detail: 'int: number of elements' }];
     if (t?.k === 'prim' && t.name === 'string') return [{ label: 'length', kind: CompletionItemKind.Property, detail: 'int: number of characters' }];
-    const wanted = t?.k === 'chan' ? (t.end === 'read' ? ['read()'] : t.end === 'write' ? ['write(...)'] : ['read()', 'write(...)', 'read', 'write']) : t?.k === 'prim' && t.name === 'timer' ? ['timeout(ms)'] : t?.k === 'prim' && t.name === 'barrier' ? ['sync()', 'resign()'] : undefined;
+    if (t?.k === 'prim' && t.name === 'timer') {
+      return [
+        { label: 'read()', kind: CompletionItemKind.Method, insertText: 'read()', detail: 'long: read the timer clock in milliseconds' },
+        { label: 'timeout(ms)', kind: CompletionItemKind.Method, insertText: 'timeout($0)', insertTextFormat: InsertTextFormat.Snippet, detail: 'Block for the given milliseconds, or use as an alt guard' },
+      ];
+    }
+    const wanted = t?.k === 'chan' ? (t.end === 'read' ? ['read()'] : t.end === 'write' ? ['write(...)'] : ['read()', 'write(...)', 'read', 'write']) : t?.k === 'prim' && t.name === 'barrier' ? ['sync()', 'resign()'] : undefined;
+    if (!wanted) return [];
     for (const [label, insert, doc] of MEMBER_COMPLETIONS) {
-      if (wanted && !wanted.includes(label)) continue;
+      if (!wanted.includes(label)) continue;
       items.push({ label, kind: CompletionItemKind.Method, insertText: insert, insertTextFormat: InsertTextFormat.Snippet, detail: doc });
     }
     return items;
   }
 
-  const { symbols, locals } = symbolsFor(doc);
+  const { symbols } = symbolsFor(doc);
   const seen = new Set<string>();
-  const add = (item: CompletionItem) => {
+  const add = (item: CompletionItem): boolean => {
     const key = `${item.label}|${item.detail ?? ''}`;
-    if (seen.has(key)) return;
+    if (seen.has(key)) return false;
     seen.add(key);
     items.push(item);
+    return true;
   };
 
-  const enclosing = symbols.find((s) => s.kind === 'proc' && params.position.line >= s.line && params.position.line <= s.endLine);
-  for (const v of locals) {
-    if (!enclosing || v.container === enclosing.name) add({ label: v.name, kind: CompletionItemKind.Variable, detail: v.detail });
+  const parsed = parsedFor(doc);
+  const checked = checkFor(doc).checked;
+  for (const v of visibleVariables(parsed.program, checked, params.position)) {
+    const detail = `${v.isConst ? 'const ' : ''}${typeStr(v.type)} ${v.name}${v.isParam ? ' (parameter)' : ''}`;
+    add({ label: v.name, kind: v.isConst ? CompletionItemKind.Constant : CompletionItemKind.Variable, detail });
   }
   for (const s of symbols) {
     add({ label: s.name, kind: completionKind(s), detail: s.detail, documentation: s.doc });
     for (const c of s.children ?? []) add({ label: c.name, kind: completionKind(c), detail: c.detail });
   }
   // Imported declarations (typed, from the checker's index), then the rest of the workspace for navigation-style completion.
-  const { index } = checkFor(doc);
+  const { index, deps } = checkFor(doc);
   const ownNames = new Set(symbols.map((s) => s.name));
   for (const [name, sigs] of index.procs) {
     if (ownNames.has(name)) continue;
@@ -776,9 +975,54 @@ connection.onCompletion((params: CompletionParams) => {
   for (const [name, pr] of index.protocols) if (!ownNames.has(name)) add({ label: name, kind: CompletionItemKind.Enum, detail: `protocol ${name}` + (pr.file ? `  (${path.basename(pr.file, '.pj')})` : '') });
   for (const [name, c] of index.consts) if (!ownNames.has(name)) add({ label: name, kind: CompletionItemKind.Constant, detail: `const ${typeStr(c.type)} ${name}` });
   const ownPath = safeFileUri(doc.uri);
-  for (const { file, symbol } of workspace.all(ownPath)) {
-    if (symbol.kind === 'proc' && symbol.name === 'main') continue; // every program has one; never useful to complete
-    add({ label: symbol.name, kind: completionKind(symbol), detail: `${symbol.detail}  (${path.basename(file)})`, documentation: symbol.doc });
+  const openPaths = new Set<string>();
+  const MAX_AUTO_IMPORTS = 200;
+  let autoImports = 0;
+  let isIncomplete = false;
+  const offerWorkspaceSymbol = (file: string, symbol: PJSymbol) => {
+    if (symbol.kind === 'proc' && symbol.name === 'main') return; // every program has one; never useful to complete
+    if (prefix && !symbol.name.toLowerCase().startsWith(prefix)) return;
+    if (deps.has(path.resolve(file))) return; // already offered above with its typed imported declaration
+    if (autoImports >= MAX_AUTO_IMPORTS) {
+      isIncomplete = true;
+      return;
+    }
+    const importName = importNameFor(file);
+    if (!importName) return;
+    if (add({
+      label: symbol.name,
+      kind: completionKind(symbol),
+      detail: `${symbol.detail}  (${importName})`,
+      documentation: symbol.doc,
+      additionalTextEdits: importName ? [addImportEdit(doc, parsed.program, importName)] : undefined,
+      sortText: `y${symbol.name}`,
+    })) autoImports++;
+  };
+  // Unsaved buffers overlay the workspace's on-disk cache.
+  for (const open of documents.all()) {
+    const file = safeFileUri(open.uri);
+    if (!file || file === ownPath) continue;
+    openPaths.add(path.resolve(file));
+    for (const symbol of symbolsFor(open).symbols) offerWorkspaceSymbol(file, symbol);
+  }
+  const excludedFiles = new Set<string>([...openPaths, ...deps]);
+  const workspaceMatches = workspace.completions(prefix, Math.max(0, MAX_AUTO_IMPORTS - autoImports), excludedFiles, ownPath);
+  if (workspaceMatches.isIncomplete) isIncomplete = true;
+  for (const { file, symbol } of workspaceMatches.items) offerWorkspaceSymbol(file, symbol);
+  // Standard-library declarations are useful even before `std` is imported.
+  // Selecting one inserts the narrow module import automatically.
+  for (const symbol of library) {
+    if (deps.has(path.resolve(symbol.file))) continue;
+    if (prefix && !symbol.name.toLowerCase().startsWith(prefix)) continue;
+    const importName = symbol.pkg ? `${symbol.pkg}.${symbol.module}` : symbol.module;
+    add({
+      label: symbol.name,
+      kind: completionKind(symbol),
+      detail: `${symbol.detail}  (${importName})`,
+      documentation: symbol.doc,
+      additionalTextEdits: [addImportEdit(doc, parsed.program, importName)],
+      sortText: `x${symbol.name}`,
+    });
   }
   for (const [label, insert, detail] of SNIPPETS) {
     add({ label, kind: CompletionItemKind.Snippet, insertText: insert, insertTextFormat: InsertTextFormat.Snippet, detail, sortText: `zz${label}` });
@@ -786,8 +1030,20 @@ connection.onCompletion((params: CompletionParams) => {
   for (const k of KEYWORDS) add({ label: k, kind: CompletionItemKind.Keyword, documentation: KEYWORD_DOCS[k] ? { kind: MarkupKind.Markdown, value: KEYWORD_DOCS[k] } : undefined });
   for (const t of PRIMITIVE_TYPES) add({ label: t, kind: CompletionItemKind.TypeParameter });
   for (const l of LITERALS) add({ label: l, kind: CompletionItemKind.Constant });
-  return items;
+  return { isIncomplete, items };
 });
+
+/** Type of the widest checked expression that ends exactly at `endCol` on `line`. */
+function receiverTypeAt(checked: CheckResult, line: number, endCol: number): Type | undefined {
+  let best: { start: number; type: Type } | undefined;
+  for (const [expr, type] of checked.types) {
+    const span = expr.span;
+    if (span.end.line !== line || span.end.col !== endCol || span.start.line !== line) continue;
+    if (type.k === 'error' || type.k === 'unknown') continue;
+    if (!best || span.start.col < best.start) best = { start: span.start.col, type };
+  }
+  return best?.type;
+}
 
 function completionKind(s: PJSymbol): CompletionItemKind {
   switch (s.kind) {
@@ -801,42 +1057,256 @@ function completionKind(s: PJSymbol): CompletionItemKind {
   }
 }
 
+/** Import spelling for a workspace file, relative to its nearest workspace root. */
+function importNameFor(file: string): string | undefined {
+  const abs = path.resolve(file);
+  const roots = workspace.getRoots()
+    .filter((root) => abs === root || abs.startsWith(root + path.sep))
+    .sort((a, b) => b.length - a.length);
+  if (workspace.getRoots().length > 0 && roots.length === 0) return undefined;
+  const relative = roots.length > 0 ? path.relative(roots[0], abs) : path.basename(abs);
+  if (!relative || relative.startsWith('..')) return undefined;
+  return relative.slice(0, relative.toLowerCase().endsWith('.pj') ? -3 : undefined).split(path.sep).join('.');
+}
+
+/** Insert an auto-import after the existing header without disturbing declarations. */
+function addImportEdit(doc: TextDocument, program: A.Program, importName: string): TextEdit {
+  let line = 0;
+  let text = `import ${importName};\n\n`;
+  if (program.imports.length > 0) {
+    line = program.imports[program.imports.length - 1].span.end.line + 1;
+    text = `import ${importName};\n`;
+  } else if (program.pkg && program.pkg.length > 0) {
+    line = program.pkg[program.pkg.length - 1].span.end.line + 1;
+    text = `\nimport ${importName};\n`;
+  } else if (program.pragmas.length > 0) {
+    line = program.pragmas[program.pragmas.length - 1].span.end.line + 1;
+    text = `\nimport ${importName};\n`;
+  }
+  // A header ending on the last line without a trailing newline leaves no line
+  // to insert before; clients clamp such a position onto the last line.
+  if (line >= doc.lineCount) return TextEdit.insert(doc.positionAt(doc.getText().length), `\n${text}`);
+  return TextEdit.insert(Position.create(line, 0), text);
+}
+
 interface Resolved {
   symbol: PJSymbol;
   uri: string;
   origin: 'local' | 'document' | 'workspace' | 'library';
+  /** Exact checker identity for locals/parameters; absent only during parser recovery. */
+  variable?: VarInfo;
+  /** Exact overload selected by the checker or declaration position. */
+  procedure?: ProcSig;
+  /** The cursor itself was proven to denote this declaration. */
+  exact: boolean;
+}
+
+function symbolForVariable(variable: VarInfo): PJSymbol {
+  return {
+    name: variable.name,
+    kind: 'var',
+    line: variable.decl.span.start.line,
+    startCol: variable.decl.span.start.col,
+    endCol: variable.decl.span.end.col,
+    endLine: variable.decl.span.end.line,
+    detail: `${variable.isConst ? 'const ' : ''}${typeStr(variable.type)} ${variable.name}${variable.isParam ? ' (parameter)' : ''}`,
+    container: variable.proc,
+  };
+}
+
+function resolvedProcedure(doc: TextDocument, sig: ProcSig): Resolved {
+  const ownPath = safeFileUri(doc.uri);
+  const file = sig.file ? path.resolve(sig.file) : undefined;
+  const uri = !file || (ownPath && file === path.resolve(ownPath)) ? doc.uri : pathToFileURL(file).toString();
+  const origin: Resolved['origin'] = uri === doc.uri ? 'document' : file && libraryFiles.has(file) ? 'library' : 'workspace';
+  const start = sig.decl.name.span.start;
+  const end = sig.decl.name.span.end;
+  const symbol: PJSymbol = {
+    name: sig.name,
+    kind: 'proc',
+    line: start.line,
+    startCol: start.col,
+    endCol: end.col,
+    endLine: sig.decl.span.end.line,
+    detail: signatureStr(sig),
+  };
+  return {
+    uri,
+    origin,
+    procedure: sig,
+    exact: true,
+    symbol: sourceSymbol(doc, file, uri, symbol),
+  };
+}
+
+function resolvedIndexedSymbol(doc: TextDocument, file: string | undefined, symbol: PJSymbol): Resolved {
+  const ownPath = safeFileUri(doc.uri);
+  const absolute = file ? path.resolve(file) : undefined;
+  const uri = !absolute || (ownPath && absolute === path.resolve(ownPath)) ? doc.uri : pathToFileURL(absolute).toString();
+  const origin: Resolved['origin'] = uri === doc.uri ? 'document' : absolute && libraryFiles.has(absolute) ? 'library' : 'workspace';
+  return { uri, origin, symbol: sourceSymbol(doc, absolute, uri, symbol), exact: true };
+}
+
+/** Recover docs and the modifier-rich display text from the source extractor.
+ * Checker signatures intentionally carry only semantic data. */
+function sourceSymbol(doc: TextDocument, file: string | undefined, uri: string, fallback: PJSymbol): PJSymbol {
+  let candidates: PJSymbol[] = [];
+  if (uri === doc.uri) candidates = symbolsFor(doc).symbols;
+  else {
+    const open = documents.get(uri);
+    if (open) candidates = symbolsFor(open).symbols;
+    else if (file && libraryFiles.has(file)) candidates = library.filter((symbol) => path.resolve(symbol.file) === file);
+    else if (file) {
+      const exact = workspace.symbolAt(file, fallback.kind, fallback.name, fallback.line, fallback.startCol);
+      if (exact) candidates = [exact];
+    }
+  }
+  const exact = candidates.find((symbol) => symbol.kind === fallback.kind && symbol.name === fallback.name && symbol.line === fallback.line && symbol.startCol === fallback.startCol);
+  return exact ? { ...fallback, detail: exact.detail, doc: exact.doc, params: exact.params } : fallback;
+}
+
+function indexedTypeResolution(doc: TextDocument, analysis: Analysis, name: string): Resolved | undefined {
+  const record = analysis.index.records.get(name);
+  if (record) {
+    const id = record.decl.name;
+    return resolvedIndexedSymbol(doc, record.file, {
+      name,
+      kind: 'record',
+      line: id.span.start.line,
+      startCol: id.span.start.col,
+      endCol: id.span.end.col,
+      endLine: record.decl.span.end.line,
+      detail: `record ${name}${record.extends.length ? ` extends ${record.extends.join(', ')}` : ''}`,
+    });
+  }
+  const protocol = analysis.index.protocols.get(name);
+  if (protocol) {
+    const id = protocol.decl.name;
+    return resolvedIndexedSymbol(doc, protocol.file, {
+      name,
+      kind: 'protocol',
+      line: id.span.start.line,
+      startCol: id.span.start.col,
+      endCol: id.span.end.col,
+      endLine: protocol.decl.span.end.line,
+      detail: `protocol ${name}${protocol.extends.length ? ` extends ${protocol.extends.join(', ')}` : ''}`,
+    });
+  }
+  return undefined;
+}
+
+function indexedConstantResolution(doc: TextDocument, analysis: Analysis, name: string): Resolved | undefined {
+  const constant = analysis.index.consts.get(name);
+  if (!constant) return undefined;
+  const declarator = constant.decl.declarators.find((entry) => entry.name.name === name);
+  if (!declarator) return undefined;
+  const id = declarator.name;
+  return resolvedIndexedSymbol(doc, constant.file, {
+    name,
+    kind: 'const',
+    line: id.span.start.line,
+    startCol: id.span.start.col,
+    endCol: id.span.end.col,
+    endLine: constant.decl.span.end.line,
+    detail: `const ${typeStr(constant.type)} ${name}`,
+  });
+}
+
+function sameFile(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return a === b;
+  return path.resolve(a) === path.resolve(b);
 }
 
 /** Find what an identifier at a position refers to: local, then this file, then workspace, then stdlib. */
 function resolve(doc: TextDocument, position: Position): { word: string; hits: Resolved[] } | undefined {
   const w = wordAt(lineText(doc, position.line), position.character);
   if (!w) return undefined;
+  const parsed = parsedFor(doc);
+  const cursorToken = parsed.tokens.find((token) => token.line === position.line && token.col === w.start && token.end === w.end);
+  if (!cursorToken) return undefined; // inside a comment or string, not a language identifier
+  if (cursorToken.kind === 'keyword') return { word: w.word, hits: [] };
+  if (cursorToken.kind !== 'ident') return undefined;
   const { symbols, locals } = symbolsFor(doc);
+  const analysis = checkFor(doc);
   const hits: Resolved[] = [];
 
+  // Prefer the checker's declaration identity over textual proximity. This is
+  // exact even when nested scopes shadow a name or procedures are overloaded.
+  const variable = variableAt(analysis.checked, position);
+  if (variable) return { word: w.word, hits: [{ symbol: symbolForVariable(variable), uri: doc.uri, origin: 'local', variable, exact: true }] };
+
+  // A resolved call identifies the exact overload and source file. In
+  // particular, do not let an unrelated file with a same-named procedure win
+  // just because that editor happens to be open.
+  for (const [call, sig] of analysis.checked.calls) {
+    if (containsPosition(call.name.span, position)) return { word: w.word, hits: [resolvedProcedure(doc, sig)] };
+  }
+  const ownPath = safeFileUri(doc.uri);
+  for (const sig of analysis.index.procs.get(w.word) ?? []) {
+    if (sameFile(sig.file, ownPath) && containsPosition(sig.decl.name.span, position)) {
+      return { word: w.word, hits: [resolvedProcedure(doc, sig)] };
+    }
+  }
+
+  const program = parsed.program;
+  if (namedTypeSpans(program, w.word).some((span) => containsPosition(span, position))) {
+    const type = indexedTypeResolution(doc, analysis, w.word);
+    if (type) return { word: w.word, hits: [type] };
+  }
+  for (const [expr] of analysis.checked.types) {
+    if (expr.kind !== 'NameExpr' || expr.qualifier?.length || analysis.checked.resolutions.has(expr) || !containsPosition(expr.name.span, position)) continue;
+    const constant = indexedConstantResolution(doc, analysis, w.word);
+    if (constant) return { word: w.word, hits: [constant] };
+  }
+
+  // Tolerant fallback for a half-typed tree. It remains useful for hover and go
+  // to definition, but rename refuses it because the binding is not provable.
   const enclosing = symbols.find((s) => s.kind === 'proc' && position.line >= s.line && position.line <= s.endLine);
   for (const v of locals) {
     if (v.name === w.word && (!enclosing || v.container === enclosing.name) && v.line <= position.line) {
-      hits.push({ symbol: v, uri: doc.uri, origin: 'local' });
+      hits.push({ symbol: v, uri: doc.uri, origin: 'local', exact: false });
     }
   }
   if (hits.length) return { word: w.word, hits: [hits[hits.length - 1]] }; // nearest declaration wins
 
+  const declarationHits: Resolved[] = [];
+  const addOwn = (symbol: PJSymbol) => {
+    if (symbol.name !== w.word) return;
+    const exact = symbol.line === position.line && symbol.startCol === w.start && symbol.endCol === w.end;
+    (exact ? declarationHits : hits).push({ symbol, uri: doc.uri, origin: 'document', exact });
+  };
   for (const s of symbols) {
-    if (s.name === w.word) hits.push({ symbol: s, uri: doc.uri, origin: 'document' });
-    for (const c of s.children ?? []) if (c.name === w.word) hits.push({ symbol: c, uri: doc.uri, origin: 'document' });
+    addOwn(s);
+    for (const c of s.children ?? []) addOwn(c);
   }
+  if (declarationHits.length) return { word: w.word, hits: declarationHits };
   if (hits.length) return { word: w.word, hits };
+
+  const openPaths = new Set<string>();
+  const visible: Resolved[] = [];
+  const fallback: Resolved[] = [];
+  const addExternal = (resolved: Resolved, file: string | undefined) => {
+    (file && analysis.deps.has(path.resolve(file)) ? visible : fallback).push(resolved);
+  };
+  for (const open of documents.all()) {
+    if (open.uri === doc.uri) continue;
+    const file = safeFileUri(open.uri);
+    if (file) openPaths.add(path.resolve(file));
+    for (const s of symbolsFor(open).symbols) {
+      if (s.name === w.word) addExternal({ symbol: s, uri: open.uri, origin: 'workspace', exact: false }, file);
+      for (const child of s.children ?? []) if (child.name === w.word) addExternal({ symbol: child, uri: open.uri, origin: 'workspace', exact: false }, file);
+    }
+  }
 
   for (const { file, symbol } of workspace.lookup(w.word, safeFileUri(doc.uri))) {
-    hits.push({ symbol, uri: pathToFileURL(file).toString(), origin: 'workspace' });
+    if (openPaths.has(path.resolve(file))) continue;
+    addExternal({ symbol, uri: pathToFileURL(file).toString(), origin: 'workspace', exact: false }, file);
   }
-  if (hits.length) return { word: w.word, hits };
 
   for (const lib of library) {
-    if (lib.name === w.word) hits.push({ symbol: lib, uri: pathToFileURL(lib.file).toString(), origin: 'library' });
+    if (lib.name === w.word) addExternal({ symbol: lib, uri: pathToFileURL(lib.file).toString(), origin: 'library', exact: false }, lib.file);
   }
-  return { word: w.word, hits };
+  return { word: w.word, hits: visible.length > 0 ? visible : fallback };
 }
 
 connection.onDefinition((params: DefinitionParams) => {
@@ -863,7 +1333,10 @@ connection.onHover((params: HoverParams): Hover | null => {
 
   const exprType = typeAtPosition(doc, params.position);
   const parts = r.hits.slice(0, 6).map((h) => {
-    const where = h.origin === 'library' ? `  — std library (${path.basename((h.symbol as LibrarySymbol).file)})` : h.origin === 'workspace' ? `  — ${path.basename(safeFileUri(h.uri) ?? '')}` : '';
+    // Exact checker resolutions synthesize an ordinary PJSymbol, including for
+    // stdlib declarations, so the URI is the reliable source of the filename.
+    const sourceName = path.basename(safeFileUri(h.uri) ?? '');
+    const where = h.origin === 'library' ? `  — std library (${sourceName})` : h.origin === 'workspace' ? `  — ${sourceName}` : '';
     let s = `\`\`\`processj\n${h.symbol.detail}\n\`\`\`${where}`;
     if (h.symbol.doc) s += `\n\n${h.symbol.doc}`;
     return s;
@@ -873,67 +1346,208 @@ connection.onHover((params: HoverParams): Hover | null => {
 });
 
 /** Type of the smallest expression containing the position, from the checker. */
+const typePositionCache = new WeakMap<CheckResult, { byLine: Map<number, Array<[A.Expr, Type]>>; multiline: Array<[A.Expr, Type]> }>();
+
 function typeAtPosition(doc: TextDocument, pos: Position): string | undefined {
   const { checked } = checkFor(doc);
+  let positionIndex = typePositionCache.get(checked);
+  if (!positionIndex) {
+    positionIndex = { byLine: new Map(), multiline: [] };
+    for (const entry of checked.types) {
+      const [expr] = entry;
+      if (expr.span.start.line !== expr.span.end.line) {
+        positionIndex.multiline.push(entry);
+        continue;
+      }
+      const line = positionIndex.byLine.get(expr.span.start.line);
+      if (line) line.push(entry);
+      else positionIndex.byLine.set(expr.span.start.line, [entry]);
+    }
+    typePositionCache.set(checked, positionIndex);
+  }
   let best: { size: number; type: string } | undefined;
-  for (const [e, t] of checked.types) {
+  const consider = ([e, t]: [A.Expr, Type]): void => {
     const s = e.span;
-    if (s.start.line > pos.line || s.end.line < pos.line) continue;
-    if (s.start.line === pos.line && s.start.col > pos.character) continue;
-    if (s.end.line === pos.line && s.end.col < pos.character) continue;
-    if (t.k === 'error' || t.k === 'unknown') continue;
+    if (!containsPosition(s, pos)) return;
+    if (t.k === 'error' || t.k === 'unknown') return;
     const size = (s.end.line - s.start.line) * 10_000 + (s.end.col - s.start.col);
     if (!best || size < best.size) best = { size, type: typeStr(t) };
-  }
+  };
+  for (const entry of positionIndex.byLine.get(pos.line) ?? []) consider(entry);
+  for (const entry of positionIndex.multiline) consider(entry);
   return best?.type;
 }
 
-/** Every identifier token equal to `name` inside [fromLine, toLine], skipping member names after `.`. */
-function occurrences(text: string, name: string, fromLine: number, toLine: number): Range[] {
-  const { tokens } = tokenize(text);
-  const out: Range[] = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (t.kind !== 'ident' || t.text !== name || t.line < fromLine || t.line > toLine) continue;
-    if (i > 0 && tokens[i - 1].kind === 'punct' && tokens[i - 1].text === '.') continue;
-    out.push(Range.create(t.line, t.col, t.line, t.end));
+function declarationSpans(program: A.Program, name: string, kind: PJSymbol['kind']): A.Span[] {
+  const spans: A.Span[] = [];
+  for (const decl of program.decls) {
+    if (kind === 'proc' && decl.kind === 'ProcDecl' && decl.name.name === name) spans.push(decl.name.span);
+    else if (kind === 'record' && decl.kind === 'RecordDecl' && decl.name.name === name) spans.push(decl.name.span);
+    else if (kind === 'protocol' && decl.kind === 'ProtocolDecl' && decl.name.name === name) spans.push(decl.name.span);
+    else if (kind === 'const' && decl.kind === 'ConstDecl') {
+      for (const variable of decl.declarators) if (variable.name.name === name) spans.push(variable.name.span);
+    }
   }
-  return out;
+  return spans;
 }
 
-function referencesOf(doc: TextDocument, position: Position): { name: string; locations: Location[] } | undefined {
+function indexedBindingFile(analysis: Analysis, kind: PJSymbol['kind'], name: string): string | undefined {
+  if (kind === 'record') return analysis.index.records.get(name)?.file;
+  if (kind === 'protocol') return analysis.index.protocols.get(name)?.file;
+  if (kind === 'const') return analysis.index.consts.get(name)?.file;
+  return undefined;
+}
+
+function callTargets(sig: ProcSig, targetFile: string | undefined, targetUri: string, sourceUri: string, target?: ProcSig): boolean {
+  const fileMatches = targetFile ? sameFile(sig.file, targetFile) : !sig.file && targetUri === sourceUri;
+  return fileMatches && (!target || sameSignature(sig, target));
+}
+
+function procedureReferenceSpans(program: A.Program, analysis: Analysis, name: string, targetFile: string | undefined, targetUri: string, sourceUri: string, target: ProcSig): A.Span[] {
+  const spans: A.Span[] = [];
+  for (const [call, sig] of analysis.checked.calls) {
+    if (call.name.name === name && callTargets(sig, targetFile, targetUri, sourceUri, target)) spans.push(call.name.span);
+  }
+
+  const candidates = analysis.index.procs.get(name) ?? [];
+  const matching = candidates.filter((sig) => callTargets(sig, targetFile, targetUri, sourceUri, target));
+  const otherTargets = candidates.some((sig) => !callTargets(sig, targetFile, targetUri, sourceUri, target));
+  if (matching.length > 0 && !otherTargets) {
+    // Calls the checker rejected (wrong arity or argument types) have no
+    // `calls` entry, yet a rename that skipped them would leave dangling names.
+    for (const [expr] of analysis.checked.types) {
+      if (expr.kind === 'Invocation' && !expr.target && !expr.qualifier?.length && expr.name.name === name && !analysis.checked.calls.has(expr)) spans.push(expr.name.span);
+    }
+    for (const decl of program.decls) {
+      if (decl.kind !== 'ProcDecl') continue;
+      for (const implemented of decl.implements) if (!implemented.qualifier?.length && implemented.name === name) spans.push(implemented.span);
+    }
+  }
+
+  // `new mobile(Worker)` names a procedure rather than a type. The checker only
+  // accepts it when exactly one mobile declaration is available, which gives us
+  // the same stable identity needed for rename.
+  const mobile = candidates.filter((sig) => sig.decl.modifiers.includes('mobile'));
+  if (mobile.length === 1 && callTargets(mobile[0], targetFile, targetUri, sourceUri, target)) {
+    for (const [expr] of analysis.checked.types) {
+      if (expr.kind === 'NewMobile' && !expr.typeName.qualifier?.length && expr.typeName.name === name) spans.push(expr.typeName.span);
+    }
+  }
+  return spans;
+}
+
+function constantReferenceSpans(analysis: Analysis, name: string): A.Span[] {
+  const spans: A.Span[] = [];
+  for (const [expr] of analysis.checked.types) {
+    if (expr.kind === 'NameExpr' && !expr.qualifier?.length && expr.name.name === name && !analysis.checked.resolutions.has(expr)) spans.push(expr.name.span);
+  }
+  return spans;
+}
+
+function rangeFor(span: A.Span): Range {
+  return Range.create(span.start.line, span.start.col, span.end.line, span.end.col);
+}
+
+function rangeKey(uri: string, range: Range): string {
+  return `${uri}\0${range.start.line}:${range.start.character}:${range.end.line}:${range.end.character}`;
+}
+
+function referencesOf(doc: TextDocument, position: Position, includeDeclaration = true): { name: string; locations: Location[] } | undefined {
   const r = resolve(doc, position);
-  if (!r || r.hits.length === 0) return undefined;
+  if (!r || r.hits.length === 0 || !r.hits[0].exact) return undefined;
   const hit = r.hits[0];
-  const text = doc.getText();
   const locations: Location[] = [];
 
   if (hit.origin === 'local') {
-    const proc = symbolsFor(doc).symbols.find((s) => s.kind === 'proc' && s.name === hit.symbol.container);
-    const from = proc ? proc.line : 0;
-    const to = proc ? proc.endLine : doc.lineCount - 1;
-    for (const range of occurrences(text, r.word, from, to)) locations.push(Location.create(doc.uri, range));
+    if (!hit.variable) return undefined;
+    for (const span of variableSpans(checkFor(doc).checked, hit.variable, includeDeclaration)) {
+      locations.push(Location.create(doc.uri, rangeFor(span)));
+    }
     return { name: r.word, locations };
   }
 
-  // Top-level symbol: this document plus every workspace file and open document.
-  for (const range of occurrences(text, r.word, 0, doc.lineCount - 1)) locations.push(Location.create(doc.uri, range));
+  // Member names need receiver-type resolution, which the checker does not yet
+  // expose as a stable declaration identity. Returning no references is safer
+  // than a workspace-wide textual rename of unrelated fields or protocol cases.
+  if (hit.symbol.kind === 'field' || hit.symbol.kind === 'case' || hit.symbol.detail.startsWith('extern ')) return undefined;
+
+  const targetFile = safeFileUri(hit.uri);
+  const targetKind = hit.symbol.kind;
+  const targetProcedure = hit.procedure;
+  if (targetKind === 'proc' && !targetProcedure) return undefined;
   const ownPath = safeFileUri(doc.uri);
-  const files = new Set<string>();
-  for (const { file } of workspace.all(ownPath)) files.add(file);
+  const openPaths = new Set<string>();
+  const seen = new Set<string>();
+  const add = (uri: string, range: Range) => {
+    const key = rangeKey(uri, range);
+    if (seen.has(key)) return;
+    seen.add(key);
+    locations.push(Location.create(uri, range));
+  };
+  if (includeDeclaration) {
+    for (const resolved of r.hits) {
+      if (resolved.symbol.kind !== targetKind || resolved.uri !== hit.uri) continue;
+      add(resolved.uri, Range.create(resolved.symbol.line, resolved.symbol.startCol, resolved.symbol.line, resolved.symbol.endCol));
+    }
+  }
+
+  const addOpenDocument = (source: TextDocument): void => {
+    const sourcePath = safeFileUri(source.uri);
+    const analysis = checkFor(source);
+    const program = parsedFor(source).program;
+    const declarations = targetKind === 'proc' && targetProcedure ? [targetProcedure.decl.name.span] : declarationSpans(program, r.word, targetKind);
+    const isTargetFile = source.uri === hit.uri || (!!sourcePath && !!targetFile && sameFile(sourcePath, targetFile));
+
+    if (targetKind === 'proc') {
+      if (includeDeclaration && isTargetFile) for (const span of declarations) add(source.uri, rangeFor(span));
+      for (const span of procedureReferenceSpans(program, analysis, r.word, targetFile, hit.uri, source.uri, targetProcedure!)) add(source.uri, rangeFor(span));
+      return;
+    }
+
+    const boundFile = indexedBindingFile(analysis, targetKind, r.word);
+    if (!(isTargetFile || (targetFile && sameFile(boundFile, targetFile)))) return;
+    if (includeDeclaration && isTargetFile) for (const span of declarations) add(source.uri, rangeFor(span));
+    const uses = targetKind === 'const' ? constantReferenceSpans(analysis, r.word) : namedTypeSpans(program, r.word);
+    for (const span of uses) add(source.uri, rangeFor(span));
+  };
+
+  addOpenDocument(doc);
   for (const d of documents.all()) {
     const p = safeFileUri(d.uri);
-    if (p && p !== ownPath) files.add(p);
+    if (d.uri === doc.uri) continue;
+    if (p) openPaths.add(path.resolve(p));
+    addOpenDocument(d);
   }
-  for (const file of files) {
-    const open = documents.get(pathToFileURL(file).toString());
-    let content: string;
-    try {
-      content = open ? open.getText() : fs.readFileSync(file, 'utf8');
-    } catch {
+
+  // Use the compact token index only to identify candidate closed files. Each
+  // candidate is then checked against its imports, and procedure calls use the
+  // exact overload/file selected by the checker.
+  const byFile = new Map<string, Range[]>();
+  for (const occurrence of workspace.occurrences(r.word, ownPath, true)) {
+    const file = path.resolve(occurrence.file);
+    if (openPaths.has(file)) continue;
+    const range = Range.create(occurrence.line, occurrence.startCol, occurrence.line, occurrence.endCol);
+    const ranges = byFile.get(file);
+    if (ranges) ranges.push(range);
+    else byFile.set(file, [range]);
+  }
+  for (const [file] of byFile) {
+    const program = workspace.programFor(file);
+    if (!program) continue;
+    const uri = pathToFileURL(file).toString();
+    const analysis = analyzeProgram(program, file);
+    const declarations = targetKind === 'proc' && targetProcedure ? [targetProcedure.decl.name.span] : declarationSpans(program, r.word, targetKind);
+    const isTargetFile = !!targetFile && sameFile(file, targetFile);
+    if (targetKind === 'proc') {
+      if (includeDeclaration && isTargetFile) for (const span of declarations) add(uri, rangeFor(span));
+      for (const span of procedureReferenceSpans(program, analysis, r.word, targetFile, hit.uri, uri, targetProcedure!)) add(uri, rangeFor(span));
       continue;
     }
-    for (const range of occurrences(content, r.word, 0, Number.MAX_SAFE_INTEGER)) locations.push(Location.create(pathToFileURL(file).toString(), range));
+    const boundFile = indexedBindingFile(analysis, targetKind, r.word);
+    if (!(isTargetFile || (targetFile && sameFile(boundFile, targetFile)))) continue;
+    if (includeDeclaration && isTargetFile) for (const span of declarations) add(uri, rangeFor(span));
+    const uses = targetKind === 'const' ? constantReferenceSpans(analysis, r.word) : namedTypeSpans(program, r.word);
+    for (const span of uses) add(uri, rangeFor(span));
   }
   return { name: r.word, locations };
 }
@@ -941,14 +1555,20 @@ function referencesOf(doc: TextDocument, position: Position): { name: string; lo
 connection.onReferences((params: ReferenceParams) => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
-  return referencesOf(doc, params.position)?.locations ?? null;
+  return referencesOf(doc, params.position, params.context.includeDeclaration)?.locations ?? null;
 });
 
 connection.onPrepareRename((params: PrepareRenameParams) => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
   const r = resolve(doc, params.position);
-  if (!r || r.hits.length === 0 || r.hits[0].origin === 'library') return null;
+  if (!r || r.hits.length === 0 || r.hits[0].origin === 'library' || (r.hits[0].origin === 'local' && !r.hits[0].variable)) return null;
+  if (r.hits.some((hit) => !hit.exact)) return null;
+  if (r.hits.some((hit) => hit.symbol.kind === 'field' || hit.symbol.kind === 'case' || hit.symbol.detail.startsWith('extern '))) return null;
+  if (r.hits.some((hit) => hit.symbol.kind === 'proc' && !hit.procedure)) return null;
+  // Multiple files with the same unresolved name are ambiguous. Exact calls
+  // are reduced to one hit by the checker above and remain safely renameable.
+  if (new Set(r.hits.map((hit) => hit.uri)).size > 1) return null;
   const w = wordAt(lineText(doc, params.position.line), params.position.character)!;
   return { range: Range.create(params.position.line, w.start, params.position.line, w.end), placeholder: r.word };
 });
@@ -956,7 +1576,15 @@ connection.onPrepareRename((params: PrepareRenameParams) => {
 connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return null;
-  if (!/^[A-Za-z_]\w*$/.test(params.newName)) return null;
+  // A refused rename must say why: a null result shows nothing in most editors.
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(params.newName)) throw new ResponseError(ErrorCodes.InvalidParams, `'${params.newName}' is not a valid ProcessJ identifier`);
+  if (KEYWORDS.includes(params.newName) || PRIMITIVE_TYPES.includes(params.newName) || LITERALS.includes(params.newName)) throw new ResponseError(ErrorCodes.InvalidParams, `'${params.newName}' is a reserved word`);
+  const prepared = resolve(doc, params.position);
+  if (!prepared || prepared.hits.length === 0 || prepared.hits[0].origin === 'library') return null;
+  if (prepared.hits.some((hit) => !hit.exact)) return null;
+  if (prepared.hits.some((hit) => hit.symbol.kind === 'field' || hit.symbol.kind === 'case' || hit.symbol.detail.startsWith('extern '))) return null;
+  if (prepared.hits.some((hit) => hit.symbol.kind === 'proc' && !hit.procedure)) return null;
+  if (new Set(prepared.hits.map((hit) => hit.uri)).size > 1) return null;
   const refs = referencesOf(doc, params.position);
   if (!refs) return null;
   const changes: Record<string, TextEdit[]> = {};
@@ -991,24 +1619,39 @@ connection.onSignatureHelp((params: SignatureHelpParams): SignatureHelp | null =
   return { signatures, activeSignature: 0, activeParameter: call.argIndex };
 });
 
-/** Walk backwards from the cursor to the unmatched `(` and the identifier before it. */
+/** Find the innermost unclosed call using lexer tokens, so commas in strings or
+ * comments and arbitrarily long multiline calls do not corrupt argument index. */
 function findCallContext(doc: TextDocument, position: Position): { name: string; argIndex: number } | undefined {
-  const text = doc.getText(Range.create(Math.max(0, position.line - 20), 0, position.line, position.character));
-  let depth = 0;
-  let argIndex = 0;
-  for (let i = text.length - 1; i >= 0; i--) {
-    const ch = text[i];
-    if (ch === ')' || ch === ']') depth++;
-    else if (ch === '(' || ch === '[') {
-      if (depth === 0) {
-        if (ch !== '(') return undefined;
-        const head = /([A-Za-z_]\w*)\s*$/.exec(text.slice(0, i));
-        if (!head) return undefined;
-        return { name: head[1], argIndex };
+  const tokens = parsedFor(doc).tokens;
+  const stack: Array<{ token: '(' | '[' | '{'; index: number; commas: number }> = [];
+  const closes: Record<string, '(' | '[' | '{'> = { ')': '(', ']': '[', '}': '{' };
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.line > position.line || (token.line === position.line && token.col >= position.character)) break;
+    if (token.text === '(' || token.text === '[' || token.text === '{') {
+      stack.push({ token: token.text, index: i, commas: 0 });
+      continue;
+    }
+    const opening = closes[token.text];
+    if (opening) {
+      for (let j = stack.length - 1; j >= 0; j--) {
+        if (stack[j].token !== opening) continue;
+        stack.length = j;
+        break;
       }
-      depth--;
-    } else if (ch === ',' && depth === 0) argIndex++;
-    else if ((ch === ';' || ch === '{' || ch === '}') && depth === 0) return undefined;
+      continue;
+    }
+    if (token.text === ',' && stack.at(-1)?.token === '(') stack[stack.length - 1].commas++;
+    // A `;` cannot appear inside an argument list, so every bracket still open
+    // in the current block belongs to an unfinished earlier statement.
+    if (token.text === ';') while (stack.length && stack[stack.length - 1].token !== '{') stack.pop();
+  }
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const open = stack[i];
+    if (open.token === '{') break;
+    if (open.token !== '(') continue;
+    const head = tokens[open.index - 1];
+    if (head?.kind === 'ident') return { name: head.text, argIndex: open.commas };
   }
   return undefined;
 }
@@ -1027,9 +1670,20 @@ function firstNonSpace(s: string): number {
 }
 
 function indexOfWord(text: string, word: string): number {
-  const re = new RegExp(String.raw`\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\b`);
+  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(?:^|[^A-Za-z0-9_$])(${escaped})(?![A-Za-z0-9_$])`);
   const m = re.exec(text);
-  return m ? m.index : -1;
+  return m ? m.index + m[0].length - m[1].length : -1;
+}
+
+/** The open editor buffer for a file on disk, matched by path rather than by URI spelling (clients encode URIs differently). */
+function documentForPath(file: string): TextDocument | undefined {
+  const wanted = path.resolve(file);
+  for (const doc of documents.all()) {
+    const p = safeFileUri(doc.uri);
+    if (p && path.resolve(p) === wanted) return doc;
+  }
+  return undefined;
 }
 
 function safeFileUri(uri: string): string | undefined {
@@ -1037,6 +1691,16 @@ function safeFileUri(uri: string): string | undefined {
     return uri.startsWith('file:') ? fileURLToPath(uri) : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** The installed package is the version source of truth for every editor. */
+function packageVersion(): string {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8')) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : 'unknown';
+  } catch {
+    return 'unknown';
   }
 }
 

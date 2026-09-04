@@ -34,16 +34,25 @@ export interface PJSymbol {
 const MODIFIERS = String.raw`(?:(?:public|private|protected|native|mobile|extern|shared)\s+)*`;
 // A type: optional `shared`, then either chan<...>[.read|.write] or an identifier with optional generics,
 // followed by any number of [] pairs.
-const TYPE = String.raw`(?:shared\s+)?(?:chan\s*<[^<>\n]*(?:<[^<>\n]*>[^<>\n]*)?>(?:\.(?:read|write))?|[A-Za-z_]\w*(?:\s*<[^<>\n]*>)?)(?:\s*\[\s*\])*`;
-const IDENT = String.raw`[A-Za-z_]\w*`;
+const TYPE = String.raw`(?:shared\s+)?(?:chan\s*<[^<>\n]*(?:<[^<>\n]*>[^<>\n]*)?>(?:\.(?:read|write))?|[A-Za-z_$][A-Za-z0-9_$]*(?:\s*<[^<>\n]*>)?)(?:\s*\[\s*\])*`;
+const IDENT = String.raw`[A-Za-z_$][A-Za-z0-9_$]*`;
 
-const PROC_RE = new RegExp(String.raw`^(\s*)(${MODIFIERS})(?:proc\s+)?(${TYPE})\s+(${IDENT})\s*\(([^()]*)\)`);
-const RECORD_RE = new RegExp(String.raw`^(\s*)(${MODIFIERS})record\s+(${IDENT})(?:\s+extends\s+([\w\s,]+?))?\s*\{?`);
-const PROTOCOL_RE = new RegExp(String.raw`^(\s*)(${MODIFIERS})protocol\s+(${IDENT})(?:\s+extends\s+([\w\s,]+?))?\s*\{?`);
-const CONST_RE = new RegExp(String.raw`^(\s*)(${MODIFIERS})const\s+(${TYPE})\s+(${IDENT})`);
-const FIELD_RE = new RegExp(String.raw`^(\s*)(${TYPE})\s+(${IDENT})\s*;`);
-const CASE_RE = new RegExp(String.raw`^(\s*)(${IDENT})\s*:\s*\{`);
-const LOCAL_RE = new RegExp(String.raw`(?:^|[;{}(,]|\bfor\s*\()\s*(${TYPE})\s+(${IDENT})((?:\s*,\s*${IDENT})*)\s*(?=[=;,)\]:])`, 'g');
+// The `d` flag exposes match indices, so a name's column is exact even when the
+// same letters occur earlier in the line (`int i`, `const int t`).
+const PROC_RE = new RegExp(String.raw`^(\s*)(${MODIFIERS})(?:proc\s+)?(${TYPE})\s+(${IDENT})\s*\(([^()]*)\)`, 'd');
+const RECORD_RE = new RegExp(String.raw`^(\s*)(${MODIFIERS})record\s+(${IDENT})(?:\s+extends\s+([A-Za-z0-9_$\s,]+?))?\s*\{?`, 'd');
+const PROTOCOL_RE = new RegExp(String.raw`^(\s*)(${MODIFIERS})protocol\s+(${IDENT})(?:\s+extends\s+([A-Za-z0-9_$\s,]+?))?\s*\{?`, 'd');
+const CONST_RE = new RegExp(String.raw`^(\s*)(${MODIFIERS})const\s+(${TYPE})\s+(${IDENT})`, 'd');
+const FIELD_RE = new RegExp(String.raw`^(\s*)(${TYPE})\s+(${IDENT})\s*;`, 'd');
+const CASE_RE = new RegExp(String.raw`^(\s*)(${IDENT})\s*:\s*\{`, 'd');
+const LOCAL_RE = new RegExp(String.raw`(?:^|[;{}(,]|\bfor\s*\()\s*(${TYPE})\s+(${IDENT})((?:\s*,\s*${IDENT})*)\s*(?=[=;,)\]:])`, 'gd');
+/** One `type name` parameter, or one `type name` fragment of a protocol case body. */
+const TYPED_NAME_RE = new RegExp(String.raw`^\s*(${TYPE})\s+(${IDENT})\s*$`, 'd');
+const NAME_RE = new RegExp(IDENT, 'g');
+
+function groupStart(m: RegExpExecArray, group: number): number {
+  return m.indices![group][0];
+}
 
 /**
  * Replace comment bodies and string/char literal contents with spaces so brace
@@ -164,16 +173,20 @@ export function extractSymbols(text: string): PJSymbol[] {
     const line = masked[l];
     if (line.trim() === '') continue;
 
-    let m = RECORD_RE.exec(line) ?? PROTOCOL_RE.exec(line);
+    let isRecord = true;
+    let m = RECORD_RE.exec(line);
+    if (!m) {
+      isRecord = false;
+      m = PROTOCOL_RE.exec(line);
+    }
     if (m) {
-      const isRecord = /\brecord\b/.test(line);
       const name = m[3];
       const endLine = findBlockEnd(masked, l);
       const sym: PJSymbol = {
         name,
         kind: isRecord ? 'record' : 'protocol',
         line: l,
-        startCol: line.indexOf(name, m[1].length + m[2].length),
+        startCol: groupStart(m, 3),
         endCol: 0,
         endLine,
         detail: `${isRecord ? 'record' : 'protocol'} ${name}${m[4] ? ` extends ${m[4].trim()}` : ''}`,
@@ -186,7 +199,7 @@ export function extractSymbols(text: string): PJSymbol[] {
         if (isRecord) {
           const f = FIELD_RE.exec(inner);
           if (f) {
-            const col = inner.indexOf(f[3], f[1].length + f[2].length);
+            const col = groupStart(f, 3);
             sym.children!.push({
               name: f[3], kind: 'field', line: k, startCol: col, endCol: col + f[3].length, endLine: k,
               detail: `${f[2].replace(/\s+/g, ' ')} ${f[3]}`, container: name,
@@ -195,13 +208,13 @@ export function extractSymbols(text: string): PJSymbol[] {
         } else {
           const c = CASE_RE.exec(inner);
           if (c) {
-            const col = inner.indexOf(c[2], c[1].length);
+            const col = groupStart(c, 2);
             const caseEnd = findBlockEnd(masked, k);
             const fields: string[] = [];
             for (let q = k; q <= caseEnd; q++) {
               const body = q === k ? masked[q].slice(masked[q].indexOf('{') + 1) : masked[q];
               for (const part of body.split(';')) {
-                const f = new RegExp(String.raw`^\s*(${TYPE})\s+(${IDENT})\s*$`).exec(part);
+                const f = TYPED_NAME_RE.exec(part);
                 if (f) fields.push(`${f[1].replace(/\s+/g, ' ')} ${f[2]}`);
               }
             }
@@ -220,7 +233,7 @@ export function extractSymbols(text: string): PJSymbol[] {
     m = CONST_RE.exec(line);
     if (m) {
       const name = m[4];
-      const col = line.indexOf(name, m[1].length + m[2].length + m[3].length);
+      const col = groupStart(m, 4);
       symbols.push({
         name, kind: 'const', line: l, startCol: col, endCol: col + name.length, endLine: l,
         detail: `${m[2]}const ${m[3].replace(/\s+/g, ' ')} ${name}`.trim(), doc: docAbove(lines, l),
@@ -234,7 +247,7 @@ export function extractSymbols(text: string): PJSymbol[] {
       const name = m[4];
       const typeHead = type.split(/[\s<[.]/)[0];
       if (NOT_A_TYPE.has(typeHead) || NOT_A_TYPE.has(name)) continue;
-      const col = line.indexOf(name, m[1].length + m[2].length + m[3].length);
+      const col = groupStart(m, 4);
       const endLine = findBlockEnd(masked, l);
       const params = splitParams(m[5]);
       symbols.push({
@@ -256,7 +269,9 @@ export function extractSymbols(text: string): PJSymbol[] {
 export function extractLocals(text: string, procs?: PJSymbol[]): PJSymbol[] {
   const masked = maskCommentsAndStrings(text);
   const lines = masked.split(/\r?\n/);
-  const containers = (procs ?? extractSymbols(text)).filter((s) => s.kind === 'proc');
+  const symbols = procs ?? extractSymbols(text);
+  const containers = symbols.filter((s) => s.kind === 'proc');
+  const typeBodies = symbols.filter((s) => s.kind === 'record' || s.kind === 'protocol');
   const out: PJSymbol[] = [];
   const seen = new Set<string>();
 
@@ -267,14 +282,17 @@ export function extractLocals(text: string, procs?: PJSymbol[]): PJSymbol[] {
     let paramSpan: [number, number] | undefined;
     const p = PROC_RE.exec(line);
     if (p && !NOT_A_TYPE.has(p[3].split(/[\s<[.]/)[0]) && !NOT_A_TYPE.has(p[4])) {
-      const open = line.indexOf('(', p[1].length + p[2].length + p[3].length);
-      const close = line.indexOf(')', open);
-      paramSpan = [open, close < 0 ? line.length : close];
-      for (const param of splitParams(p[5])) {
-        const pm = new RegExp(String.raw`^(${TYPE})\s+(${IDENT})$`).exec(param.replace(/\s+/g, ' '));
-        if (!pm) continue;
-        const col = line.indexOf(pm[2], open);
-        out.push({ name: pm[2], kind: 'var', line: l, startCol: col, endCol: col + pm[2].length, endLine: l, detail: `${pm[1]} ${pm[2]} (parameter)`, container: p[4] });
+      const listStart = groupStart(p, 5);
+      paramSpan = [listStart - 1, listStart + p[5].length];
+      // Walk the raw list so each name's column is taken from where it really is.
+      let offset = 0;
+      for (const param of p[5].split(',')) {
+        const pm = TYPED_NAME_RE.exec(param);
+        if (pm) {
+          const col = listStart + offset + groupStart(pm, 2);
+          out.push({ name: pm[2], kind: 'var', line: l, startCol: col, endCol: col + pm[2].length, endLine: l, detail: `${pm[1].replace(/\s+/g, ' ')} ${pm[2]} (parameter)`, container: p[4] });
+        }
+        offset += param.length + 1;
       }
     }
     LOCAL_RE.lastIndex = 0;
@@ -285,11 +303,20 @@ export function extractLocals(text: string, procs?: PJSymbol[]): PJSymbol[] {
       if (NOT_A_TYPE.has(typeHead)) continue;
       const names = [m[2], ...m[3].split(',').map((s) => s.trim()).filter(Boolean)];
       const container = containers.find((p) => l >= p.line && l <= p.endLine)?.name;
-      let searchFrom = m.index;
+      // FIELD_RE owns record/protocol members. The tolerant local scan is
+      // deliberately line-oriented, so without this guard fields also looked
+      // like procedure locals whenever recovery was active. Locals outside any
+      // recognised procedure are kept: mid-edit the header may be unparseable.
+      if (!container && typeBodies.some((t) => l >= t.line && l <= t.endLine)) continue;
+      // The first name has an exact index; the others follow it in the `, b, c` tail.
+      const cols = new Map<string, number>([[m[2], groupStart(m, 2)]]);
+      NAME_RE.lastIndex = 0;
+      const tail = m[3];
+      const tailStart = groupStart(m, 3);
+      for (let n = NAME_RE.exec(tail); n; n = NAME_RE.exec(tail)) if (!cols.has(n[0])) cols.set(n[0], tailStart + n.index);
       for (const name of names) {
         if (NOT_A_TYPE.has(name)) continue;
-        const col = line.indexOf(name, searchFrom + m[1].length);
-        searchFrom = col + name.length;
+        const col = cols.get(name) ?? groupStart(m, 2);
         const key = `${container ?? ''}|${name}|${l}`;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -303,11 +330,11 @@ export function extractLocals(text: string, procs?: PJSymbol[]): PJSymbol[] {
 /** Word under a cursor position, with its column span. */
 export function wordAt(lineText: string, col: number): { word: string; start: number; end: number } | undefined {
   let start = col;
-  while (start > 0 && /\w/.test(lineText[start - 1])) start--;
+  while (start > 0 && /[A-Za-z0-9_$]/.test(lineText[start - 1])) start--;
   let end = col;
-  while (end < lineText.length && /\w/.test(lineText[end])) end++;
+  while (end < lineText.length && /[A-Za-z0-9_$]/.test(lineText[end])) end++;
   if (start === end) return undefined;
   const word = lineText.slice(start, end);
-  if (!/^[A-Za-z_]\w*$/.test(word)) return undefined;
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(word)) return undefined;
   return { word, start, end };
 }

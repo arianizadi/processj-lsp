@@ -4,10 +4,10 @@
  * definition and the lints keep working unchanged, but now with proper scoping.
  */
 import type * as A from './parser/ast';
-import { typeToString } from './parser/ast';
+import { identToString, typeToString } from './parser/ast';
 import type { ParseResult } from './parser/parser';
 import type { PJSymbol } from './symbols';
-import type { CommentToken } from './tokens';
+import type { CommentToken, Token } from './tokens';
 
 export interface AstSymbols {
   symbols: PJSymbol[];
@@ -17,7 +17,7 @@ export interface AstSymbols {
 export function astSymbols(parsed: ParseResult): AstSymbols {
   const symbols: PJSymbol[] = [];
   const locals: PJSymbol[] = [];
-  const docs = new DocFinder(parsed.comments);
+  const docs = new DocFinder(parsed.comments, parsed.tokens);
 
   for (const d of parsed.program.decls) {
     switch (d.kind) {
@@ -49,7 +49,7 @@ export function astSymbols(parsed: ParseResult): AstSymbols {
           startCol: d.name.span.start.col,
           endCol: d.name.span.end.col,
           endLine: d.span.end.line,
-          detail: `record ${d.name.name}${d.extends.length ? ` extends ${d.extends.map((e) => e.name).join(', ')}` : ''}`,
+          detail: `record ${d.name.name}${d.extends.length ? ` extends ${d.extends.map(identToString).join(', ')}` : ''}`,
           doc: docs.above(d.span.start.line),
           children: d.members.map((m) => ({
             name: m.name.name,
@@ -71,7 +71,7 @@ export function astSymbols(parsed: ParseResult): AstSymbols {
           startCol: d.name.span.start.col,
           endCol: d.name.span.end.col,
           endLine: d.span.end.line,
-          detail: `protocol ${d.name.name}${d.extends.length ? ` extends ${d.extends.map((e) => e.name).join(', ')}` : ''}`,
+          detail: `protocol ${d.name.name}${d.extends.length ? ` extends ${d.extends.map(identToString).join(', ')}` : ''}`,
           doc: docs.above(d.span.start.line),
           children: (d.cases ?? []).map((c) => ({
             name: c.name.name,
@@ -178,12 +178,15 @@ function collectLocals(s: A.Stmt, container: string, out: PJSymbol[]): void {
   }
 }
 
+/** Extended rendezvous blocks can sit inside any expression, so walk every child expression. */
 function collectExpr(e: A.Expr, container: string, out: PJSymbol[]): void {
   switch (e.kind) {
     case 'ChanRead':
+      collectExpr(e.target, container, out);
       if (e.extended) collectLocals(e.extended, container, out);
       return;
     case 'AssignExpr':
+      collectExpr(e.target, container, out);
       collectExpr(e.value, container, out);
       return;
     case 'BinaryExpr':
@@ -191,7 +194,49 @@ function collectExpr(e: A.Expr, container: string, out: PJSymbol[]): void {
       collectExpr(e.right, container, out);
       return;
     case 'Invocation':
+      if (e.target) collectExpr(e.target, container, out);
       for (const a of e.args) collectExpr(a, container, out);
+      return;
+    case 'ParenExpr':
+    case 'CastExpr':
+    case 'IsExpr':
+      collectExpr(e.expr, container, out);
+      return;
+    case 'UnaryExpr':
+      collectExpr(e.operand, container, out);
+      return;
+    case 'TernaryExpr':
+      collectExpr(e.cond, container, out);
+      collectExpr(e.then, container, out);
+      collectExpr(e.else, container, out);
+      return;
+    case 'RecordAccess':
+    case 'ChanEnd':
+    case 'Sync':
+      collectExpr(e.target, container, out);
+      return;
+    case 'ArrayAccess':
+      collectExpr(e.target, container, out);
+      collectExpr(e.index, container, out);
+      return;
+    case 'ChanWrite':
+      collectExpr(e.target, container, out);
+      collectExpr(e.value, container, out);
+      return;
+    case 'Timeout':
+      collectExpr(e.target, container, out);
+      collectExpr(e.delay, container, out);
+      return;
+    case 'NewArray':
+      for (const d of e.dimExprs) collectExpr(d, container, out);
+      if (e.init) collectExpr(e.init, container, out);
+      return;
+    case 'ArrayLiteral':
+      for (const x of e.elements) collectExpr(x, container, out);
+      return;
+    case 'RecordLiteral':
+    case 'ProtocolLiteral':
+      for (const f of e.fields) collectExpr(f.value, container, out);
       return;
     default:
       return;
@@ -200,13 +245,27 @@ function collectExpr(e: A.Expr, container: string, out: PJSymbol[]): void {
 
 /** Finds a line-comment run or a block comment that ends directly above a declaration line. */
 class DocFinder {
-  constructor(private readonly comments: CommentToken[]) {}
+  private readonly byEndLine = new Map<number, CommentToken>();
+
+  constructor(comments: CommentToken[], tokens: Token[]) {
+    // A comment that follows code on its line (`int x; // count`) annotates that
+    // code, not the declaration below it. Only comments that open a line count.
+    const firstCodeCol = new Map<number, number>();
+    for (const token of tokens) if (!firstCodeCol.has(token.line)) firstCodeCol.set(token.line, token.col);
+    // `above` is called for every declaration. Indexing once avoids repeatedly
+    // scanning the full comment list (quadratic on generated/documented APIs).
+    for (const comment of comments) {
+      const code = firstCodeCol.get(comment.line);
+      if (code !== undefined && code < comment.col) continue;
+      if (!this.byEndLine.has(comment.endLine)) this.byEndLine.set(comment.endLine, comment);
+    }
+  }
 
   above(line: number): string | undefined {
     let target = line - 1;
     const run: CommentToken[] = [];
     for (;;) {
-      const c = this.comments.find((x) => x.endLine === target);
+      const c = this.byEndLine.get(target);
       if (!c) break;
       run.unshift(c);
       if (c.kind === 'block') break;

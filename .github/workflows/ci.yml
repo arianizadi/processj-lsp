@@ -25,3 +25,24 @@ jobs:
       - run: node --test --test-reporter=spec dist/test/*.test.js
       - name: benchmark (informational)
         run: node scripts/bench.js 1000 10000
+
+  editor-package:
+    name: VS Code package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            vscode/package-lock.json
+      - run: npm run package -- --out processj.vsix
+        working-directory: vscode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: processj-vscode-${{ github.sha }}
+          path: vscode/processj.vsix
+          if-no-files-found: error

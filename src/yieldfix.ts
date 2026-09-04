@@ -5,7 +5,7 @@
  * compiler's line numbers still map onto the editor buffer.
  */
 import { DeclIndex } from './checker/index';
-import { YieldAnalysis } from './checker/yields';
+import { YieldAnalysis, yieldAnnotationEdit } from './checker/yields';
 import { parse } from './parser/parser';
 
 export function withYieldAnnotations(text: string): string {
@@ -15,13 +15,15 @@ export function withYieldAnnotations(text: string): string {
   index.addProgram(parsed.program);
   const procs = new YieldAnalysis(index).needingAnnotation(parsed.program);
   if (procs.length === 0) return text;
-  const lines = text.split('\n');
-  // Insert from the bottom up so earlier positions stay valid.
-  for (const d of procs.sort((a, b) => b.body!.span.start.line - a.body!.span.start.line || b.body!.span.start.col - a.body!.span.start.col)) {
-    const { line, col } = d.body!.span.start;
-    const l = lines[line];
+  // Split keeps the line terminators at the odd indices, so any mix of LF, CRLF
+  // and CR round-trips unchanged.
+  const parts = text.split(/(\r\n|\r|\n)/);
+  const edits = procs.map(yieldAnnotationEdit).sort((a, b) => b.line - a.line || b.col - a.col);
+  // Apply from the bottom up (and right to left) so earlier positions stay valid.
+  for (const { line, col, text: insert } of edits) {
+    const l = parts[line * 2];
     if (l === undefined) continue;
-    lines[line] = l.slice(0, col) + '[yield=true] ' + l.slice(col);
+    parts[line * 2] = l.slice(0, col) + insert + l.slice(col);
   }
-  return lines.join('\n');
+  return parts.join('');
 }

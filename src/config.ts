@@ -70,7 +70,7 @@ export function findInstall(opts: InstallOptions = {}): Install | { error: strin
     .map((c) => path.resolve(expandHome(c, home)));
 
   for (const dir of candidates) {
-    if (isInstallDir(dir)) return buildInstall(dir, opts.javaBin, env);
+    if (isInstallDir(dir)) return buildInstall(dir, opts.javaBin ? expandHome(opts.javaBin, home) : undefined, env);
   }
 
   if (candidates.length === 0) {

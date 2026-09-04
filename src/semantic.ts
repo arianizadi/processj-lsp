@@ -36,12 +36,16 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
     if (s.start.line !== s.end.line || s.end.col <= s.start.col) return;
     toks.push({ line: s.start.line, col: s.start.col, len: s.end.col - s.start.col, type: typeIdx(type), mods: modBits(...mods) });
   };
+  const addQualified = (id: A.Ident, type: TokenType, ...mods: Modifier[]): void => {
+    for (const q of id.qualifier ?? []) add(q, 'namespace');
+    add(id, type, ...mods);
+  };
   const typeNode = (t: A.TypeNode): void => {
     switch (t.kind) {
       case 'NamedType': {
         const n = t.name.name;
-        if (index.protocols.has(n)) add(t.name, 'enum');
-        else add(t.name, 'struct');
+        if (index.protocols.has(n)) addQualified(t.name, 'enum');
+        else addQualified(t.name, 'struct');
         return;
       }
       case 'ArrayType':
@@ -92,7 +96,7 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
         return;
       case 'IsExpr':
         expr(e.expr);
-        add(e.typeName, 'enumMember');
+        addQualified(e.typeName, 'enumMember');
         return;
       case 'Invocation': {
         if (e.target) expr(e.target);
@@ -136,14 +140,14 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
         for (const x of e.elements) expr(x);
         return;
       case 'RecordLiteral':
-        add(e.typeName, 'struct');
+        addQualified(e.typeName, 'struct');
         for (const f of e.fields) {
           add(f.name, 'property');
           expr(f.value);
         }
         return;
       case 'ProtocolLiteral':
-        add(e.typeName, 'enum');
+        addQualified(e.typeName, 'enum');
         add(e.tag, 'enumMember');
         for (const f of e.fields) {
           add(f.name, 'property');
@@ -151,7 +155,7 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
         }
         return;
       case 'NewMobile':
-        add(e.typeName, 'function');
+        addQualified(e.typeName, 'function');
         return;
     }
   };
@@ -247,12 +251,12 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
           typeNode(p.type);
           add(p.name, 'parameter', 'declaration');
         }
-        for (const i of d.implements) add(i, 'type');
+        for (const i of d.implements) addQualified(i, 'type');
         if (d.body) block(d.body);
         break;
       case 'RecordDecl':
         add(d.name, 'struct', 'declaration');
-        for (const e of d.extends) add(e, 'struct');
+        for (const e of d.extends) addQualified(e, 'struct');
         for (const m of d.members) {
           typeNode(m.type);
           add(m.name, 'property', 'declaration');
@@ -260,7 +264,7 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
         break;
       case 'ProtocolDecl':
         add(d.name, 'enum', 'declaration');
-        for (const e of d.extends) add(e, 'enum');
+        for (const e of d.extends) addQualified(e, 'enum');
         for (const c of d.cases ?? []) {
           add(c.name, 'enumMember', 'declaration');
           for (const m of c.members) {

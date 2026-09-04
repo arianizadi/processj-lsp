@@ -112,12 +112,14 @@ export function parseCompilerOutput(stdout: string, stderr: string): ParsedOutpu
         source: 'bugmanager',
       };
       let j = i + 1;
+      while (j < lines.length && lines[j].trim() === '') j++;
       const loc = /^\[\+\]\s+(.*?):(\d+)\s*$/.exec(lines[j] ?? '');
       if (loc) {
         d.file = loc[1];
         d.line = Number(loc[2]) - 1;
         j++;
       }
+      while (j < lines.length && lines[j].trim() === '') j++;
       const tok = /^\s*###\s+Token:\s+'(.*)',\s+line\s+(\d+)\s+\[(\d+):(\d+)\]/.exec(lines[j] ?? '');
       if (tok) {
         d.line = Number(tok[2]) - 1;
@@ -164,17 +166,27 @@ export function parseCompilerOutput(stdout: string, stderr: string): ParsedOutpu
 
   // 5. Failure with nothing parseable: surface the last meaningful line.
   if (!succeeded && diagnostics.length === 0) {
-    const tail = lines
+    // Launch failures (missing Java, a bad classpath, permissions) are normally
+    // written only to stderr. Include it here instead of reporting the much less
+    // useful "failed without a message".
+    const tail = [...lines, ...err.split(/\r?\n/)]
       .map((l) => l.trim())
       .filter((l) => l && !PROGRESS_LINE.test(l))
       .pop();
-    diagnostics.push({
-      line: 0,
-      message: tail ? `ProcessJ compiler failed: ${tail}` : 'ProcessJ compiler failed without a message',
-      severity: 'error',
-      code: 'unknown',
-      source: 'lsp',
-    });
+    // Some legacy printers emit `file:LINE: message` with no error number at all
+    // (casts, modifiers, a few name-checker paths): keep the line they name.
+    const located = tail ? /^(.+?):(\d+): (.+)$/.exec(tail) : null;
+    if (located) {
+      diagnostics.push({ file: located[1], line: Number(located[2]) - 1, message: located[3].trim(), severity: 'error', source: 'legacy' });
+    } else {
+      diagnostics.push({
+        line: 0,
+        message: tail ? `ProcessJ compiler failed: ${tail}` : 'ProcessJ compiler failed without a message',
+        severity: 'error',
+        code: 'unknown',
+        source: 'lsp',
+      });
+    }
   }
 
   return { diagnostics: dedupe(diagnostics), succeeded, crash };
@@ -185,7 +197,9 @@ function dedupe(diags: RawDiagnostic[]): RawDiagnostic[] {
   const seen = new Set<string>();
   const out: RawDiagnostic[] = [];
   for (const d of diags) {
-    const key = `${d.line}|${d.startCol ?? ''}|${d.message}`;
+    // Imported files can produce identical messages at identical coordinates.
+    // They must remain distinct because the server prefixes each with its file.
+    const key = `${d.file ?? ''}|${d.line}|${d.startCol ?? ''}|${d.endCol ?? ''}|${d.message}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(d);

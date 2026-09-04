@@ -9,6 +9,7 @@
 import { KEYWORDS, PRIMITIVE_TYPES } from '../keywords';
 import { tokenize, type CommentToken, type LexIssue, type Token } from '../tokens';
 import type * as A from './ast';
+import { identToString, qualifierToString } from './ast';
 
 export interface ParseResult {
   program: A.Program;
@@ -22,6 +23,8 @@ const PRIMITIVES = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', '
 const MODIFIERS = new Set(['public', 'private', 'protected', 'native', 'mobile', 'const']);
 const ASSIGN_OPS = new Set(['=', '*=', '/=', '%=', '+=', '-=', '<<=', '>>=', '>>>=', '&=', '^=', '|=']);
 const TYPE_KEYWORDS = ['chan', 'shared', ...PRIMITIVE_TYPES];
+/** Expression/block nesting beyond which the parser gives up rather than overflow the stack. */
+const MAX_NESTING = 400;
 const TOP_LEVEL_KEYWORDS = ['public', 'private', 'protected', 'native', 'mobile', 'const', 'record', 'protocol', 'extern', 'import', 'package', 'void', ...TYPE_KEYWORDS];
 
 const BINARY_PRECEDENCE: Record<string, number> = {
@@ -58,33 +61,68 @@ export function parse(text: string): ParseResult {
 export function editDistance(a: string, b: string): number {
   const m = a.length;
   const n = b.length;
-  const d: number[][] = Array.from({ length: m + 1 }, (_, i) => {
-    const row = new Array<number>(n + 1).fill(0);
-    row[0] = i;
-    return row;
-  });
-  for (let j = 0; j <= n; j++) d[0][j] = j;
+  let twoBack = new Array<number>(n + 1).fill(0);
+  let previous = Array.from({ length: n + 1 }, (_, j) => j);
+  let current = new Array<number>(n + 1).fill(0);
   for (let i = 1; i <= m; i++) {
+    current[0] = i;
     for (let j = 1; j <= n; j++) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
-      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) current[j] = Math.min(current[j], twoBack[j - 2] + 1);
     }
+    const reusable = twoBack;
+    twoBack = previous;
+    previous = current;
+    current = reusable;
   }
-  return d[m][n];
+  return previous[n];
+}
+
+/** Return the distance when it is at most `limit`, otherwise `limit + 1`. */
+function boundedEditDistance(a: string, b: string, limit: number): number {
+  const m = a.length;
+  const n = b.length;
+  const beyond = limit + 1;
+  if (Math.abs(m - n) > limit) return beyond;
+
+  let twoBack = new Array<number>(n + 1).fill(beyond);
+  let previous = Array.from({ length: n + 1 }, (_, j) => (j <= limit ? j : beyond));
+  let current = new Array<number>(n + 1).fill(beyond);
+  for (let i = 1; i <= m; i++) {
+    current.fill(beyond);
+    if (i <= limit) current[0] = i;
+    const from = Math.max(1, i - limit);
+    const to = Math.min(n, i + limit);
+    for (let j = from; j <= to; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost, beyond);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) current[j] = Math.min(current[j], twoBack[j - 2] + 1);
+    }
+    const reusable = twoBack;
+    twoBack = previous;
+    previous = current;
+    current = reusable;
+  }
+  return previous[n] <= limit ? previous[n] : beyond;
 }
 
 export function suggest(word: string, candidates: Iterable<string>): string | undefined {
   if (word.length < 2) return undefined;
+  const normalized = word.toLowerCase();
+  const limit = word.length <= 4 ? 1 : 2;
   let best: string | undefined;
   let bestD = Infinity;
   for (const c of candidates) {
     if (c === word) continue;
-    const d = editDistance(word.toLowerCase(), c.toLowerCase());
-    const limit = word.length <= 4 ? 1 : 2;
-    if (d <= limit && d < bestD) {
+    const candidate = c.toLowerCase();
+    if (Math.abs(candidate.length - normalized.length) > limit) continue;
+    const threshold = bestD === Infinity ? limit : Math.min(limit, bestD - 1);
+    const d = boundedEditDistance(normalized, candidate, threshold);
+    if (d <= threshold) {
       best = c;
       bestD = d;
+      if (d === 0) return best;
     }
   }
   return best;
@@ -94,6 +132,7 @@ class Parser {
   private i = 0;
   readonly errors: A.ParseError[] = [];
   private lastErrorTok = -1;
+  private nesting = 0;
   private readonly declaredTypes = new Set<string>();
   private readonly eof: Token;
 
@@ -101,7 +140,7 @@ class Parser {
     private readonly toks: Token[],
     text: string,
   ) {
-    const lines = text.split('\n');
+    const lines = text.split(/\r\n|\r|\n/);
     const lastLine = Math.max(0, lines.length - 1);
     this.eof = { kind: 'punct', text: '<end of file>', line: lastLine, col: lines[lastLine]?.length ?? 0, end: lines[lastLine]?.length ?? 0 };
     // Pre-scan declared record/protocol names so unknown types can be told apart from typos.
@@ -220,7 +259,38 @@ class Parser {
   }
 
   private span(start: A.Pos): A.Span {
-    return { start, end: this.endPos() };
+    const end = this.endPos();
+    // A synthetic node that consumed nothing must not end before it starts.
+    if (end.line < start.line || (end.line === start.line && end.col < start.col)) return { start, end: start };
+    return { start, end };
+  }
+
+  /** True at a token that can only begin a top-level declaration and sits at column 0 on its own line. */
+  private atUnindentedDeclaration(): boolean {
+    const t = this.peek();
+    if (t === this.eof || t.col !== 0 || t.kind !== 'keyword') return false;
+    return t.text === 'void' || t.text === 'record' || t.text === 'protocol' || t.text === 'extern' || t.text === 'public' || t.text === 'private' || t.text === 'protected' || t.text === 'native';
+  }
+
+  /** After a broken top-level declaration: skip to its `;`, but never past the start of the next declaration. */
+  private skipToNextDeclaration(): void {
+    let depth = 0;
+    while (!this.atEof()) {
+      const t = this.peek();
+      if (depth === 0 && t.line > this.endPos().line && (this.atUnindentedDeclaration() || (t.kind === 'keyword' && MODIFIERS.has(t.text)) || this.atTypeStart())) return;
+      if (t.kind === 'punct') {
+        if (t.text === '{' || t.text === '(' || t.text === '[') depth++;
+        else if (t.text === '}' || t.text === ')' || t.text === ']') {
+          if (depth === 0) {
+            this.next();
+            return;
+          }
+          depth--;
+        }
+      }
+      this.next();
+      if (depth === 0 && t.text === ';') return;
+    }
   }
 
   /** Skip tokens until one of `stops` at bracket depth 0 (the stop token itself is not consumed). */
@@ -301,9 +371,15 @@ class Parser {
 
   private parsePragma(): A.Pragma {
     const start = this.startPos();
-    this.next(); // '#'
+    const hash = this.next(); // '#'
     if (this.peek().text !== 'pragma') this.error(this.peek(), `Expected 'pragma' after '#' but found ${this.describe(this.peek())}`);
-    else this.next();
+    else {
+      const pragma = this.peek();
+      if (pragma.line !== hash.line || pragma.col !== hash.end) {
+        this.error(pragma, "ProcessJ requires '#pragma' with no whitespace between '#' and 'pragma'");
+      }
+      this.next();
+    }
     const name = this.expectIdent('a pragma name');
     let value: string | undefined;
     if (this.peek().kind === 'string') value = this.next().text;
@@ -318,6 +394,32 @@ class Parser {
       parts.push(this.ident(this.next()));
     }
     return parts;
+  }
+
+  /** Number of tokens in an identifier or `pkg.path::identifier` starting at `k`. */
+  private qualifiedNameLength(k = 0): number {
+    if (!this.atIdent(k)) return 0;
+    let j = k + 1;
+    if (this.at('::', j) && this.atIdent(j + 1)) return 3;
+    let dotted = false;
+    while (this.at('.', j) && this.atIdent(j + 1)) {
+      dotted = true;
+      j += 2;
+    }
+    return dotted && this.at('::', j) && this.atIdent(j + 1) ? j + 2 - k : 1;
+  }
+
+  /** Parse CUP's `type_name`: a bare name or a dotted package followed by `::name`. */
+  private parseTypeName(what: string): A.Ident {
+    const length = this.qualifiedNameLength();
+    const first = this.expectIdent(what);
+    if (length <= 1 || first.name === '<missing>') return first;
+    const qualifier = [first];
+    while (this.accept('.')) qualifier.push(this.ident(this.next()));
+    this.expect('::', `before ${what}`);
+    const name = this.expectIdent(what);
+    name.qualifier = qualifier;
+    return name;
   }
 
   private parseImport(): A.Import {
@@ -389,14 +491,23 @@ class Parser {
       return undefined;
     }
 
+    const typeToken = this.peek();
     const type = this.parseType(true);
     const name = this.expectIdent('a name after the type');
 
+    if (type.kind === 'ArrayType' && containsVoid(type)) {
+      this.error(typeToken, "'void' cannot be an array element type; only a procedure may use bare 'void' as its return type");
+    }
+
     if (this.at('(')) return this.parseProcRest(modifiers, type, name, start);
+
+    if (type.kind === 'PrimitiveType' && type.name === 'void') {
+      this.error(typeToken, "'void' can only be the return type of a procedure; it cannot declare a constant");
+    }
 
     // Constant declaration.
     const declarators = this.parseDeclarators(name);
-    if (!this.expect(';', 'after the constant declaration')) this.skipTo([';', '}'], true);
+    if (!this.expect(';', 'after the constant declaration')) this.skipToNextDeclaration();
     return { kind: 'ConstDecl', modifiers, type, declarators, span: this.span(start) };
   }
 
@@ -423,11 +534,14 @@ class Parser {
       }
     }
     this.expect(')', 'to close the parameter list');
+    const headerEnd = this.endPos();
+    const annotationStart = this.at('[') ? this.startPos() : undefined;
     const annotations = this.parseAnnotations();
+    const annotationsSpan = annotationStart ? this.span(annotationStart) : undefined;
     const impls: A.Ident[] = [];
     if (this.accept('implements')) {
-      impls.push(this.expectIdent('an interface name'));
-      while (this.accept(',')) impls.push(this.expectIdent('an interface name'));
+      impls.push(this.parseTypeName('a procedure name'));
+      while (this.accept(',')) impls.push(this.parseTypeName('a procedure name'));
     }
     let body: A.Block | undefined;
     if (this.at('{')) body = this.parseBlock();
@@ -438,7 +552,7 @@ class Parser {
       if (this.at('{')) body = this.parseBlock();
       else this.accept(';');
     }
-    return { kind: 'ProcDecl', modifiers, returnType, name, params, annotations, implements: impls, body, span: this.span(start) };
+    return { kind: 'ProcDecl', modifiers, returnType, name, params, annotations, annotationsSpan, implements: impls, body, headerEnd, span: this.span(start) };
   }
 
   private parseAnnotations(): A.Annotation[] {
@@ -448,7 +562,11 @@ class Parser {
     for (;;) {
       const name = this.expectIdent('an annotation name');
       this.expect('=', 'in the annotation');
-      const v = this.next();
+      const v = this.peek();
+      if (!(v.kind === 'ident' || v.kind === 'number' || (v.kind === 'keyword' && (v.text === 'true' || v.text === 'false')))) {
+        this.error(v, `Annotation '${name.name}' needs an identifier, boolean, or numeric value; found ${this.describe(v)}`);
+      }
+      if (!this.atEof()) this.next();
       out.push({ name: name.name, value: v.text });
       if (this.accept(',')) continue;
       break;
@@ -460,8 +578,8 @@ class Parser {
   private parseExtends(): A.Ident[] {
     const out: A.Ident[] = [];
     if (this.accept('extends')) {
-      out.push(this.expectIdent("a type name after 'extends'"));
-      while (this.accept(',')) out.push(this.expectIdent('a type name'));
+      out.push(this.parseTypeName("a type name after 'extends'"));
+      while (this.accept(',')) out.push(this.parseTypeName('a type name'));
     }
     return out;
   }
@@ -514,6 +632,7 @@ class Parser {
     if (this.accept(';')) return { kind: 'ProtocolDecl', modifiers, name, extends: ext, annotations, span: this.span(start) };
     const cases: A.ProtocolCase[] = [];
     if (this.expect('{', `to start the body of protocol '${name.name}'`)) {
+      if (this.at('}')) this.error(this.peek(), `Protocol '${name.name}' must declare at least one case; use ';' instead of an empty body for a forward declaration`);
       while (!this.at('}') && !this.atEof()) {
         const before = this.i;
         const cstart = this.startPos();
@@ -521,7 +640,9 @@ class Parser {
         if (!this.expect(':', `after protocol case '${tag.name}'`)) {
           this.skipTo(['{', '}']);
         }
-        const members = this.at('{') ? this.parseMemberBody(`protocol case '${tag.name}'`) : [];
+        let members: A.Field[] = [];
+        if (this.at('{')) members = this.parseMemberBody(`protocol case '${tag.name}'`);
+        else this.error(this.peek(), `Protocol case '${tag.name}' needs a body in braces, even when it has no fields`);
         cases.push({ kind: 'ProtocolCase', name: tag, members, span: this.span(cstart) });
         if (this.i === before) this.next();
       }
@@ -562,10 +683,10 @@ class Parser {
     const t = this.peek();
     if (t.kind === 'keyword') return PRIMITIVES.has(t.text) || t.text === 'chan' || t.text === 'shared' || t.text === 'const' || t.text === 'mobile';
     if (t.kind !== 'ident') return false;
-    const n = this.peek(1);
-    if (n.kind === 'ident') return true;
-    if (n.text === '[' && this.peek(2).text === ']') return true;
-    return false;
+    let k = this.qualifiedNameLength();
+    if (k === 0) return false;
+    while (this.at('[', k) && this.at(']', k + 1)) k += 2;
+    return this.atIdent(k);
   }
 
   private parseDims(): number {
@@ -593,13 +714,16 @@ class Parser {
     } else if (t.text === 'shared' || t.text === 'chan') {
       base = this.parseChanType();
     } else if (t.kind === 'ident') {
-      this.next();
-      base = { kind: 'NamedType', name: this.ident(t), span: this.spanOf(t) };
+      const name = this.parseTypeName('a type name');
+      base = { kind: 'NamedType', name, span: this.span(start) };
     } else {
       this.error(t, `Expected a type but found ${this.describe(t)}`);
       base = { kind: 'NamedType', name: { kind: 'Ident', name: '<missing>', span: this.spanOf(t) }, span: this.spanOf(t) };
     }
     const dims = this.parseDims();
+    if (base.kind === 'NamedType' && base.name.qualifier?.length && dims === 0) {
+      this.error(t, `A package-qualified named type must be an array in this compiler grammar; '${identToString(base.name)}[]' is valid, but '${identToString(base.name)}' is not`);
+    }
     if (dims > 0) return { kind: 'ArrayType', elem: base, dims, span: this.span(start) };
     return base;
   }
@@ -625,8 +749,10 @@ class Parser {
     }
     let end: 'read' | 'write' | undefined;
     if (this.at('.') && (this.at('read', 1) || this.at('write', 1))) {
+      const dot = this.peek();
       this.next();
       end = this.next().text as 'read' | 'write';
+      if (sharedEnd) this.error(dot, `'shared ${sharedEnd} chan<...>' already selects which side is shared and cannot also be a channel-end type; use 'shared chan<...>.${end}' for a shared end`);
     }
     return { kind: 'ChanType', elem, shared, sharedEnd, end, span: this.span(start) };
   }
@@ -639,13 +765,33 @@ class Parser {
     const start = this.startPos();
     const open = this.next(); // '{'
     const stmts: A.Stmt[] = [];
+    if (this.nesting > MAX_NESTING) {
+      this.error(open, 'Blocks nested too deeply');
+      this.skipTo(['}'], true);
+      return { kind: 'Block', stmts, span: this.span(start) };
+    }
+    this.nesting++;
+    try {
+      return this.parseBlockBody(start, open, stmts);
+    } finally {
+      this.nesting--;
+    }
+  }
+
+  private parseBlockBody(start: A.Pos, open: Token, stmts: A.Stmt[]): A.Block {
     while (!this.at('}')) {
       if (this.atEof()) {
         this.error(this.eof, `Missing '}' to close the block opened at line ${open.line + 1}`);
         break;
       }
+      if (this.atUnindentedDeclaration()) {
+        // The next declaration has started: this block was never closed. Leave
+        // the token for the top level so the declaration is still parsed.
+        this.errorAfterPrevious(`Missing '}' to close the block opened at line ${open.line + 1}`, '}');
+        return { kind: 'Block', stmts, span: this.span(start) };
+      }
       const before = this.i;
-      const s = this.parseStatement();
+      const s = this.parseStatement(true);
       if (s) stmts.push(s);
       if (this.i === before) {
         const t = this.next();
@@ -656,7 +802,7 @@ class Parser {
     return { kind: 'Block', stmts, span: this.span(start) };
   }
 
-  private parseStatement(): A.Stmt | undefined {
+  private parseStatement(allowDeclaration = false): A.Stmt | undefined {
     const start = this.startPos();
     const t = this.peek();
 
@@ -756,6 +902,9 @@ class Parser {
     }
 
     if (this.atLocalDeclStart()) {
+      if (!allowDeclaration) {
+        this.error(this.peek(), 'A variable declaration cannot be used as a single substatement; wrap it in a block with braces');
+      }
       const decl = this.parseLocalDecl();
       this.expect(';', 'after the variable declaration');
       return decl;
@@ -775,14 +924,17 @@ class Parser {
   /** Report a misspelled keyword, then parse the statement as if it had been spelled right so its body is still checked. */
   private retryAsKeyword(t: Token, keyword: string): A.Stmt | undefined {
     this.error(t, `Unknown statement '${t.text}'; did you mean '${keyword}'?`, this.replaceFix(t, keyword, `Change to '${keyword}'`));
-    this.next();
-    this.toks.splice(this.i, 0, { kind: 'keyword', text: keyword, line: t.line, col: t.col, end: t.end });
+    // Re-read the misspelled word as the keyword in place: no phantom token is
+    // left behind for the callers that inspect the token stream afterwards.
+    this.toks[this.i] = { kind: 'keyword', text: keyword, line: t.line, col: t.col, end: t.end };
     return this.parseStatement();
   }
 
   private parseExpressionStatement(): A.Stmt | undefined {
     const start = this.startPos();
     const startTok = this.peek();
+    const errorsBefore = this.errors.length;
+    const lastErrorBefore = this.lastErrorTok;
     const expr = this.parseExpression();
     if (expr.kind === 'ErrorExpr') {
       this.skipTo([';', '}'], false);
@@ -794,6 +946,8 @@ class Parser {
       const s = suggest(expr.name.name, ['if', 'while', 'for', 'switch', 'claim', 'alt']);
       if (s) {
         this.i = this.indexOfToken(expr.span.start);
+        this.errors.length = errorsBefore;
+        this.lastErrorTok = lastErrorBefore;
         return this.retryAsKeyword(this.peek(), s);
       }
       this.error(this.peek(), `Unexpected '{' after the call to '${expr.name.name}'; a call ends with ';'`);
@@ -820,13 +974,16 @@ class Parser {
   private parseLocalDecl(): A.LocalDecl {
     const start = this.startPos();
     const isConst = !!this.accept('const');
-    const isMobile = !!this.accept('mobile');
+    const mobile = this.accept('mobile');
+    const isMobile = !!mobile;
+    if (isConst && mobile) this.error(mobile, "A local declaration cannot be both 'const' and 'mobile'");
     const typeTok = this.peek();
     const type = this.parseType();
-    // `retrun x;` or `itn y = 2;`: a lower-case type name that is one typo away from a keyword.
-    // Capitalised names are left alone: they may be records imported from another file.
-    if (type.kind === 'NamedType' && !this.declaredTypes.has(type.name.name) && /^[a-z]/.test(type.name.name)) {
-      const s = suggest(type.name.name, [...TYPE_KEYWORDS, 'return', 'break', 'continue']);
+    // `retrun x;`: a lower-case "type" that is one typo away from a statement keyword.
+    // Other unknown names (including `itn`) are left to the checker, which knows the
+    // imported types too; a lower-case record from another file is valid here.
+    if (type.kind === 'NamedType' && !type.name.qualifier?.length && !this.declaredTypes.has(type.name.name) && /^[a-z]/.test(type.name.name)) {
+      const s = suggest(type.name.name, ['return', 'break', 'continue']);
       if (s) this.error(typeTok, `Unknown type '${type.name.name}'; did you mean '${s}'?`, this.replaceFix(typeTok, s, `Change to '${s}'`));
     }
     const declarators = this.parseDeclarators();
@@ -842,9 +999,11 @@ class Parser {
   }
 
   private parseCondition(owner: string): A.Expr {
-    if (!this.expect('(', `after '${owner}'`)) return { kind: 'ErrorExpr', span: this.span(this.startPos()) };
+    const open = this.expect('(', `after '${owner}'`);
+    if (!open && this.at('{')) return { kind: 'ErrorExpr', span: this.span(this.startPos()) };
     const e = this.parseExpression();
-    this.expect(')', `to close the '${owner}' condition`);
+    if (open) this.expect(')', `to close the '${owner}' condition`);
+    else this.accept(')');
     return e;
   }
 
@@ -876,7 +1035,11 @@ class Parser {
       if (this.accept('(')) {
         barrierParens = true;
         barriers.push(this.parseExpression());
-        while (this.accept(',')) barriers.push(this.parseExpression());
+        while (this.at(',')) {
+          const comma = this.next();
+          this.error(comma, "A parenthesised 'par enroll' accepts one barrier only; write 'par enroll a, b' without parentheses");
+          barriers.push(this.parseExpression());
+        }
         this.expect(')', "to close the 'enroll' list");
       } else {
         barriers.push(this.parseExpression());
@@ -897,8 +1060,16 @@ class Parser {
     if (!this.at(';')) {
       if (this.atLocalDeclStart()) init = this.parseLocalDecl();
       else {
-        init = [this.parseExpression()];
-        while (this.accept(',')) init.push(this.parseExpression());
+        const first = this.peek();
+        const expr = this.parseExpression();
+        this.checkForStatementExpression(expr, first, owner, 'initialiser');
+        init = [expr];
+        while (this.accept(',')) {
+          const tok = this.peek();
+          const next = this.parseExpression();
+          this.checkForStatementExpression(next, tok, owner, 'initialiser');
+          init.push(next);
+        }
       }
     }
     this.expect(';', `after the initialiser in '${owner}'`);
@@ -906,10 +1077,24 @@ class Parser {
     this.expect(';', `after the condition in '${owner}'`);
     const update: A.Expr[] = [];
     if (!this.at(')')) {
-      update.push(this.parseExpression());
-      while (this.accept(',')) update.push(this.parseExpression());
+      const first = this.peek();
+      const expr = this.parseExpression();
+      this.checkForStatementExpression(expr, first, owner, 'update');
+      update.push(expr);
+      while (this.accept(',')) {
+        const tok = this.peek();
+        const next = this.parseExpression();
+        this.checkForStatementExpression(next, tok, owner, 'update');
+        update.push(next);
+      }
     }
     return { init, cond, update };
+  }
+
+  /** CUP permits only assignments, ++/--, calls and reads in a for/replicated-alt expression list. */
+  private checkForStatementExpression(expr: A.Expr, token: Token, owner: string, part: 'initialiser' | 'update'): void {
+    if (isForStatementExpr(expr)) return;
+    this.error(token, `The ${part} of '${owner}' must be an assignment, ++/--, procedure call, or channel read; ${describeExpr(expr)} has no effect`);
   }
 
   private parseFor(): A.ForStmt {
@@ -981,10 +1166,11 @@ class Parser {
         const stmts: A.Stmt[] = [];
         while (!this.at('case') && !this.at('default') && !this.at('}') && !this.atEof()) {
           const sb = this.i;
-          const s = this.parseStatement();
+          const s = this.parseStatement(true);
           if (s) stmts.push(s);
           if (this.i === sb) this.next();
         }
+        if (stmts.length === 0) this.error(this.peek(), "A switch 'case' or 'default' must contain at least one statement");
         groups.push({ kind: 'SwitchGroup', labels, stmts, span: this.span(gstart) });
       }
       this.expect('}', "to close the 'switch' block");
@@ -1010,6 +1196,7 @@ class Parser {
       return { kind: 'AltStmt', isPri, replicated, cases, span: this.span(start) };
     }
     const open = this.next();
+    if (this.at('}')) this.error(this.peek(), `${isPri ? "A 'pri alt'" : "An 'alt'"} must contain at least one guard`);
     while (!this.at('}')) {
       if (this.atEof()) {
         this.error(this.eof, `Missing '}' to close the alt opened at line ${open.line + 1}`);
@@ -1065,6 +1252,20 @@ class Parser {
 
   private parseExpression(): A.Expr {
     const start = this.startPos();
+    if (this.nesting > MAX_NESTING) {
+      // Deeper than any real program: bail out instead of overflowing the stack.
+      this.error(this.peek(), 'Expression nested too deeply');
+      return { kind: 'ErrorExpr', span: this.span(start) };
+    }
+    this.nesting++;
+    try {
+      return this.parseExpressionInner(start);
+    } finally {
+      this.nesting--;
+    }
+  }
+
+  private parseExpressionInner(start: A.Pos): A.Expr {
     const lhs = this.parseTernary();
     const t = this.peek();
     if (t.kind === 'punct' && ASSIGN_OPS.has(t.text)) {
@@ -1072,7 +1273,12 @@ class Parser {
         this.error(t, `Cannot assign to ${describeExpr(lhs)}; the left side must be a variable, field or array element`);
       }
       this.next();
-      const value = this.at('{') ? this.parseArrayLiteral() : this.parseExpression();
+      let value: A.Expr;
+      if (this.at('{')) {
+        const brace = this.peek();
+        this.error(brace, 'An array literal can only initialise a declaration or follow a new array type; it cannot be assigned later');
+        value = this.parseArrayLiteral();
+      } else value = this.parseExpression();
       return { kind: 'AssignExpr', op: t.text, target: lhs, value, span: this.span(start) };
     }
     return lhs;
@@ -1100,7 +1306,7 @@ class Parser {
       if (prec === undefined || prec < minPrec) break;
       this.next();
       if (op === 'is') {
-        const typeName = this.expectIdent("a protocol case name after 'is'");
+        const typeName = this.parseTypeName("a protocol case name after 'is'");
         left = { kind: 'IsExpr', expr: left, typeName, span: this.span(start) };
         continue;
       }
@@ -1121,7 +1327,16 @@ class Parser {
       }
       if (t.text === '(' && this.isCastAhead()) {
         this.next();
-        const type = this.parseType();
+        const typeToken = this.peek();
+        let type: A.TypeNode;
+        // CUP parses a named cast through `expression`, so this is one of the
+        // positions where a scalar package-qualified name is legal.
+        if (this.peek().kind === 'ident') {
+          const typeStart = this.startPos();
+          const name = this.parseTypeName('a type name in the cast');
+          type = { kind: 'NamedType', name, span: this.span(typeStart) };
+        } else type = this.parseType();
+        if (type.kind === 'ArrayType') this.error(typeToken, 'Array casts are not accepted by the ProcessJ grammar');
         this.expect(')', 'to close the cast');
         const expr = this.parseUnary();
         return { kind: 'CastExpr', type, expr, span: this.span(start) };
@@ -1133,18 +1348,21 @@ class Parser {
   /** `(int) x` is always a cast; `(Name) x` is a cast only when followed by an operand that cannot continue an expression. */
   private isCastAhead(): boolean {
     const t1 = this.peek(1);
-    const t2 = this.peek(2);
     if (t1.kind === 'keyword' && PRIMITIVES.has(t1.text)) {
       // (int) x  or  (int[]) x
       let k = 2;
       while (this.peek(k).text === '[' && this.peek(k + 1).text === ']') k += 2;
       return this.peek(k).text === ')';
     }
-    if (t1.kind === 'ident' && t2.text === ')') {
-      const t3 = this.peek(3);
-      if (t3.kind === 'ident' || t3.kind === 'number' || t3.kind === 'string' || t3.kind === 'char') return true;
-      if (t3.kind === 'keyword') return t3.text === 'new' || t3.text === 'true' || t3.text === 'false' || t3.text === 'null' || t3.text === 'fork';
-      if (t3.kind === 'punct') return t3.text === '(' || t3.text === '!' || t3.text === '~';
+    if (t1.kind === 'ident') {
+      const nameLength = this.qualifiedNameLength(1);
+      const close = 1 + nameLength;
+      if (nameLength > 0 && this.peek(close).text === ')') {
+        const operand = this.peek(close + 1);
+        if (operand.kind === 'ident' || operand.kind === 'number' || operand.kind === 'string' || operand.kind === 'char') return true;
+        if (operand.kind === 'keyword') return operand.text === 'new' || operand.text === 'true' || operand.text === 'false' || operand.text === 'null' || operand.text === 'fork';
+        if (operand.kind === 'punct') return operand.text === '(' || operand.text === '!' || operand.text === '~';
+      }
     }
     return false;
   }
@@ -1212,13 +1430,14 @@ class Parser {
         continue;
       }
       if (this.at('::') && this.atIdent(1)) {
-        this.next();
+        const separator = this.next();
         const name = this.ident(this.next());
-        const qualifier = e.kind === 'NameExpr' ? [...(e.qualifier ?? []), e.name] : [];
+        const qualifier = packageQualifier(e);
+        if (!qualifier) this.error(separator, "Only a dotted package name may appear before '::'");
         if (this.at('(')) {
           const args = this.parseArgs();
-          e = { kind: 'Invocation', qualifier, name, args, span: this.span(start) };
-        } else e = { kind: 'NameExpr', qualifier, name, span: this.span(start) };
+          e = { kind: 'Invocation', qualifier: qualifier ?? [], name, args, span: this.span(start) };
+        } else e = { kind: 'NameExpr', qualifier: qualifier ?? [], name, span: this.span(start) };
         continue;
       }
       if (this.at('++') || this.at('--')) {
@@ -1256,6 +1475,10 @@ class Parser {
     while (!this.at('}') && !this.atEof()) {
       elements.push(this.at('{') ? this.parseArrayLiteral() : this.parseExpression());
       if (!this.accept(',')) break;
+      if (this.at('}')) {
+        this.error(this.peek(), 'Trailing commas are not accepted in an array initializer');
+        break;
+      }
     }
     this.expect('}', 'to close the array initialiser');
     return { kind: 'ArrayLiteral', elements, span: this.span(start) };
@@ -1267,8 +1490,7 @@ class Parser {
     switch (t.kind) {
       case 'number': {
         this.next();
-        const lower = t.text.toLowerCase();
-        const litKind = /[fF]$/.test(t.text) ? 'float' : /[dD]$/.test(t.text) || (/[.e]/.test(lower) && !lower.startsWith('0x')) ? 'double' : /[lL]$/.test(t.text) ? 'long' : 'int';
+        const litKind = numericLiteralKind(t.text);
         return { kind: 'Literal', litKind, text: t.text, span: this.spanOf(t) };
       }
       case 'string':
@@ -1326,7 +1548,7 @@ class Parser {
     this.next(); // new
     if (this.accept('mobile')) {
       this.expect('(', "after 'new mobile'");
-      const typeName = this.expectIdent('a mobile procedure name');
+      const typeName = this.parseTypeName('a mobile procedure name');
       this.expect(')', "to close 'new mobile('");
       return { kind: 'NewMobile', typeName, span: this.span(start) };
     }
@@ -1338,9 +1560,13 @@ class Parser {
     } else if (t.text === 'chan' || t.text === 'shared') {
       elem = this.parseChanType();
     } else if (t.kind === 'ident') {
-      this.next();
-      elem = { kind: 'NamedType', name: this.ident(t), span: this.spanOf(t) };
-      if (this.at('{')) return this.parseRecordOrProtocolLiteral(this.ident(t), start);
+      const typeStart = this.startPos();
+      const name = this.parseTypeName('a type name after new');
+      elem = { kind: 'NamedType', name, span: this.span(typeStart) };
+      if (this.at('{')) return this.parseRecordOrProtocolLiteral(name, start);
+      if (name.qualifier?.length) {
+        this.error(t, `Package-qualified names are accepted in record/protocol literals, but not array creation; use an imported short name instead of '${identToString(name)}'`);
+      }
     } else {
       this.error(t, `Expected a type after 'new' but found ${this.describe(t)}`);
       return { kind: 'ErrorExpr', span: this.span(start) };
@@ -1360,7 +1586,11 @@ class Parser {
       } else break;
     }
     let init: A.ArrayLiteral | undefined;
-    if (this.at('{')) init = this.parseArrayLiteral();
+    if (this.at('{')) {
+      const brace = this.peek();
+      if (dimExprs.length > 0) this.error(brace, 'A new array cannot have both explicit sizes and an initializer; use either new T[n] or new T[] { ... }');
+      init = this.parseArrayLiteral();
+    }
     if (dimExprs.length === 0 && !init) {
       this.error(this.peek(), `'new ${sourceOfType(elem)}' needs a size like '[10]' or an initialiser like '[] { 1, 2 }'`);
     }
@@ -1375,6 +1605,7 @@ class Parser {
       tag = this.ident(this.next());
       this.next();
     }
+    if (!tag && this.at('}')) this.error(this.peek(), `A record literal must initialise at least one field; 'new ${typeName.name} {}' is not accepted by the ProcessJ grammar`);
     while (!this.at('}') && !this.atEof()) {
       const before = this.i;
       const name = this.expectIdent(`a field name in the ${tag ? 'protocol' : 'record'} literal`);
@@ -1382,6 +1613,10 @@ class Parser {
       const value = this.parseExpression();
       fields.push({ name, value });
       if (!this.accept(',')) break;
+      if (this.at('}')) {
+        this.error(this.peek(), `Trailing commas are not accepted in a ${tag ? 'protocol' : 'record'} literal`);
+        break;
+      }
       if (this.i === before) this.next();
     }
     this.expect('}', `to close the 'new ${typeName.name} {' literal`);
@@ -1405,6 +1640,43 @@ function isStatementExpr(e: A.Expr): boolean {
     default:
       return false;
   }
+}
+
+/** Literal category selected by the ordered, longest-match ProcessJ.flex rules. */
+function numericLiteralKind(raw: string): A.Literal['litKind'] {
+  const lower = raw.toLowerCase();
+  if (lower.startsWith('0x')) return /l$/i.test(raw) ? 'long' : 'int';
+  if (/l$/i.test(raw)) return 'long';
+  if (/f$/i.test(raw)) return 'float';
+  if (/d$/i.test(raw)) return 'double';
+  if (/[.e]/i.test(raw)) return 'double';
+  // Octal/decimal integer rules precede DoubleLiteral. Only an otherwise
+  // all-digit spelling containing 8 or 9 after a leading zero falls through.
+  if (/^0[0-9]*[89][0-9]*$/.test(raw)) return 'double';
+  return 'int';
+}
+
+function containsVoid(t: A.TypeNode): boolean {
+  if (t.kind === 'PrimitiveType') return t.name === 'void';
+  if (t.kind === 'ArrayType' || t.kind === 'ChanType') return containsVoid(t.elem);
+  return false;
+}
+
+/** Flatten the expression form CUP accepts as a package path before `::`. */
+function packageQualifier(e: A.Expr): A.Ident[] | undefined {
+  if (e.kind === 'NameExpr') return [...(e.qualifier ?? []), e.name];
+  if (e.kind === 'RecordAccess') {
+    const prefix = packageQualifier(e.target);
+    return prefix ? [...prefix, e.member] : undefined;
+  }
+  if (e.kind === 'ParenExpr') return packageQualifier(e.expr);
+  return undefined;
+}
+
+/** Narrower set used by CUP's `statement_expression` production in loop headers. */
+function isForStatementExpr(e: A.Expr): boolean {
+  if (e.kind === 'AssignExpr' || e.kind === 'Invocation' || e.kind === 'ChanRead') return true;
+  return e.kind === 'UnaryExpr' && (e.op === '++' || e.op === '--');
 }
 
 function describeExpr(e: A.Expr): string {
@@ -1432,7 +1704,7 @@ function describeExpr(e: A.Expr): string {
 function sourceOf(e: A.Expr): string {
   switch (e.kind) {
     case 'NameExpr':
-      return e.name.name;
+      return `${qualifierToString(e.qualifier)}${e.name.name}`;
     case 'RecordAccess':
       return `${sourceOf(e.target)}.${e.member.name}`;
     case 'ChanEnd':
@@ -1449,7 +1721,7 @@ function sourceOfType(t: A.TypeNode): string {
     case 'PrimitiveType':
       return t.name;
     case 'NamedType':
-      return t.name.name;
+      return identToString(t.name);
     case 'ArrayType':
       return sourceOfType(t.elem) + '[]'.repeat(t.dims);
     case 'ChanType':

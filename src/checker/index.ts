@@ -4,6 +4,7 @@
  * the standard-library headers) and merged with the nearest definition winning.
  */
 import type * as A from '../parser/ast';
+import { identToString } from '../parser/ast';
 import { fromNode, T, typeStr, type Type } from './types';
 
 export interface ProcSig {
@@ -46,13 +47,17 @@ export class DeclIndex {
   readonly protocols = new Map<string, ProtocolInfo>();
   readonly consts = new Map<string, ConstInfo>();
   readonly externs = new Set<string>();
+  private readonly recordFieldCache = new Map<string, Map<string, Type>>();
+  private readonly protocolCaseCache = new Map<string, Map<string, Map<string, Type>>>();
+  private readonly extendsCache = new Map<string, boolean>();
 
   /** Add every declaration of a parsed program. Existing entries win over later ones (nearest scope first). */
   addProgram(p: A.Program, file?: string): void {
+    this.invalidateDerived();
     // Two passes: names first so field/param types can refer to records declared later in the file.
     for (const d of p.decls) {
-      if (d.kind === 'RecordDecl' && !this.records.has(d.name.name)) this.records.set(d.name.name, { name: d.name.name, fields: new Map(), extends: d.extends.map((e) => e.name), decl: d, file });
-      else if (d.kind === 'ProtocolDecl' && !this.protocols.has(d.name.name)) this.protocols.set(d.name.name, { name: d.name.name, cases: new Map(), extends: d.extends.map((e) => e.name), decl: d, file });
+      if (d.kind === 'RecordDecl' && !this.records.has(d.name.name)) this.records.set(d.name.name, { name: d.name.name, fields: new Map(), extends: d.extends.map(identToString), decl: d, file });
+      else if (d.kind === 'ProtocolDecl' && !this.protocols.has(d.name.name)) this.protocols.set(d.name.name, { name: d.name.name, cases: new Map(), extends: d.extends.map(identToString), decl: d, file });
       else if (d.kind === 'ExternDecl') this.externs.add(d.name.name);
     }
     for (const d of p.decls) {
@@ -103,6 +108,7 @@ export class DeclIndex {
 
   /** Merge another index underneath this one (this one's definitions win). */
   addIndex(other: DeclIndex): void {
+    this.invalidateDerived();
     for (const [name, list] of other.procs) {
       const mine = this.procs.get(name);
       if (!mine) this.procs.set(name, [...list]);
@@ -115,7 +121,10 @@ export class DeclIndex {
   }
 
   resolve(node: A.TypeNode): Type {
-    return fromNode(node, (id) => this.named(id.name));
+    // Package-qualified names need a package-aware declaration index. Preserve
+    // their full spelling as a lenient unknown instead of accidentally binding
+    // `a::Thing` to an imported/local `Thing` from some other package.
+    return fromNode(node, (id) => id.qualifier?.length ? { k: 'unknown', name: identToString(id) } : this.named(id.name));
   }
 
   named(name: string): Type {
@@ -131,6 +140,8 @@ export class DeclIndex {
 
   /** All fields of a record including inherited ones (cycle safe). */
   recordFields(name: string): Map<string, Type> {
+    const cached = this.recordFieldCache.get(name);
+    if (cached) return cached;
     const out = new Map<string, Type>();
     const seen = new Set<string>();
     const visit = (n: string) => {
@@ -142,11 +153,14 @@ export class DeclIndex {
       for (const e of r.extends) visit(e);
     };
     visit(name);
+    this.recordFieldCache.set(name, out);
     return out;
   }
 
   /** All cases of a protocol including inherited ones (cycle safe). */
   protocolCases(name: string): Map<string, Map<string, Type>> {
+    const cached = this.protocolCaseCache.get(name);
+    if (cached) return cached;
     const out = new Map<string, Map<string, Type>>();
     const seen = new Set<string>();
     const visit = (n: string) => {
@@ -158,11 +172,15 @@ export class DeclIndex {
       for (const e of p.extends) visit(e);
     };
     visit(name);
+    this.protocolCaseCache.set(name, out);
     return out;
   }
 
   /** Does `sub` extend `sup` transitively (records or protocols)? */
   extendsName(sub: string, sup: string): boolean {
+    const key = `${sub}\0${sup}`;
+    const cached = this.extendsCache.get(key);
+    if (cached !== undefined) return cached;
     const seen = new Set<string>();
     const visit = (n: string): boolean => {
       if (n === sup) return true;
@@ -171,12 +189,20 @@ export class DeclIndex {
       const parents = this.records.get(n)?.extends ?? this.protocols.get(n)?.extends ?? [];
       return parents.some(visit);
     };
-    return visit(sub);
+    const result = visit(sub);
+    this.extendsCache.set(key, result);
+    return result;
   }
 
   /** Every name that could be suggested for a typo. */
   allNames(): string[] {
     return [...this.procs.keys(), ...this.records.keys(), ...this.protocols.keys(), ...this.consts.keys()];
+  }
+
+  private invalidateDerived(): void {
+    this.recordFieldCache.clear();
+    this.protocolCaseCache.clear();
+    this.extendsCache.clear();
   }
 }
 

@@ -104,7 +104,7 @@ export function sameType(a: Type, b: Type): boolean {
     }
     case 'chan': {
       const bb = b as typeof a;
-      return a.end === bb.end && sameType(a.elem, bb.elem);
+      return a.end === bb.end && a.shared === bb.shared && a.sharedSide === bb.sharedSide && sameType(a.elem, bb.elem);
     }
     default:
       return true;
@@ -139,6 +139,9 @@ export function assignable(to: Type, from: Type, sub: Subtyping): boolean {
   if (to.k === 'array' && from.k === 'array') return to.dims === from.dims && sameType(to.elem, from.elem);
   if (to.k === 'chan' && from.k === 'chan') {
     if (to.end !== from.end) return false; // a full channel is not an end and vice versa
+    // Whole channels are synchronization objects, not assignable values. Pass a
+    // read/write end to a procedure instead of aliasing the channel itself.
+    if (!to.end) return false;
     if (!elemCompatible(to, from, sub)) return false;
     if (to.shared && !from.shared) return false; // a shared slot needs a shared channel
     return true;
@@ -172,9 +175,10 @@ export function whyNotAssignable(to: Type, from: Type): string | undefined {
     if (!sameType(to.elem, from.elem) && to.end === from.end) return `the channel carries ${typeStr(from.elem)}, not ${typeStr(to.elem)}`;
     if (!to.end && from.end) return 'a channel end was given where a whole channel is needed';
     if (to.end !== from.end) return `a ${from.end} end was given where a ${to.end} end is needed`;
+    if (!to.end && !from.end) return 'whole channels cannot be assigned or passed; pass the required .read or .write end';
     if (to.shared && !from.shared) return `declare the channel 'shared chan<${typeStr(to.elem)}>'`;
   }
-  if (isNumeric(to) && isNumeric(from)) return `${typeStr(from)} does not fit in ${typeStr(to)} without a cast`;
+  if (isNumeric(to) && isNumeric(from) && !sameType(to, from)) return `${typeStr(from)} does not fit in ${typeStr(to)} without a cast`;
   return undefined;
 }
 

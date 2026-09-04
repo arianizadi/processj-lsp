@@ -16,6 +16,8 @@ export interface Span {
 export interface Ident {
   kind: 'Ident';
   name: string;
+  /** Package path before `::`, for grammar positions that use `type_name`. */
+  qualifier?: Ident[];
   span: Span;
 }
 
@@ -104,8 +106,12 @@ export interface ProcDecl {
   name: Ident;
   params: Param[];
   annotations: Annotation[];
+  /** The `[...]` annotation list, when one was written. */
+  annotationsSpan?: Span;
   implements: Ident[];
   body?: Block;
+  /** Just after the `)` closing the parameter list: where an annotation list may be inserted. */
+  headerEnd: Pos;
   span: Span;
 }
 
@@ -567,13 +573,23 @@ export interface ParseError {
   fix?: ParseFix;
 }
 
+/** The `pkg.path::` prefix of a qualified name, or '' when there is none. */
+export function qualifierToString(qualifier: Ident[] | undefined): string {
+  return qualifier?.length ? `${qualifier.map((q) => q.name).join('.')}::` : '';
+}
+
+/** Render a possibly package-qualified identifier back to source form. */
+export function identToString(id: Ident): string {
+  return qualifierToString(id.qualifier) + id.name;
+}
+
 /** Render a type back to source form (used in hover text and symbols). */
 export function typeToString(t: TypeNode): string {
   switch (t.kind) {
     case 'PrimitiveType':
       return t.name;
     case 'NamedType':
-      return t.name.name;
+      return identToString(t.name);
     case 'ArrayType':
       return typeToString(t.elem) + '[]'.repeat(t.dims);
     case 'ChanType': {
