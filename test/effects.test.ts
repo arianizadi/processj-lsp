@@ -296,6 +296,38 @@ test('mutable record and protocol aliases replace stale aggregate parameter orig
   assert.equal(protocol.direct.confidence, 'conservative');
 });
 
+test('conditional alias joins preserve every possible parameter may-effect', () => {
+  const result = summary(
+    [
+      'record Box { chan<int>.read input; }',
+      'void route(Box first, Box second, boolean chooseSecond) {',
+      '    Box selected = first;',
+      '    if (chooseSecond) selected = second;',
+      '    int value = selected.input.read();',
+      '}',
+    ].join('\n'),
+    'route',
+  );
+  assert.deepEqual(sorted(result.direct.channelReads), [0, 1]);
+});
+
+test('loop alias analysis reaches a fixed point across later iterations', () => {
+  const result = summary(
+    [
+      'record Box { chan<int>.read input; }',
+      'void route(Box first, Box second, boolean keepGoing) {',
+      '    Box selected = first;',
+      '    while (keepGoing) {',
+      '        int value = selected.input.read();',
+      '        selected = second;',
+      '    }',
+      '}',
+    ].join('\n'),
+    'route',
+  );
+  assert.deepEqual(sorted(result.direct.channelReads), [0, 1]);
+});
+
 test('field writes update static origins and indexed writes invalidate aggregate aliases', () => {
   const field = summary(
     [

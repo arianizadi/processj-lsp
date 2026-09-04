@@ -7,6 +7,11 @@ export type RendezvousSearchResult =
   | { kind: 'deadlock'; heads: number[]; states: number }
   | { kind: 'budget'; states: number };
 
+export type RendezvousSafetyResult =
+  | { kind: 'safe'; states: number }
+  | { kind: 'deadlock'; heads: number[]; states: number }
+  | { kind: 'budget'; states: number };
+
 /**
  * Explore every distinct vector of queue heads until one legal schedule
  * completes, every reachable schedule is stuck, or the state budget is hit.
@@ -59,4 +64,47 @@ export function searchRendezvousHeads<T>(
   }
 
   return { kind: 'deadlock', heads: firstDeadlock ?? initial, states: discovered.size };
+}
+
+/**
+ * Prove the stronger property needed before creating concurrency: every
+ * reachable scheduler state either advances or has completed. One completing
+ * interleaving is not enough—a different legal pairing must not get stuck.
+ */
+export function proveAllRendezvousSchedulesComplete<T>(
+  queues: readonly (readonly T[])[],
+  canPair: (left: T, right: T) => boolean,
+  stateBudget = RENDEZVOUS_STATE_BUDGET,
+): RendezvousSafetyResult {
+  if (!Number.isSafeInteger(stateBudget) || stateBudget < 1) return { kind: 'budget', states: 0 };
+  const initial = queues.map(() => 0);
+  const pending: number[][] = [initial];
+  const discovered = new Set<string>([initial.join(',')]);
+
+  while (pending.length > 0) {
+    const heads = pending.pop()!;
+    if (heads.every((head, branch) => head >= queues[branch].length)) continue;
+
+    let moveCount = 0;
+    for (let left = 0; left < queues.length; left++) {
+      const a = queues[left][heads[left]];
+      if (a === undefined) continue;
+      for (let right = left + 1; right < queues.length; right++) {
+        const b = queues[right][heads[right]];
+        if (b === undefined || !canPair(a, b)) continue;
+        moveCount++;
+        const next = [...heads];
+        next[left]++;
+        next[right]++;
+        const key = next.join(',');
+        if (discovered.has(key)) continue;
+        if (discovered.size >= stateBudget) return { kind: 'budget', states: discovered.size };
+        discovered.add(key);
+        pending.push(next);
+      }
+    }
+    if (moveCount === 0) return { kind: 'deadlock', heads, states: discovered.size };
+  }
+
+  return { kind: 'safe', states: discovered.size };
 }

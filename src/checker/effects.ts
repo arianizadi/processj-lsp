@@ -68,7 +68,8 @@ export interface EffectSite {
 export type ArgumentOrigin =
   | { kind: 'parameter'; index: number }
   | { kind: 'local' }
-  | { kind: 'unknown' };
+  | { kind: 'unknown' }
+  | { kind: 'may'; parameters: ReadonlySet<number>; local: boolean; unknown: boolean };
 
 export interface ProcedureCallEffect {
   call: A.Invocation;
@@ -222,6 +223,49 @@ function collectDirect(
   const { decl, direct, sites, calls } = summary;
   const aliases = new Map<CheckResult['vars'][number], ArgumentOrigin>();
   const aggregateAliases = new Map<CheckResult['vars'][number], Map<string, ArgumentOrigin>>();
+  const captureAliases = (): AliasState => ({
+    aliases: new Map(aliases),
+    aggregateAliases: new Map([...aggregateAliases].map(([variable, fields]) => [variable, new Map(fields)])),
+  });
+  const restoreAliases = (state: AliasState): void => {
+    aliases.clear();
+    for (const [variable, origin] of state.aliases) aliases.set(variable, origin);
+    aggregateAliases.clear();
+    for (const [variable, fields] of state.aggregateAliases) aggregateAliases.set(variable, new Map(fields));
+  };
+  const joinAliases = (states: readonly AliasState[]): AliasState => joinAliasStates(states, decl);
+  const alternatives = (branches: readonly (() => void)[], includeUnchanged = false): void => {
+    const entry = captureAliases();
+    const exits: AliasState[] = includeUnchanged ? [entry] : [];
+    for (const branch of branches) {
+      restoreAliases(entry);
+      branch();
+      exits.push(captureAliases());
+    }
+    if (exits.length === 0) exits.push(entry);
+    restoreAliases(joinAliases(exits));
+  };
+  const loopFixedPoint = (iteration: () => void, executesAtLeastOnce: boolean): void => {
+    const entry = captureAliases();
+    let current = entry;
+    if (executesAtLeastOnce) {
+      restoreAliases(entry);
+      iteration();
+      current = captureAliases();
+    }
+    const limit = Math.max(2, checked.vars.length + 2);
+    for (let pass = 0; pass < limit; pass++) {
+      restoreAliases(current);
+      iteration();
+      const next = joinAliases([current, captureAliases()]);
+      if (sameAliasState(current, next, decl)) {
+        current = next;
+        break;
+      }
+      current = next;
+    }
+    restoreAliases(current);
+  };
   if (decl.modifiers.includes('mobile')) {
     direct.mobile = true;
     sites.push({ kind: 'mobile', span: decl.name.span });
@@ -236,17 +280,18 @@ function collectDirect(
 
   const channelEffect = (kind: 'channel-read' | 'channel-write', target: A.Expr, span: A.Span): void => {
     const origin = parameterOrigin(target);
-    const parameter = origin.kind === 'parameter' ? origin.index : undefined;
+    const parameters = parameterIndices(origin);
+    const parameter = parameters.size === 1 ? [...parameters][0] : undefined;
     if (kind === 'channel-read') {
       direct.channelRead = true;
-      if (parameter !== undefined) direct.channelReads.add(parameter);
+      for (const index of parameters) direct.channelReads.add(index);
     } else {
       direct.channelWrite = true;
-      if (parameter !== undefined) direct.channelWrites.add(parameter);
+      for (const index of parameters) direct.channelWrites.add(index);
     }
     direct.blocking = true;
     sites.push({ kind, span, parameter });
-    if (origin.kind === 'unknown') {
+    if (originHasUnknown(origin)) {
       direct.unknown = true;
       lowerConfidence(direct, 'conservative');
     }
@@ -269,8 +314,10 @@ function collectDirect(
   const call = (expr: A.Invocation): void => {
     const selected = checked.calls.get(expr);
     const arguments_ = expr.args.map(parameterOrigin);
+    const existing = calls.find((entry) => entry.call === expr);
+    if (existing) existing.arguments = existing.arguments.map((origin, index) => joinArgumentOrigins([origin, arguments_[index] ?? { kind: 'unknown' }]));
     if (!selected) {
-      calls.push({ call: expr, resolution: 'unresolved', arguments: arguments_ });
+      if (!existing) calls.push({ call: expr, resolution: 'unresolved', arguments: arguments_ });
       markUnknown(direct, sites, expr.span, 'unknown');
       // An unresolved call must not make a "non-blocking" summary unsound.
       direct.blocking = true;
@@ -278,13 +325,15 @@ function collectDirect(
     }
     const target = selected.decl;
     const internal = all.has(target);
-    calls.push({
-      call: expr,
-      target,
-      targetFile: selected.file,
-      resolution: internal ? 'exact' : 'external',
-      arguments: arguments_,
-    });
+    if (!existing) {
+      calls.push({
+        call: expr,
+        target,
+        targetFile: selected.file,
+        resolution: internal ? 'exact' : 'external',
+        arguments: arguments_,
+      });
+    }
     if (!internal) {
       markUnknown(direct, sites, expr.span, 'unknown');
       direct.blocking = true;
@@ -307,7 +356,8 @@ function collectDirect(
         return;
       case 'BinaryExpr':
         expression(expr.left);
-        expression(expr.right);
+        if (expr.op === '&&' || expr.op === '||') alternatives([() => expression(expr.right)], true);
+        else expression(expr.right);
         return;
       case 'UnaryExpr':
         expression(expr.operand);
@@ -351,8 +401,7 @@ function collectDirect(
         return;
       case 'TernaryExpr':
         expression(expr.cond);
-        expression(expr.then);
-        expression(expr.else);
+        alternatives([() => expression(expr.then), () => expression(expr.else)]);
         return;
       case 'Invocation':
         if (expr.target) expression(expr.target);
@@ -433,21 +482,24 @@ function collectDirect(
         return;
       case 'IfStmt':
         expression(stmt.cond);
-        statement(stmt.then);
-        if (stmt.else) statement(stmt.else);
+        alternatives([() => statement(stmt.then), ...(stmt.else ? [() => statement(stmt.else!)] : [])], !stmt.else);
         return;
       case 'WhileStmt':
         expression(stmt.cond);
-        statement(stmt.body);
+        loopFixedPoint(() => {
+          statement(stmt.body);
+          expression(stmt.cond);
+        }, false);
         return;
       case 'DoStmt':
-        statement(stmt.body);
-        expression(stmt.cond);
+        loopFixedPoint(() => {
+          statement(stmt.body);
+          expression(stmt.cond);
+        }, true);
         return;
       case 'ForStmt':
         if (stmt.init) Array.isArray(stmt.init) ? stmt.init.forEach(expression) : localDecl(stmt.init);
         if (stmt.cond) expression(stmt.cond);
-        stmt.update.forEach(expression);
         stmt.enroll.forEach(expression);
         if (stmt.enroll.length) {
           direct.barrier = true;
@@ -458,7 +510,11 @@ function collectDirect(
           direct.blocking = true;
           sites.push({ kind: 'par', span: stmt.span });
         }
-        statement(stmt.body);
+        loopFixedPoint(() => {
+          statement(stmt.body);
+          stmt.update.forEach(expression);
+          if (stmt.cond) expression(stmt.cond);
+        }, false);
         return;
       case 'ParBlock':
         direct.par = true;
@@ -471,7 +527,7 @@ function collectDirect(
         }
         // A par block's lexical children are processes, not sequential
         // siblings: one branch returning does not make the next branch dead.
-        for (const branch of stmt.body.stmts) statement(branch);
+        alternatives(stmt.body.stmts.map((branch) => () => statement(branch)));
         return;
       case 'SeqBlock':
         statement(stmt.body);
@@ -484,12 +540,12 @@ function collectDirect(
         return;
       case 'SwitchStmt':
         expression(stmt.expr);
-        for (const group of stmt.groups) {
+        alternatives(stmt.groups.map((group) => () => {
           for (const label of group.labels) if (label) expression(label);
           // Each label can enter its group independently; only the executable
           // prefix within that group is a sequential reachability region.
           forEachReachableStatement(group.stmts, statement);
-        }
+        }), true);
         return;
       case 'AltStmt':
         direct.alt = true;
@@ -498,7 +554,7 @@ function collectDirect(
         if (stmt.replicated?.init) Array.isArray(stmt.replicated.init) ? stmt.replicated.init.forEach(expression) : localDecl(stmt.replicated.init);
         if (stmt.replicated?.cond) expression(stmt.replicated.cond);
         stmt.replicated?.update.forEach(expression);
-        for (const altCase of stmt.cases) {
+        alternatives(stmt.cases.map((altCase) => () => {
           if (altCase.precondition) expression(altCase.precondition);
           if (altCase.guard?.kind === 'ReadGuard') {
             expression(altCase.guard.target);
@@ -508,7 +564,7 @@ function collectDirect(
           }
           if (altCase.nested) statement(altCase.nested);
           if (altCase.body) statement(altCase.body);
-        }
+        }));
         return;
       case 'ReturnStmt':
         if (stmt.expr) expression(stmt.expr);
@@ -531,6 +587,9 @@ function collectDirect(
   };
 
   statement(decl.body);
+  const dedupedSites = new Map<string, EffectSite>();
+  for (const site of sites) dedupedSites.set(`${site.kind}:${site.span.start.line}:${site.span.start.col}:${site.span.end.line}:${site.span.end.col}:${site.parameter ?? ''}`, site);
+  sites.splice(0, sites.length, ...dedupedSites.values());
 }
 
 function argumentOrigin(
@@ -623,6 +682,97 @@ function mayCarryChannel(type: CheckResult['vars'][number]['type']): boolean {
   return type.k === 'array' && mayCarryChannel(type.elem);
 }
 
+type EffectVariable = CheckResult['vars'][number];
+
+interface AliasState {
+  aliases: Map<EffectVariable, ArgumentOrigin>;
+  aggregateAliases: Map<EffectVariable, Map<string, ArgumentOrigin>>;
+}
+
+function defaultArgumentOrigin(variable: EffectVariable, owner: A.ProcDecl): ArgumentOrigin {
+  if (!variable.isParam) return { kind: 'local' };
+  const index = owner.params.findIndex((parameter) => parameter.name === variable.decl);
+  return index >= 0 ? { kind: 'parameter', index } : { kind: 'unknown' };
+}
+
+function argumentOriginParts(origin: ArgumentOrigin): { parameters: Set<number>; local: boolean; unknown: boolean } {
+  switch (origin.kind) {
+    case 'parameter': return { parameters: new Set([origin.index]), local: false, unknown: false };
+    case 'local': return { parameters: new Set(), local: true, unknown: false };
+    case 'unknown': return { parameters: new Set(), local: false, unknown: true };
+    case 'may': return { parameters: new Set(origin.parameters), local: origin.local, unknown: origin.unknown };
+  }
+}
+
+function joinArgumentOrigins(origins: readonly ArgumentOrigin[]): ArgumentOrigin {
+  const parameters = new Set<number>();
+  let local = false;
+  let unknown = false;
+  for (const origin of origins) {
+    const parts = argumentOriginParts(origin);
+    for (const index of parts.parameters) parameters.add(index);
+    local ||= parts.local;
+    unknown ||= parts.unknown;
+  }
+  if (parameters.size === 1 && !local && !unknown) return { kind: 'parameter', index: [...parameters][0] };
+  if (parameters.size === 0 && local && !unknown) return { kind: 'local' };
+  if (parameters.size === 0 && !local && unknown) return { kind: 'unknown' };
+  return { kind: 'may', parameters, local, unknown };
+}
+
+function parameterIndices(origin: ArgumentOrigin): ReadonlySet<number> {
+  if (origin.kind === 'parameter') return new Set([origin.index]);
+  return origin.kind === 'may' ? origin.parameters : new Set();
+}
+
+function originHasUnknown(origin: ArgumentOrigin): boolean {
+  return origin.kind === 'unknown' || (origin.kind === 'may' && origin.unknown);
+}
+
+function sameArgumentOrigin(left: ArgumentOrigin, right: ArgumentOrigin): boolean {
+  const a = argumentOriginParts(left);
+  const b = argumentOriginParts(right);
+  return a.local === b.local && a.unknown === b.unknown && setEqual(a.parameters, b.parameters);
+}
+
+function joinAliasStates(states: readonly AliasState[], owner: A.ProcDecl): AliasState {
+  const aliases = new Map<EffectVariable, ArgumentOrigin>();
+  const aggregateAliases = new Map<EffectVariable, Map<string, ArgumentOrigin>>();
+  const variables = new Set<EffectVariable>();
+  for (const state of states) {
+    for (const variable of state.aliases.keys()) variables.add(variable);
+    for (const variable of state.aggregateAliases.keys()) variables.add(variable);
+  }
+  for (const variable of variables) {
+    const fallback = defaultArgumentOrigin(variable, owner);
+    const joined = joinArgumentOrigins(states.map((state) => state.aliases.get(variable) ?? fallback));
+    if (!sameArgumentOrigin(joined, fallback)) aliases.set(variable, joined);
+
+    const paths = new Set<string>();
+    for (const state of states) for (const path of state.aggregateAliases.get(variable)?.keys() ?? []) paths.add(path);
+    const fields = new Map<string, ArgumentOrigin>();
+    for (const path of paths) {
+      const fieldOrigin = joinArgumentOrigins(states.map((state) => state.aggregateAliases.get(variable)?.get(path) ?? state.aliases.get(variable) ?? fallback));
+      if (!sameArgumentOrigin(fieldOrigin, joined)) fields.set(path, fieldOrigin);
+    }
+    if (fields.size > 0) aggregateAliases.set(variable, fields);
+  }
+  return { aliases, aggregateAliases };
+}
+
+function sameAliasState(left: AliasState, right: AliasState, owner: A.ProcDecl): boolean {
+  const a = joinAliasStates([left], owner);
+  const b = joinAliasStates([right], owner);
+  if (a.aliases.size !== b.aliases.size || a.aggregateAliases.size !== b.aggregateAliases.size) return false;
+  for (const [variable, origin] of a.aliases) if (!sameArgumentOrigin(origin, b.aliases.get(variable) ?? defaultArgumentOrigin(variable, owner))) return false;
+  for (const [variable, fields] of a.aggregateAliases) {
+    const other = b.aggregateAliases.get(variable);
+    if (!other || fields.size !== other.size) return false;
+    for (const [path, origin] of fields) if (!other.has(path) || !sameArgumentOrigin(origin, other.get(path)!)) return false;
+  }
+  return true;
+}
+
 function emptyFacts(): MutableFacts {
   return {
     channelRead: false,
@@ -676,8 +826,8 @@ function mergeCall(into: MutableFacts, callee: EffectFacts, arguments_: readonly
 function substituteParameters(into: MutableFacts, destination: Set<number>, source: ReadonlySet<number>, arguments_: readonly ArgumentOrigin[]): void {
   for (const parameter of source) {
     const origin = arguments_[parameter];
-    if (origin?.kind === 'parameter') destination.add(origin.index);
-    else if (!origin || origin.kind === 'unknown') {
+    if (origin) for (const index of parameterIndices(origin)) destination.add(index);
+    if (!origin || originHasUnknown(origin)) {
       into.unknown = true;
       lowerConfidence(into, 'conservative');
     }

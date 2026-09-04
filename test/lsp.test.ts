@@ -84,6 +84,7 @@ class LspClient {
         this.waiting.delete(message.id);
       } else if (message.id !== undefined && message.method) {
         // A server-to-client request (for example dynamic registration).
+        this.notifications.push(message);
         this.send({ jsonrpc: '2.0', id: message.id, result: null });
       } else if (message.method) this.notifications.push(message);
     }
@@ -858,7 +859,7 @@ test('server follows reachable imported bodies for effects, yield overloads and 
   await client.request('initialize', {
     processId: process.pid,
     rootUri: pathToFileURL(root).toString(),
-    capabilities: { workspace: { workspaceFolders: true } },
+    capabilities: { workspace: { workspaceFolders: true, inlayHint: { refreshSupport: true }, codeLens: { refreshSupport: true } } },
     initializationOptions: { installDir: path.join(root, 'missing-processj') },
   });
   client.notify('initialized', {});
@@ -891,7 +892,12 @@ test('server follows reachable imported bodies for effects, yield overloads and 
     'public void deepRead(chan<int>.read input) { int value = input.read(); }',
     'public void waiter() { timer clock; clock.timeout(1); }',
   ].join('\n');
+  const decorationRefreshes = Promise.all([
+    client.waitFor('workspace/inlayHint/refresh'),
+    client.waitFor('workspace/codeLens/refresh'),
+  ]);
   client.notify('textDocument/didOpen', { textDocument: { uri: deepUri, languageId: 'processj', version: 2, text: unsavedDeep } });
+  await decorationRefreshes;
   const overlaid = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
   assert.deepEqual(overlaid.params.diagnostics.filter((diagnostic: any) => diagnostic.code === 'pj/needs-yield-annotation').map((diagnostic: any) => diagnostic.range.start.line), [4]);
 

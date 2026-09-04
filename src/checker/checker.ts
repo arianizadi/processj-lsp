@@ -182,6 +182,7 @@ class Checker {
   readonly types = new Map<A.Expr, Type>();
   readonly channelFacts: ChannelFact[] = [];
   readonly deadlocks: DeadlockFact[] = [];
+  private readonly pendingStarvingLoops: Array<{ loopSpan: A.Span; body: A.Stmt; keyword: string }> = [];
 
   private readonly index: DeclIndex;
   private scope = new Scope(undefined, 0);
@@ -440,11 +441,19 @@ class Checker {
     }
     for (const d of p.decls) if (d.kind === 'ProcDecl') this.procDecl(d);
     // Earlier lints may consult yieldability before every call in the file has
-    // been resolved. Use a fresh analysis here so overload decisions are exact.
+    // been resolved. Never reuse that partially memoised analysis for a
+    // file-level result after the walk: unresolved calls deliberately fail
+    // closed as yielding, and that answer would otherwise become order-sensitive.
+    const resolvedYields = new YieldAnalysis(this.index, this.calls, this.opts.yieldCalls, this.opts.yieldCallProvider);
+    for (const pending of this.pendingStarvingLoops) {
+      if (resolvedYields.stmtYields(pending.body, 'calls')) continue;
+      const head: A.Span = { start: pending.loopSpan.start, end: { line: pending.loopSpan.start.line, col: pending.loopSpan.start.col + pending.keyword.length } };
+      this.warn(head, 'pj/starving-loop', 'This loop never ends and never communicates, so no other process ever runs again (the scheduler is cooperative). Add a channel operation, timeout or alt.');
+    }
     for (const d of p.decls) {
       if (d.kind !== 'ProcDecl' || !d.body) continue;
       const ret = this.index.resolve(d.returnType);
-      if (isPrim(ret, 'void') || !this.yields.procYields(d)) continue;
+      if (isPrim(ret, 'void') || !resolvedYields.procYields(d)) continue;
       this.report(d.returnType.span, 'warning', 'pj/compiler-limit', `'${d.name.name}' returns ${typeStr(ret)} and can suspend, which this ProcessJ build cannot compile: it puts the 'return' inside the generated process body and turns every call into a process start. Make it 'void' and hand the result back through a channel parameter.`);
     }
     for (const d of new YieldAnalysis(this.index, this.calls, this.opts.yieldCalls, this.opts.yieldCallProvider, { unresolvedRootCallsYield: false }).needingAnnotation(p)) {
@@ -564,9 +573,8 @@ class Checker {
   private checkStarvingLoop(loopSpan: A.Span, cond: A.Expr | undefined, body: A.Stmt, keyword: string): void {
     if (!this.collectExecutionFacts) return;
     if (cond && !isTrueLiteral(cond)) return;
-    if (containsExit(body) || this.yields.stmtYields(body, 'calls')) return;
-    const head: A.Span = { start: loopSpan.start, end: { line: loopSpan.start.line, col: loopSpan.start.col + keyword.length } };
-    this.warn(head, 'pj/starving-loop', `This loop never ends and never communicates, so no other process ever runs again (the scheduler is cooperative). Add a channel operation, timeout or alt.`);
+    if (containsExit(body)) return;
+    this.pendingStarvingLoops.push({ loopSpan, body, keyword });
   }
 
   // -------------------------------------------------------------------------
@@ -658,7 +666,7 @@ class Checker {
         if (s.isPar) {
           const head: A.Span = { start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + 3 } };
           this.processParFors++;
-          if (this.processParFors === 2) {
+          if (this.processParFors >= 2) {
             this.report(head, 'warning', 'pj/compiler-limit', "A second 'par for' in the same process cannot be compiled by this ProcessJ build (its generated process array is declared twice); move this one into its own procedure");
           }
           // The generated code turns every statement of the body into its own
@@ -769,10 +777,15 @@ class Checker {
     while (inner.kind === 'ParenExpr') inner = inner.expr;
     if (inner.kind === 'AssignExpr' && inner.op === '=' && isPrim(t, 'boolean')) this.warn(e.span, 'pj/assign-in-condition', `This assigns '${exprText(inner.target)}' instead of comparing it; did you mean '=='?`);
     const isLoopOrBranch = owner === 'if' || owner === 'while' || owner === 'do ... while' || owner === 'for';
-    let negatedOperand = inner.kind === 'UnaryExpr' && inner.op === '!' && inner.prefix ? inner.operand : undefined;
-    while (negatedOperand?.kind === 'ParenExpr') negatedOperand = negatedOperand.expr;
+    let call: A.Expr = inner;
+    let negated = false;
+    while (call.kind === 'UnaryExpr' && call.op === '!' && call.prefix) {
+      negated = !negated;
+      call = call.operand;
+      while (call.kind === 'ParenExpr') call = call.expr;
+    }
     // A negated call has its own, more specific rule below.
-    if (inner.kind === 'UnaryExpr' && inner.op === '!' && inner.prefix && isLoopOrBranch && negatedOperand?.kind !== 'Invocation') {
+    if (inner.kind === 'UnaryExpr' && inner.op === '!' && inner.prefix && isLoopOrBranch && call.kind !== 'Invocation') {
       // The generated code renders a whole-condition `!x` as a statement and the
       // javac step then fails on the stray `;`. Inside a larger condition
       // (`!a && b`) the same operand compiles.
@@ -782,13 +795,6 @@ class Checker {
         : undefined;
       this.report(inner.span, 'warning', 'pj/compiler-limit', `'!' as the whole condition of '${owner}' cannot be compiled by this ProcessJ build; write '${operand ?? 'x'} == false' instead`, fix);
       return;
-    }
-    let call: A.Expr = inner;
-    let negated = false;
-    while (call.kind === 'UnaryExpr' && call.op === '!' && call.prefix) {
-      negated = !negated;
-      call = call.operand;
-      while (call.kind === 'ParenExpr') call = call.expr;
     }
     if (call.kind === 'Invocation' && isLoopOrBranch) {
       const negatedText = negated ? this.slice(call.span) : undefined;
@@ -951,7 +957,7 @@ class Checker {
     // The compiler merges a nested non-replicated alt into its parent, so only
     // top-level and replicated alts count towards the one-alt limit.
     if (!nested || s.replicated) this.processAlts++;
-    if (this.processAlts === 2) this.error({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + (s.isPri ? 7 : 3) } }, 'pj/multiple-alts', `A second alt in the same process cannot be compiled by this ProcessJ build (its generated guard array is declared twice); move this one into its own procedure or into a separate par branch`);
+    if (this.processAlts >= 2) this.error({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + (s.isPri ? 7 : 3) } }, 'pj/multiple-alts', `A second alt in the same process cannot be compiled by this ProcessJ build (its generated guard array is declared twice); move this one into its own procedure or into a separate par branch`);
     this.insideAlt++;
     this.push();
     if (s.replicated) {

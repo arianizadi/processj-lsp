@@ -36,6 +36,8 @@ export interface ReachableCallOptions {
    * selected declarations refer to those objects by identity.
    */
   load(file: string): ReachableUnit | undefined;
+  /** True when the loader refused a requested unit because its own shared budget was exhausted. */
+  loadTruncated?: () => boolean;
   /** Maximum imported files to check. The root does not consume this budget. */
   maxImportedFiles?: number;
   /** Direct imports of the root file. */
@@ -97,7 +99,10 @@ export function analyzeReachableCalls(root: EffectUnit, options: ReachableCallOp
       return undefined;
     }
     const unit = options.load(absolute);
-    if (!unit) return undefined;
+    if (!unit) {
+      truncated ||= options.loadTruncated?.() === true;
+      return undefined;
+    }
     importedFiles++;
     loaded.set(absolute, unit);
     units.push(unit);

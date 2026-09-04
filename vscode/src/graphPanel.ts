@@ -40,9 +40,11 @@ interface GraphResult {
 
 interface ProtocolResult {
   protocols: Array<{ id: string; name: string; file?: string; span: SourceLocation['span']; nameSpan: SourceLocation['span']; local: boolean; caseSetComplete: boolean; parents: Array<{ name: string; targetId?: string; span: SourceLocation['span'] }>; cases: Array<{ id: string; name: string; file?: string; span: SourceLocation['span']; inherited: boolean; declaringProtocolName: string; effective: boolean; fields: Array<{ name: string; typeLabel: string }> }>; collisions: Array<{ caseName: string; origins: Array<{ declaringProtocolName: string }> }> }>;
-  flows: Array<{ id: string; kind: string; file?: string; span: SourceLocation['span']; protocolId: string; caseId?: string; caseName?: string; procedureId?: string; procedureName?: string }>;
+  flows: Array<{ id: string; kind: string; file?: string; span: SourceLocation['span']; protocolId: string; caseId?: string; caseName?: string; procedureId?: string; procedureName?: string; procedureFile?: string; procedureSpan?: SourceLocation['span'] }>;
   issues: Array<{ severity: string; message: string }>;
 }
+
+let activePanel: vscode.WebviewPanel | undefined;
 
 export async function showConcurrencyGraph(client: LanguageClient): Promise<void> {
   const editor = vscode.window.activeTextEditor;
@@ -85,7 +87,7 @@ export async function showProtocolGraph(client: LanguageClient): Promise<void> {
   const observed: GraphResult['procedureEffects'] = {};
   for (const flow of model.flows) {
     if (!flow.procedureId || !flow.procedureName) continue;
-    if (!nodes.has(flow.procedureId)) nodes.set(flow.procedureId, { id: flow.procedureId, kind: 'procedure', label: flow.procedureName, source: { uri: uriFor(flow.file), span: flow.span }, confidence: 'exact', detail: 'procedure observed in protocol flow' });
+    if (!nodes.has(flow.procedureId)) nodes.set(flow.procedureId, { id: flow.procedureId, kind: 'procedure', label: flow.procedureName, source: { uri: uriFor(flow.procedureFile ?? flow.file), span: flow.procedureSpan ?? flow.span }, confidence: 'exact', detail: 'procedure observed in protocol flow' });
     const facts = observed[flow.procedureId] ??= [];
     facts.push({ label: `${flow.kind}${flow.caseName ? ` ${flow.caseName}` : ''}`, confidence: 'exact' });
     const caseOrProtocol = flow.caseId ?? flow.protocolId;
@@ -107,28 +109,47 @@ export async function showProtocolGraph(client: LanguageClient): Promise<void> {
 }
 
 function showGraphPanel(graph: GraphResult, title: string, heading: string): void {
-  const panel = vscode.window.createWebviewPanel(
+  const panel = activePanel ?? vscode.window.createWebviewPanel(
     'processjConcurrencyGraph',
     `ProcessJ ${heading} — ${title}`,
     vscode.ViewColumn.Beside,
     { enableScripts: true, retainContextWhenHidden: true },
   );
+  if (!activePanel) {
+    activePanel = panel;
+    const messages = panel.webview.onDidReceiveMessage((message: unknown) => {
+      void handleGraphMessage(message);
+    });
+    panel.onDidDispose(() => {
+      messages.dispose();
+      if (activePanel === panel) activePanel = undefined;
+    });
+  } else {
+    panel.reveal(vscode.ViewColumn.Beside, true);
+  }
+  panel.title = `ProcessJ ${heading} — ${title}`;
   panel.webview.html = graphHtml(panel.webview, graph, title, heading);
-  panel.webview.onDidReceiveMessage(async (message: unknown) => {
+
+  async function handleGraphMessage(message: unknown): Promise<void> {
     if (!message || typeof message !== 'object') return;
     const value = message as { type?: unknown; uri?: unknown; line?: unknown; col?: unknown; text?: unknown };
-    if (value.type === 'copy' && typeof value.text === 'string') {
-      await vscode.env.clipboard.writeText(value.text);
-      void vscode.window.showInformationMessage('ProcessJ: graph JSON copied.');
-      return;
+    try {
+      if (value.type === 'copy' && typeof value.text === 'string') {
+        await vscode.env.clipboard.writeText(value.text);
+        void vscode.window.showInformationMessage('ProcessJ: graph JSON copied.');
+        return;
+      }
+      if (value.type !== 'open' || typeof value.uri !== 'string' || typeof value.line !== 'number' || typeof value.col !== 'number') return;
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(value.uri));
+      const target = await vscode.window.showTextDocument(document, { preview: false, preserveFocus: false });
+      const position = new vscode.Position(value.line, value.col);
+      target.selection = new vscode.Selection(position, position);
+      target.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    } catch (error) {
+      const action = value.type === 'copy' ? 'copy graph JSON' : 'open graph source';
+      void vscode.window.showErrorMessage(`ProcessJ: could not ${action}. ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (value.type !== 'open' || typeof value.uri !== 'string' || typeof value.line !== 'number' || typeof value.col !== 'number') return;
-    const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(value.uri));
-    const target = await vscode.window.showTextDocument(document, { preview: false, preserveFocus: false });
-    const position = new vscode.Position(value.line, value.col);
-    target.selection = new vscode.Selection(position, position);
-    target.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-  });
+  }
 }
 
 function graphHtml(webview: vscode.Webview, graph: GraphResult, title: string, heading: string): string {

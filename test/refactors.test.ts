@@ -186,7 +186,7 @@ test('run in par accepts a locally matched rendezvous', () => {
   assert.match(applyRefactorEdits(source, result.plan.edits), /par \{\n        c\.write\(1\);\n        value = c\.read\(\);/);
 });
 
-test('run in par explores alternate ready peers instead of depending on a greedy match', () => {
+test('run in par refuses when one legal peer choice completes but another deadlocks', () => {
   const first = '{ c.write(1); d.write(1); }';
   const last = '{ int otherC = c.read(); int fromD = d.read(); c.write(2); e.write(2); }';
   const source = [
@@ -200,10 +200,7 @@ test('run in par explores alternate ready peers instead of depending on a greedy
     '}',
     '',
   ].join('\n');
-  const result = succeed(planRunInPar(source, rangeFrom(source, first, last)));
-  const rewritten = applyRefactorEdits(source, result.plan.edits);
-  assert.match(rewritten, /par \{/);
-  assert.match(rewritten, /int fromE = e\.read\(\);/);
+  assert.match(fail(planRunInPar(source, rangeFrom(source, first, last))).reasons.join(' '), /legal rendezvous schedule can deadlock/);
 });
 
 test('run in par still refuses an unavoidable crossed rendezvous deadlock', () => {
@@ -218,7 +215,7 @@ test('run in par still refuses an unavoidable crossed rendezvous deadlock', () =
     '}',
     '',
   ].join('\n');
-  assert.match(fail(planRunInPar(source, rangeFrom(source, first, last))).reasons.join(' '), /provable rendezvous schedule/);
+  assert.match(fail(planRunInPar(source, rangeFrom(source, first, last))).reasons.join(' '), /legal rendezvous schedule can deadlock/);
 });
 
 test('run in par explains dependencies, opaque calls, unmatched channels, and branch-local declarations', () => {
@@ -282,7 +279,7 @@ test('run in par refuses opaque synchronization and reference mutations without 
 
 test('channel-direction repair changes a private parameter and all exact in-file callers', () => {
   const source = [
-    'private void writer(chan<int>.read out) { out.write(1); }',
+    'private void writer(chan<int>.read out) { int payload = 1; out.write(payload); }',
     'public void main(string[] args) {',
     '    chan<int> c;',
     '    par {',
@@ -292,7 +289,7 @@ test('channel-direction repair changes a private parameter and all exact in-file
     '}',
     '',
   ].join('\n');
-  const result = succeed(planChannelDiagnostic(source, { code: 'pj/channel-direction', range: rangeFrom(source, 'out.write(1)') }));
+  const result = succeed(planChannelDiagnostic(source, { code: 'pj/channel-direction', range: rangeFrom(source, 'out.write(payload)') }));
   assert.equal(result.plan.kind, 'channel-direction');
   const rewritten = applyRefactorEdits(source, result.plan.edits);
   assert.match(rewritten, /writer\(chan<int>\.write out\)/);
@@ -303,6 +300,7 @@ test('channel-direction repair changes a private parameter and all exact in-file
 test('channel-direction repair refuses public API changes and mixed-direction uses', () => {
   const publicSource = 'public void writer(chan<int>.read out) { out.write(1); }\n';
   assert.match(fail(planCorrectChannelDirection(publicSource, rangeFrom(publicSource, 'out.write(1)'))).reasons.join(' '), /public\/protected signature/);
+  assert.match(fail(planCorrectChannelDirection(publicSource, rangeFrom(publicSource, 'out.write(1)'), { allowExternalCallers: true })).reasons.join(' '), /No in-file callers demonstrate/);
 
   const mixed = [
     'private void broken(chan<int>.read end) {',

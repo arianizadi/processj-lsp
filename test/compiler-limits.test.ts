@@ -40,11 +40,34 @@ test('a negated call keeps its own diagnostic and now carries the comparison fix
   assert.deepEqual(r.diagnostics.filter((d) => d.code === 'pj/compiler-limit'), []);
 });
 
+test('any depth of whole-condition negation retains the call-as-condition error', () => {
+  const r = run(MAIN('    if (!!ready()) println("a");\n    if (!(!(ready()))) println("b");', 'public boolean ready() { return true; }'));
+  assert.equal(r.diagnostics.filter((d) => d.code === 'pj/call-as-condition').length, 2);
+  assert.deepEqual(r.diagnostics.filter((d) => d.code === 'pj/compiler-limit' && /whole condition/.test(d.message)), []);
+});
+
 test('a procedure that returns a value and can suspend cannot be compiled', () => {
   const hits = of('import std.*;\npublic int take(chan<int>.read c) { int v; v = c.read(); return v; }\npublic int twice(int n) { return n * 2; }\npublic int viaCall(chan<int>.read c) { return take(c); }\npublic void fine(chan<int>.read c) { int v; v = c.read(); println(v); }\npublic void main(string[] args) { }\n', 'pj/compiler-limit');
   assert.deepEqual(hits.map(([line]) => line), [1, 3]);
   assert.match(hits[0][1], /'take' returns int and can suspend/);
   assert.match(hits[0][1], /hand the result back through a channel parameter/);
+});
+
+test('post-walk yield and starvation results do not depend on declaration order', () => {
+  const source = [
+    'void spin() { while (true) { a(); } }',
+    'int a() { return b(); }',
+    'int b() { return 1; }',
+  ].join('\n');
+  const result = run(source);
+  assert.equal(result.diagnostics.filter((d) => d.code === 'pj/starving-loop').length, 1);
+  assert.equal(result.diagnostics.some((d) => d.code === 'pj/compiler-limit' && /returns int and can suspend/.test(d.message)), false);
+
+  const reordered = run(['int b() { return 1; }', 'int a() { return b(); }', 'void spin() { while (true) { a(); } }'].join('\n'));
+  assert.deepEqual(
+    reordered.diagnostics.filter((d) => d.code === 'pj/starving-loop' || /returns int and can suspend/.test(d.message)).map((d) => d.code),
+    ['pj/starving-loop'],
+  );
 });
 
 test('a channel carrying string is a compiler limit wherever the type is written', () => {
@@ -71,6 +94,11 @@ test('per-process limits: a second alt or par for in one process, but not one pe
   const twoParFors = of(MAIN('    par for (int i = 0; i < 2; i++) println("a" + i);\n    par for (int j = 0; j < 2; j++) println("b" + j);'), 'pj/compiler-limit');
   assert.deepEqual(twoParFors.map(([line]) => line), [4]);
   assert.match(twoParFors[0][1], /second 'par for' in the same process/);
+
+  const threeAlts = of('void f(chan<int>.read c) { int x; alt { x = c.read() : { } } alt { x = c.read() : { } } alt { x = c.read() : { } } }', 'pj/multiple-alts');
+  assert.equal(threeAlts.length, 2, 'every occurrence after the first is rejected');
+  const threeParFors = of('void f() { par for (int i = 0; i < 1; i++) skip; par for (int j = 0; j < 1; j++) skip; par for (int k = 0; k < 1; k++) skip; }', 'pj/compiler-limit');
+  assert.equal(threeParFors.filter(([, message]) => /second 'par for'/.test(message)).length, 2, 'every occurrence after the first is rejected');
 });
 
 test('a par for body with several statements runs each of them as its own process', () => {

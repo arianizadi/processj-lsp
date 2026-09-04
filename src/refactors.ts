@@ -9,7 +9,7 @@
 import { check, type CheckResult, type VarInfo } from './checker/checker';
 import { forEachReachableStatement } from './checker/controlflow';
 import { DeclIndex, type ProcSig } from './checker/index';
-import { searchRendezvousHeads } from './checker/rendezvous';
+import { proveAllRendezvousSchedulesComplete } from './checker/rendezvous';
 import { endOf, typeStr } from './checker/types';
 import { YieldAnalysis } from './checker/yields';
 import { KEYWORDS, LITERALS, PRIMITIVE_TYPES } from './keywords';
@@ -936,10 +936,10 @@ function proveChannelSchedule(branches: WalkFacts[]): string[] {
       return ['A channel operation uses an unresolved or already-separated endpoint, so a matching peer cannot be proved locally.'];
     }
   }
-  const proof = searchRendezvousHeads(queues, (left, right) => left.variable === right.variable && left.direction !== right.direction);
-  if (proof.kind === 'complete') return [];
+  const proof = proveAllRendezvousSchedulesComplete(queues, (left, right) => left.variable === right.variable && left.direction !== right.direction);
+  if (proof.kind === 'safe') return [];
   if (proof.kind === 'budget') return [`The selected channel operations exceed the bounded rendezvous proof budget (${proof.states} states), so the refactor is refused.`];
-  return ['The selected channel operations do not have a provable rendezvous schedule when each statement becomes a branch.'];
+  return ['At least one legal rendezvous schedule can deadlock when each selected statement becomes a branch.'];
 }
 
 /** Wrap independent complete statements in a `par` block after a local effect proof. */
@@ -1004,7 +1004,8 @@ function externalSignature(procedure: A.ProcDecl): boolean {
 
 function diagnosticUse(ctx: Context, range: A.Span): UseEvent | undefined {
   const candidates = allUses(ctx).filter((use) => overlaps(use.operation, range) || overlaps(use.expression.span, range) || containsSpan(use.operation, range) || containsSpan(range, use.operation));
-  candidates.sort((a, b) => spanSize(a.operation) - spanSize(b.operation));
+  const directChannelRank = (use: UseEvent): number => use.role === 'chan-read' || use.role === 'chan-write' ? 0 : 1;
+  candidates.sort((a, b) => directChannelRank(a) - directChannelRank(b) || spanSize(a.operation) - spanSize(b.operation));
   return candidates[0];
 }
 
@@ -1056,7 +1057,7 @@ export function planCorrectChannelDirection(source: string, range: A.Span, optio
     if (!endToken) return refuse(`Could not locate an exact endpoint token at a call to '${site.procedure.name.name}'.`);
     edits.push({ range: { start: { line: endToken.line, col: endToken.col }, end: { line: endToken.line, col: endToken.end } }, newText: desired });
   }
-  if (!callers && externalSignature(site.procedure) && !options.allowExternalCallers) return refuse(`No in-file callers prove that changing '${site.procedure.name.name}' is closed over the workspace.`);
+  if (!callers && externalSignature(site.procedure) && options.allowExternalCallers) return refuse(`No in-file callers demonstrate how the public/protected signature of '${site.procedure.name.name}' should be propagated; change it manually after reviewing external callers.`);
   const finalEdits = dedupeEdits(edits);
   const invalid = validateDiagnosticCandidate(ctx, finalEdits, 'pj/channel-direction', options);
   if (invalid.length) return refuse(...invalid);

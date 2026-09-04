@@ -247,9 +247,9 @@ on a laptop produced:
 
 ```
  lines   parse  symbols  check  effects  protocols  graph  inlays  semantic  format
- 1.3k     2.2      0.6    1.5      0.4        1.0    0.8     0.2       1.1     1.7 ms
-  10k    10.4      2.3    7.5      2.2        6.7    7.7     1.0       6.1    12.3 ms
-  50k    54.7     10.6   34.0     14.0       35.5   33.1     5.2      31.6    64.6 ms
+ 1.3k     1.7      0.2    1.7      1.0        1.6    0.8     0.2       1.1     2.6 ms
+  10k    10.4      1.9    6.1      8.8        7.7    5.7     1.0       7.3    12.7 ms
+  50k    50.9      9.3   36.2     31.7       35.6   30.9     6.2      32.2    63.0 ms
 ```
 
 (Exact numbers vary by machine; these are warm, steady-state runs rather than

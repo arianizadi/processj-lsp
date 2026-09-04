@@ -134,6 +134,7 @@ test('protocol switches expose explicit coverage, missing cases and duplicate de
     partial.labels.filter((label) => label.kind === 'case').map((label) => [label.name, label.valid, label.duplicate]),
     [['inherited', true, false], ['ping', true, false]],
   );
+  assert.ok(partial.insertAt);
   assert.equal(source.split('\n')[partial.insertAt.line][partial.insertAt.col], '}');
 
   assert.equal(withDefaults.coverage, 'exhaustive');
@@ -195,6 +196,26 @@ test('protocol diagnostics do not cascade from invalid cases or broken inheritan
   assert.equal(result.issues.some((issue) => issue.kind === 'inherited-case-collision'), false);
 });
 
+test('a recovery-truncated switch never inserts cases at a nested closing brace', () => {
+  const source = [
+    'protocol Message { ping: { } pong: { } }',
+    'void inspect(Message message) {',
+    '    switch (message) {',
+    '    case ping:',
+    '        if (true) { break; }',
+  ].join('\n');
+  const parsed = parse(source);
+  assert.ok(parsed.errors.length > 0);
+  const index = new DeclIndex();
+  index.addProgram(parsed.program, 'recovery.pj');
+  const checked = check(parsed.program, { index, text: source });
+  const result = analyzeProtocols(parsed.program, index, checked, { file: 'recovery.pj', sourceText: source, tokens: parsed.tokens });
+  const protocolSwitch = result.switches[0];
+  assert.ok(protocolSwitch);
+  assert.equal(protocolSwitch.insertAt, undefined);
+  assert.equal(result.issues.some((issue) => issue.kind === 'missing-cases'), false, 'no unsafe missing-case edit is offered without the outer brace');
+});
+
 test('flow facts connect construction, channel traffic and case inspection to procedures', () => {
   const source = [
     'protocol Message { ping: { int value; } pong: { } }',
@@ -228,6 +249,7 @@ test('flow facts connect construction, channel traffic and case inspection to pr
   assert.deepEqual([protocolTest?.caseName, protocolTest?.procedureName, protocolTest?.subject?.variableName], ['pong', 'consume', 'message']);
   assert.ok(send?.subject?.variableId?.includes('parameter'));
   assert.equal(send?.caseId, construct?.caseId);
+  assert.deepEqual([send?.procedureFile, send?.procedureSpan?.start.line, send?.procedureSpan?.start.col], ['flow.pj', 1, 5]);
 
   // Fact identity is content-derived, not tied to an analysis instance.
   assert.deepEqual(first.flows.map((flow) => flow.id), second.flows.map((flow) => flow.id));

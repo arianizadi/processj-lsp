@@ -453,7 +453,7 @@ export function formatConcurrencyMarkdown(title: string, graph: ConcurrencyGraph
     const to = shortIds.get(edge.to);
     if (!from || !to) continue;
     const label = escapeMermaid(edge.label ?? edge.kind);
-    lines.push(`    ${from} ${edge.confidence === 'exact' ? '-->' : '-.->'}|${label}| ${to}`);
+    lines.push(`    ${from} ${edge.confidence === 'exact' ? '-->' : '-.->'}|"${label}"| ${to}`);
   }
   lines.push('    classDef uncertain stroke-dasharray: 5 5,opacity:0.75', '```', '');
 

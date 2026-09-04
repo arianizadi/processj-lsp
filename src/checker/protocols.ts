@@ -138,7 +138,7 @@ export interface ProtocolSwitchFact {
   /** Undefined means the visible case universe is incomplete. */
   exhaustive: boolean | undefined;
   /** Safe insertion position for generated `case` clauses. */
-  insertAt: A.Pos;
+  insertAt?: A.Pos;
 }
 
 export type ProtocolFlowKind = 'construct' | 'send' | 'receive' | 'match' | 'test';
@@ -162,6 +162,9 @@ export interface ProtocolFlowFact {
   caseName?: string;
   procedureId?: string;
   procedureName?: string;
+  /** Declaration location for editor navigation; flow.span remains the observed operation. */
+  procedureFile?: string;
+  procedureSpan?: A.Span;
   /** Channel endpoint for send/receive; matched/tested value for match/test. */
   subject?: ProtocolValueFact;
 }
@@ -277,6 +280,8 @@ export function analyzeProtocols(
       const procedure: ProcedureContext = {
         id: protocolFactId(currentFile, 'procedure', declaration.name.span, declaration.name.name),
         name: declaration.name.name,
+        file: currentFile,
+        span: declaration.name.span,
       };
       visitAst(declaration.body, (node) => collectNode(node, procedure));
     } else if (declaration.kind === 'ConstDecl') {
@@ -309,6 +314,8 @@ export function analyzeProtocols(
             caseName: label.name,
             procedureId: procedure?.id,
             procedureName: procedure?.name,
+            procedureFile: procedure?.file,
+            procedureSpan: procedure?.span,
             subject: valueFact(statement.expr, currentFile, checked),
           });
         }
@@ -331,6 +338,8 @@ export function analyzeProtocols(
           caseName: literal.tag.name,
           procedureId: procedure?.id,
           procedureName: procedure?.name,
+          procedureFile: procedure?.file,
+          procedureSpan: procedure?.span,
           subject: valueFact(literal, currentFile, checked),
         });
         break;
@@ -354,6 +363,8 @@ export function analyzeProtocols(
           caseName,
           procedureId: procedure?.id,
           procedureName: procedure?.name,
+          procedureFile: procedure?.file,
+          procedureSpan: procedure?.span,
           subject: valueFact(write.target, currentFile, checked),
         });
         break;
@@ -372,6 +383,8 @@ export function analyzeProtocols(
           protocolName: structure.name,
           procedureId: procedure?.id,
           procedureName: procedure?.name,
+          procedureFile: procedure?.file,
+          procedureSpan: procedure?.span,
           subject: valueFact(read.target, currentFile, checked),
         });
         break;
@@ -393,6 +406,8 @@ export function analyzeProtocols(
           caseName: test.typeName.name,
           procedureId: procedure?.id,
           procedureName: procedure?.name,
+          procedureFile: procedure?.file,
+          procedureSpan: procedure?.span,
           subject: valueFact(test.expr, currentFile, checked),
         });
         break;
@@ -885,7 +900,7 @@ function analyzeSwitch(
     duplicateDefaults,
     coverage,
     exhaustive: coverage === 'unknown' ? undefined : coverage === 'exhaustive',
-    insertAt: locator?.closingBrace(statement.span) ?? beforeSpanEnd(statement.span),
+    insertAt: locator ? locator.closingBrace(statement.span) : beforeSpanEnd(statement.span),
   };
 }
 
@@ -894,7 +909,7 @@ function addSwitchIssues(fact: ProtocolSwitchFact, issues: ProtocolIssue[]): voi
   // suggestion). A simultaneous exhaustiveness warning would repeat the same
   // root cause and offer a misleading bulk insertion.
   const hasInvalidCase = fact.labels.some((label) => label.kind === 'case' && !label.valid);
-  if (fact.coverage === 'non-exhaustive' && !hasInvalidCase) {
+  if (fact.coverage === 'non-exhaustive' && !hasInvalidCase && fact.insertAt) {
     const names = fact.missingCases.map((protocolCase) => `'${protocolCase.name}'`).join(', ');
     issues.push({
       id: protocolFactId(fact.file, 'issue-missing-cases', fact.expressionSpan, fact.id),
@@ -979,6 +994,8 @@ function variableFactId(variable: VarInfo, file: string | undefined): string {
 interface ProcedureContext {
   id: string;
   name: string;
+  file?: string;
+  span: A.Span;
 }
 
 interface AstNode {
@@ -1019,18 +1036,24 @@ class SourceLocator {
     return out;
   }
 
-  closingBrace(span: A.Span): A.Pos {
-    const after = this.lowerBound(span.end);
-    const finalToken = this.tokens[after - 1];
-    if (finalToken?.text === '}' && samePosition(tokenEnd(finalToken), span.end)) return tokenStart(finalToken);
-    // Error-recovery trees may not end exactly on their brace. Keep the
-    // fallback bounded to this switch rather than rescanning the whole file.
-    for (let i = after - 1; i >= 0; i--) {
-      const token = this.tokens[i];
-      if (before(tokenStart(token), span.start)) break;
-      if (token.text === '}' && atOrBefore(tokenEnd(token), span.end)) return tokenStart(token);
+  closingBrace(span: A.Span): A.Pos | undefined {
+    const end = this.lowerBound(span.end);
+    let opening = -1;
+    for (let i = this.lowerBound(span.start); i < end; i++) {
+      if (this.tokens[i].text === '{') {
+        opening = i;
+        break;
+      }
     }
-    return beforeSpanEnd(span);
+    if (opening < 0) return undefined;
+    let depth = 0;
+    for (let i = opening; i < end; i++) {
+      const token = this.tokens[i];
+      if (token.text === '{') depth++;
+      else if (token.text === '}' && --depth === 0) return tokenStart(token);
+    }
+    // An unmatched or recovery-truncated switch has no safe insertion point.
+    return undefined;
   }
 
   private lowerBound(position: A.Pos): number {
@@ -1059,14 +1082,6 @@ function tokenSpan(token: Token): A.Span {
 
 function before(a: A.Pos, b: A.Pos): boolean {
   return a.line < b.line || (a.line === b.line && a.col < b.col);
-}
-
-function atOrBefore(a: A.Pos, b: A.Pos): boolean {
-  return a.line < b.line || (a.line === b.line && a.col <= b.col);
-}
-
-function samePosition(a: A.Pos, b: A.Pos): boolean {
-  return a.line === b.line && a.col === b.col;
 }
 
 function fallbackDefaultSpan(group: A.SwitchGroup, labelIndex: number): A.Span {

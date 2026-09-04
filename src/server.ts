@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   CodeAction,
   CodeActionKind,
+  CodeLensRefreshRequest,
   DidChangeWatchedFilesNotification,
   DidChangeWorkspaceFoldersNotification,
   type WorkspaceFoldersChangeEvent,
@@ -113,6 +114,8 @@ let clientSupportsDocumentChanges = false;
 let clientSupportsApplyEdit = false;
 let clientSupportsCodeActionLiterals = false;
 let clientSupportsDisabledCodeActions = false;
+let clientSupportsInlayHintRefresh = false;
+let clientSupportsCodeLensRefresh = false;
 let install: Install | undefined;
 let installError: string | undefined;
 let library: LibrarySymbol[] = [];
@@ -153,6 +156,7 @@ const lintPending = new Map<string, NodeJS.Timeout>();
 // that synthetic event so it cannot cancel the required open-time compiler run.
 const openingDocuments = new Set<string>();
 const LINT_DELAY_MS = 40;
+let analysisDecorationRefresh: NodeJS.Timeout | undefined;
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -168,6 +172,8 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   clientSupportsApplyEdit = !!params.capabilities.workspace?.applyEdit;
   clientSupportsCodeActionLiterals = !!params.capabilities.textDocument?.codeAction?.codeActionLiteralSupport;
   clientSupportsDisabledCodeActions = !!params.capabilities.textDocument?.codeAction?.disabledSupport;
+  clientSupportsInlayHintRefresh = !!params.capabilities.workspace?.inlayHint?.refreshSupport;
+  clientSupportsCodeLensRefresh = !!params.capabilities.workspace?.codeLens?.refreshSupport;
 
   const found = findInstall({ installDir: settings.installDir, javaBin: settings.javaBin });
   if ('error' in found) {
@@ -371,6 +377,19 @@ function invalidate(doc: TextDocument, recompile: boolean): void {
     scheduleCheck(doc, 0);
   }
   schedulePublish(doc);
+  scheduleAnalysisDecorationRefresh();
+}
+
+/** Coalesce global refresh requests when one dependency invalidates many importers. */
+function scheduleAnalysisDecorationRefresh(): void {
+  if ((!clientSupportsInlayHintRefresh && !clientSupportsCodeLensRefresh) || analysisDecorationRefresh) return;
+  analysisDecorationRefresh = setTimeout(() => {
+    analysisDecorationRefresh = undefined;
+    const requests: Promise<void>[] = [];
+    if (clientSupportsInlayHintRefresh) requests.push(connection.languages.inlayHint.refresh());
+    if (clientSupportsCodeLensRefresh) requests.push(connection.sendRequest(CodeLensRefreshRequest.type));
+    void Promise.all(requests).catch((error) => connection.console.warn(`could not refresh ProcessJ analysis decorations: ${String(error)}`));
+  }, 0);
 }
 documents.onDidSave((e) => {
   scheduleCheck(e.document, 0);
@@ -573,6 +592,7 @@ function analyzeProgram(program: A.Program, ownPath: string | undefined, text?: 
     rootDependencies: resolution.files,
     maxImportedFiles: DEFAULT_MAX_IMPORTED_FILES,
     load: loadImportedUnit,
+    loadTruncated: () => importedFilesChecked >= DEFAULT_MAX_IMPORTED_FILES,
   });
   const yieldCalls = new Map(reachable.calls);
   for (const [invocation, selected] of checked.calls) yieldCalls.set(invocation, selected);

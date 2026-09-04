@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { searchRendezvousHeads } from '../src/checker/rendezvous';
+import { proveAllRendezvousSchedulesComplete, searchRendezvousHeads } from '../src/checker/rendezvous';
 
 interface Operation {
   channel: string;
@@ -19,6 +19,7 @@ test('bounded rendezvous search finds a completing non-greedy schedule in either
   ];
   assert.equal(searchRendezvousHeads(branches, pair).kind, 'complete');
   assert.equal(searchRendezvousHeads([branches[2], branches[0], branches[1]], pair).kind, 'complete');
+  assert.equal(proveAllRendezvousSchedulesComplete(branches, pair).kind, 'deadlock', 'a completing schedule does not prove every legal schedule safe');
 });
 
 test('bounded rendezvous search distinguishes unavoidable deadlock from proof-budget exhaustion', () => {
@@ -39,4 +40,5 @@ test('bounded rendezvous search distinguishes unavoidable deadlock from proof-bu
   // A directly observed completing transition remains a proof even with a
   // one-state worklist budget; no sibling state needs to be explored.
   assert.equal(searchRendezvousHeads([[write('c')], [read('c')]], pair, 1).kind, 'complete');
+  assert.equal(proveAllRendezvousSchedulesComplete([[write('c')], [read('c')]], pair, 2).kind, 'safe');
 });

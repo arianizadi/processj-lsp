@@ -114,4 +114,12 @@ test('reachable imports preserve exact overload yield and transitive parameter e
     true,
     'an omitted imported overload chain stays conservatively yielding instead of binding against the root scope',
   );
+
+  const sharedLoaderBudget = analyzeReachableCalls(root, {
+    rootDependencies: root.dependencies,
+    load: () => undefined,
+    loadTruncated: () => true,
+  });
+  assert.equal(sharedLoaderBudget.units.length, 1);
+  assert.equal(sharedLoaderBudget.truncated, true, 'a loader that already spent its shared budget propagates truncation to the walk');
 });

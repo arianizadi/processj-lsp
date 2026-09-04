@@ -46,6 +46,8 @@ test('the concurrency graph connects procedures, branches, calls and channels wi
   assert.match(report, /flowchart LR/);
   assert.match(report, /Procedure effects/);
   assert.match(report, /produce/);
+  assert.match(report, /-->\|"produce\(chan‹int›\.write\)"\|/, 'Mermaid-sensitive call punctuation is contained in a quoted edge label');
+  assert.doesNotMatch(report, /-->\|produce\(/);
 });
 
 test('unreachable operations are absent from the exact execution graph', () => {
