@@ -567,7 +567,11 @@ class Parser {
         this.error(v, `Annotation '${name.name}' needs an identifier, boolean, or numeric value; found ${this.describe(v)}`);
       }
       if (!this.atEof()) this.next();
-      out.push({ name: name.name, value: v.text });
+      out.push({
+        name: name.name,
+        value: v.text,
+        span: { start: { line: v.line, col: v.col }, end: { line: v.line, col: v.end } },
+      });
       if (this.accept(',')) continue;
       break;
     }

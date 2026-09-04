@@ -1,0 +1,10 @@
+// outcome: runs-wrong
+import std.*;
+// Each statement of a par for body is its own process, so `x` is declared in one
+// process and printed as 0 by another. Verified: prints "x=0" twice.
+public void main(string[] args) {
+    par for (int i = 0; i < 2; i++) {
+        int x = i * 10;
+        println("i=" + i + " x=" + x);
+    }
+}

@@ -1,0 +1,10 @@
+// outcome: deadlocks
+import std.*;
+// The replicated body writes inline from two iterations before any reader runs.
+public void main(string[] args) {
+    shared chan<int> c;
+    par for (int i = 0; i < 4; i++) {
+        if (i < 2) c.write(i);
+        else println("read " + c.read());
+    }
+}

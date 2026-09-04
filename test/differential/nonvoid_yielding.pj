@@ -1,0 +1,13 @@
+// outcome: compiler-limit
+import std.*;
+// A value-returning procedure that suspends puts its `return` inside the
+// generated process body, and javac rejects it.
+public int take(chan<int>.read c) { int v; v = c.read(); return v; }
+public void main(string[] args) {
+    chan<int> c;
+    int x;
+    par {
+        c.write(7);
+        { x = take(c.read); println("got " + x); }
+    }
+}

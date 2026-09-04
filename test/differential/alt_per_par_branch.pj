@@ -1,0 +1,13 @@
+// outcome: runs
+import std.*;
+// One alt per par branch is one alt per generated class, which builds and runs.
+public void main(string[] args) {
+    chan<int> a;
+    chan<int> b;
+    par {
+        a.write(1);
+        b.write(2);
+        { int x; alt { x = a.read() : { println("A " + x); } } }
+        { int y; alt { y = b.read() : { println("B " + y); } } }
+    }
+}

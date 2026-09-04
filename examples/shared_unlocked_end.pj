@@ -1,0 +1,19 @@
+// expect: pj/shared-unlocked-end
+import std.*;
+
+// Declaring the channel `shared` is only half of it. This ProcessJ build claims
+// the runtime's write lock from the *parameter's* type, so a write made directly
+// on the channel variable takes no lock at all. Two such writers then overwrite
+// the runtime's single writer slot and the program hangs after the first
+// rendezvous. Passing `c.write` to a `shared chan<int>.write` parameter works.
+public void main(string[] args) {
+    shared chan<int> c;
+    par {
+        c.write(1);
+        c.write(2);
+        {
+            println(c.read());
+            println(c.read());
+        }
+    }
+}

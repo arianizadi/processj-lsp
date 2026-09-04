@@ -20,6 +20,9 @@ function stdIndex(): DeclIndex {
   return idx;
 }
 const STD = stdIndex();
+const TRUSTED_STD_OUTPUT_DECLARATIONS = new Set(
+  ['print', 'println'].flatMap((name) => STD.procs.get(name) ?? []).map((signature) => signature.decl),
+);
 
 export function run(src: string, opts: { std?: boolean } = {}) {
   const parsed = parse(src);
@@ -28,7 +31,13 @@ export function run(src: string, opts: { std?: boolean } = {}) {
   index.addProgram(parsed.program, 'test.pj');
   const importsStd = /import\s+std\b/.test(src);
   if (opts.std !== false && importsStd) index.addIndex(STD);
-  const result = check(parsed.program, { index, stdIndex: STD, importsStd, text: src });
+  const result = check(parsed.program, {
+    index,
+    stdIndex: STD,
+    importsStd,
+    text: src,
+    trustedNonBlockingNativeDeclarations: TRUSTED_STD_OUTPUT_DECLARATIONS,
+  });
   return { ...result, codes: result.diagnostics.filter((d) => d.severity !== 'info').map((d) => d.code), notes: result.diagnostics.filter((d) => d.severity === 'info').map((d) => `${d.line + 1}:${d.code}`), messages: result.diagnostics.filter((d) => d.severity !== 'info').map((d) => `${d.line + 1}: ${d.message}`), errors: result.diagnostics.filter((d) => d.severity === 'error') };
 }
 
@@ -129,7 +138,7 @@ test('channels: element types, directions, whole channel vs end, shared requirem
 
 test('records and protocols: fields, literals, switch narrowing, is', () => {
   const decls = 'record Point { int x; int y; }\nrecord Point3 extends Point { int z; }\nprotocol Msg { move : { int dx; int dy; } quit : { string reason; } }';
-  const ok = run(MAIN('    Point3 p = new Point3 { x = 1, y = 2, z = 3 };\n    int s = p.x + p.z;\n    Point q = p;\n    Msg m = new Msg { move: dx = 1, dy = 2 };\n    Msg n = new Msg { quit: };\n    switch (m) {\n        case move: s = m.dx; break;\n        case quit: println(m.reason); break;\n    }\n    if (m is move) s = m.dy;\n    println(s + q.y + n.reason);', decls));
+  const ok = run(MAIN('    Point3 p = new Point3 { x = 1, y = 2, z = 3 };\n    int s = p.x + p.z;\n    Point q = p;\n    Msg m = new Msg { move: dx = 1, dy = 2 };\n    Msg n = new Msg { quit: };\n    switch (m) {\n        case move: s = m.dx; break;\n        case quit: println(m.reason); break;\n    }\n    if (m is move) s = m.dy;\n    println(s + q.y);', decls));
   assert.deepEqual(ok.errors, [], ok.messages.join('\n'));
   const bad = run(MAIN('    Point p = new Point { x = 1, yy = 2 };\n    int a = p.z;\n    Msg m = new Msg { mvoe: dx = 1 };\n    Msg n = new Msg { move: reason = "r" };\n    switch (m) {\n        case move: println(m.reason); break;\n        case halt: break;\n    }\n    boolean b = m is bogus;\n    Point q = new Msg { quit: };', decls));
   assert.deepEqual(
@@ -145,6 +154,8 @@ test('records and protocols: fields, literals, switch narrowing, is', () => {
       "15: Cannot initialise 'q' (Point) with a value of type Msg",
     ],
   );
+  const unnarrowed = run(MAIN('    Msg n = new Msg { quit: reason = "done" };\n    println(n.reason);', decls));
+  assert.match(unnarrowed.errors.find((d) => d.code === 'pj/type/field')?.message ?? '', /only be inspected after a protocol switch/);
 });
 
 test('procedure calls: overload resolution, mismatch explanations, methods, return and break checks', () => {
@@ -180,12 +191,29 @@ test('an end handed to a procedure is not an operation: no blocking or self-dead
   assert.deepEqual(bothEnds.codes.filter((c) => (c ?? '').startsWith('pj/channel')), []);
 });
 
+test('parenthesized and explicitly selected channel operations remain direct, not escaped', () => {
+  const result = run(MAIN('    chan<int> c;\n    par {\n        c.write.write(1);\n        println((c).read());\n    }'));
+  assert.deepEqual(result.codes.filter((code) => (code ?? '').startsWith('pj/channel')), []);
+  const channel = result.channels.find((fact) => fact.variable.name === 'c');
+  assert.ok(channel);
+  assert.equal(channel.escaped, false);
+  assert.deepEqual(channel.operations.map((operation) => [operation.end, operation.direct]), [['write', true], ['read', true]]);
+});
+
 test('a read guard in an alt with other guards does not block by itself', () => {
   const alt = run(MAIN('    chan<int> c;\n    timer t;\n    int v;\n    alt {\n        v = c.read() : { println("got " + v); }\n        t.timeout(5000) : { println("timer"); }\n    }'));
   assert.deepEqual(alt.codes.filter((c) => (c ?? '').startsWith('pj/channel')), []);
   // A lone read guard is just a read: with no writer anywhere it blocks.
   const lone = run(MAIN('    chan<int> c;\n    int v;\n    alt {\n        v = c.read() : { println("got " + v); }\n    }'));
   assert.ok(lone.codes.includes('pj/channel-no-writer'));
+});
+
+test('an alt read still counts as a possible peer for a writer in another par branch', () => {
+  const result = run(MAIN('    chan<int> c;\n    timer t;\n    int v;\n    par {\n        { alt {\n            v = c.read() : { println(v); }\n            t.timeout(50) : { }\n        } }\n        c.write(1);\n    }'));
+  assert.deepEqual(result.codes.filter((code) => (code ?? '').startsWith('pj/channel')), []);
+  const channel = result.channels.find((fact) => fact.variable.name === 'c');
+  assert.deepEqual(channel?.operations.map((operation) => [operation.end, operation.direct]), [['read', true], ['write', true]]);
+  assert.equal(channel?.hazard, undefined);
 });
 
 test('a par for body is many processes: writes and reads of one channel inside it are not a self-deadlock', () => {
@@ -217,20 +245,47 @@ test('starving loops: infinite loops that never communicate, unless they can exi
 test('par deadlock simulation: crossed orders, unmatched writes, and correct pairings', () => {
   const crossed = run(MAIN('    chan<int> c;\n    chan<int> d;\n    par {\n        { c.write(1); int x = d.read(); println(x); }\n        { d.write(2); int y = c.read(); println(y); }\n    }'));
   assert.deepEqual(crossed.codes, ['pj/par-deadlock']);
+  assert.equal(crossed.deadlocks[0]?.cause, 'circular-wait');
   assert.match(crossed.messages[0], /branch 1 waits to write 'c', branch 2 waits to write 'd'/);
   const unmatched = run(MAIN('    chan<int> c;\n    par {\n        { c.write(1); c.write(2); }\n        println(c.read());\n    }'));
   assert.deepEqual(unmatched.codes, ['pj/par-deadlock']);
   assert.match(unmatched.messages[0], /branch 1 waits to write 'c' but every other branch has finished/);
   const fine = run(MAIN('    chan<int> c;\n    chan<int> d;\n    par {\n        { c.write(1); int x = d.read(); println(x); }\n        { int y = c.read(); d.write(y + 1); }\n    }'));
   assert.deepEqual(fine.codes, []);
+  const wrapped = run(MAIN('    timer clock;\n    chan<int> c;\n    chan<int> d;\n    par {\n        { long now = clock.read(); c.write.write(1); int x = d.read.read(); println(now + x); }\n        { d.write.write(2); int y = c.read.read(); println(y); }\n    }'));
+  assert.deepEqual(wrapped.codes, ['pj/par-deadlock'], 'timer reads and endpoint selectors do not make an otherwise exact simulation opaque');
   // Opaque branches (a loop, a call that takes a channel) switch the simulation off.
   const opaque = run(MAIN('    chan<int> c;\n    par {\n        while (true) c.write(1);\n        println(c.read());\n    }'));
   assert.deepEqual(opaque.codes, []);
 });
 
+test('rendezvous proof explores ambiguous peers instead of depending on branch order', () => {
+  const branches = [
+    '{ c.write(1); d.write(1); }',
+    '{ int fromC = c.read(); int fromE = e.read(); }',
+    '{ int otherC = c.read(); int fromD = d.read(); c.write(2); e.write(2); }',
+  ];
+  const runOrder = (ordered: string[]) => run(MAIN(`    shared chan<int> c;\n    chan<int> d;\n    chan<int> e;\n    par {\n        ${ordered.join('\n        ')}\n    }`));
+  const original = runOrder(branches);
+  const swapped = runOrder([branches[0], branches[2], branches[1]]);
+  assert.equal(original.codes.includes('pj/par-deadlock'), false, original.messages.join('\n'));
+  assert.equal(swapped.codes.includes('pj/par-deadlock'), false, swapped.messages.join('\n'));
+});
+
+test('multiple independently unmatched waits are missing peers and retain exact no-peer diagnostics', () => {
+  const writers = run(MAIN('    shared chan<int> left;\n    shared chan<int> right;\n    par {\n        { left.write(1); right.write(1); }\n        { right.write(2); left.write(2); }\n    }'));
+  assert.equal(writers.codes.filter((code) => code === 'pj/par-deadlock').length, 1);
+  assert.equal(writers.deadlocks[0]?.cause, 'missing-peer');
+  assert.deepEqual(writers.deadlocks[0]?.waits.map((wait) => [wait.branch, wait.operation, wait.channel.name]), [[1, 'write', 'left'], [2, 'write', 'right']]);
+  assert.equal(writers.codes.filter((code) => code === 'pj/channel-no-reader').length, 2);
+  assert.match(writers.diagnostics.find((diagnostic) => diagnostic.code === 'pj/par-deadlock')?.message ?? '', /matching read on 'left' for branch 1 or a matching read on 'right' for branch 2/);
+  assert.equal(writers.channels.find((fact) => fact.variable.name === 'left')?.hazard, 'no-reader');
+  assert.equal(writers.channels.find((fact) => fact.variable.name === 'right')?.hazard, 'no-reader');
+});
+
 test('par for: outer variables and non-shared ends are shared by every iteration', () => {
   const r = run(MAIN('    chan<int> c;\n    int sum = 0;\n    par for (int i = 0; i < 3; i++) {\n        sum += i;\n        c.write(i);\n    }\n    for (int j = 0; j < 3; j++) println(c.read() + sum);'));
-  assert.deepEqual(r.codes.sort(), ['pj/parallel-usage', 'pj/shared-channel-end']);
+  assert.deepEqual(r.codes.sort(), ['pj/par-for-body', 'pj/parallel-usage', 'pj/shared-channel-end']);
   assert.equal(r.diagnostics.find((d) => d.code === 'pj/shared-channel-end')?.fix?.kind, 'make-shared');
 });
 
@@ -239,6 +294,79 @@ test('pri alt with skip before other guards, trivial alt and par, unreachable co
   const codes = new Set(r.diagnostics.map((d) => d.code));
   for (const c of ['pj/pri-alt-skip', 'pj/trivial-alt', 'pj/trivial-par', 'pj/unreachable', 'pj/assign-in-condition', 'pj/barrier-not-enrolled']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
   assert.ok(!codes.has('pj/string-identity'));
+});
+
+test('unreachable code is still type-checked but cannot create execution facts', () => {
+  const r = run(MAIN([
+    '    chan<int> channel;',
+    '    barrier gate;',
+    '    return;',
+    '    int wrong = "not an int";',
+    '    int value = channel.read();',
+    '    gate.sync();',
+  ].join('\n')));
+
+  assert.ok(r.codes.includes('pj/unreachable'));
+  assert.ok(r.codes.includes('pj/type/assign'), 'dead code remains type-checked');
+  assert.equal(r.codes.includes('pj/channel-no-writer'), false);
+  assert.equal(r.codes.includes('pj/barrier-not-enrolled'), false);
+  assert.deepEqual(r.deadlocks, []);
+  assert.equal(r.channels.find((fact) => fact.variable.name === 'channel')?.operations.length, 0);
+});
+
+test('rendezvous proofs stop at unresolved, diverging and spoofed calls but retain trusted std output leaves', () => {
+  const crossedBody = (call: string) => [
+    '    chan<int> a;',
+    '    chan<int> b;',
+    '    par {',
+    `        { ${call} a.write(1); int fromB = b.read(); }`,
+    '        { b.write(1); int fromA = a.read(); }',
+    '    }',
+  ].join('\n');
+
+  const unresolvedSource = `import missing.*;\npublic void main(string[] args) {\n${crossedBody('mystery();')}\n}\n`;
+  const unresolvedProgram = parse(unresolvedSource).program;
+  const unresolvedIndex = new DeclIndex();
+  unresolvedIndex.addProgram(unresolvedProgram, 'unresolved.pj');
+  const unresolved = check(unresolvedProgram, { index: unresolvedIndex, unresolvedImports: true, text: unresolvedSource });
+  assert.equal(unresolved.diagnostics.some((diagnostic) => diagnostic.code === 'pj/par-deadlock'), false);
+
+  const bodyless = run(MAIN(crossedBody('opaque();'), 'private native void opaque();'));
+  assert.equal(bodyless.codes.includes('pj/par-deadlock'), false);
+
+  const localPure = run(MAIN(crossedBody('pure();'), 'private void pure() { }'));
+  assert.equal(localPure.codes.includes('pj/par-deadlock'), false, 'an unproven body-bearing call is not an exact transparent step');
+
+  const diverging = run(MAIN(crossedBody('spin();'), 'private void spin() { while (true) { } }'));
+  assert.equal(diverging.codes.includes('pj/par-deadlock'), false, 'a wait after a nonterminating call is not reported as reachable');
+
+  const stdOutput = run(MAIN(crossedBody('println(1);')));
+  assert.equal(stdOutput.codes.includes('pj/par-deadlock'), true, 'the compiler-verified std output leaf remains a narrow exception');
+
+  const spoofSource = MAIN(crossedBody('println(1);'));
+  const spoofProgram = parse(spoofSource).program;
+  const spoofIndex = new DeclIndex();
+  spoofIndex.addProgram(spoofProgram, '/workspace/main.pj');
+  spoofIndex.addProgram(parse('public native void println(int value);').program, '/workspace/std/io.pj');
+  const spoofed = check(spoofProgram, {
+    index: spoofIndex,
+    text: spoofSource,
+    trustedNonBlockingNativeDeclarations: TRUSTED_STD_OUTPUT_DECLARATIONS,
+  });
+  assert.equal(spoofed.diagnostics.some((diagnostic) => diagnostic.code === 'pj/par-deadlock'), false, 'a workspace std/io.pj lookalike is not trusted by its path or spelling');
+});
+
+test('short-circuit-only channel operations cannot become exact rendezvous heads', () => {
+  const source = MAIN([
+    '    chan<int> conditional;',
+    '    chan<int> live;',
+    '    par {',
+    '        { boolean skipped = true || conditional.read() > 0; live.write(1); }',
+    '        { int value = live.read(); }',
+    '    }',
+  ].join('\n'));
+  const result = run(source);
+  assert.equal(result.codes.includes('pj/par-deadlock'), false, 'the skipped conditional read must not fabricate an unmatched branch head');
 });
 
 test('a procedure that suspends only through calls gets a [yield=true] quick fix', () => {
@@ -280,6 +408,26 @@ test('yield analysis survives call cycles: every member of a cycle that reaches 
   assert.deepEqual(hits, [2, 3]);
 });
 
+test('yield diagnostics follow the selected overload, mobile construction and yield=false replacement', () => {
+  const overload = run([
+    'void f(int n) { }',
+    'void f(chan<int>.read c) { c.read(); }',
+    'void caller() { f(1); }',
+  ].join('\n'));
+  assert.deepEqual(overload.diagnostics.filter((d) => d.code === 'pj/needs-yield-annotation'), []);
+
+  const mobile = run([
+    'record Handle { }',
+    'mobile void worker() { }',
+    'void make() { Handle process = new mobile(worker); }',
+    'void caller() [yield=false] { make(); }',
+  ].join('\n'));
+  const warning = mobile.diagnostics.find((d) => d.code === 'pj/needs-yield-annotation');
+  assert.ok(warning);
+  assert.equal(warning.line, 3);
+  assert.deepEqual(warning.fix, { kind: 'edit', title: 'Add [yield=true]', line: 3, col: 21, endCol: 26, text: 'true' });
+});
+
 test('unused reports are per overload and skip native declarations', () => {
   const r = run('public void foo(int a) { int dead = 1; }\npublic void foo(long b) { int other = 2; }\npublic native void bar(int x);\npublic void main(string[] args) { foo(1); foo(2L); }\n');
   const unused = r.diagnostics.filter((d) => d.code === 'pj/unused').map((d) => `${d.line}:${/'(\w+)'/.exec(d.message)![1]}`);
@@ -314,6 +462,7 @@ test('reads that must be their own statement: inside ?:, inside a write value; c
   const calls = r.diagnostics.filter((d) => d.code === 'pj/call-as-condition');
   assert.deepEqual(calls.map((d) => d.line + 1), [16, 17]);
   assert.equal(calls[0].fix?.text, ' == true');
+  assert.equal(calls[1].fix?.text, 'ready(2) == false');
 });
 
 test('every confirmed compiler bug that depends on the code is reported at its point of use', () => {
@@ -336,14 +485,15 @@ test('every confirmed compiler bug that depends on the code is reported at its p
       '    xs[c.read()] = 1;',
       '    int f = c.read().x;',
       '    par for (int j = 0; j < 2; j++) println(j);',
-      '    if (rr == null) rr = new R { x = 1 };',
+      '    if (rr == null) println("null");',
+      '    rr = new R { x = 1 };',
       '    stop;',
     ].join('\n'),
     'record R { int x; }\nrecord Cyc { Cyc next; }\npublic void worker(int i, chan<int>.write out) { out.write(i); }',
   ));
   const lines = r.diagnostics.map((d) => `${d.line + 1}:${d.code}`);
   // Line numbers: MAIN adds two lines (import + extra decls) before the body.
-  const want = ['3:pj/compiler-limit', '7:pj/compiler-limit', '13:pj/compiler-limit', '17:pj/compiler-limit', '19:pj/read-placement', '20:pj/read-placement', '21:pj/read-placement'];
+  const want = ['3:pj/compiler-limit', '7:pj/compiler-limit', '13:pj/compiler-limit', '17:pj/compiler-limit', '19:pj/read-placement', '20:pj/read-placement', '21:pj/read-placement', '24:pj/compiler-limit'];
   for (const w of want) assert.ok(lines.includes(w), `${w} in ${lines.join(' ')}`);
   // Comparing with null is fine and reads inside an index on the right-hand side are fine.
   assert.equal(lines.filter((l) => l.startsWith('23:')).length, 0, lines.join(' '));

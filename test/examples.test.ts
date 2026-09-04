@@ -35,9 +35,25 @@ test('examples produce exactly the diagnostics they announce', () => {
     const res = resolveImports(parsed.program, file, [EXAMPLES], INCLUDE);
     const index = new DeclIndex();
     index.addProgram(parsed.program, file);
-    for (const dep of res.files) index.addProgram(parse(fs.readFileSync(dep, 'utf8')).program, dep);
+    const trustedNonBlockingNativeDeclarations = new Set<import('../src/parser/ast').ProcDecl>();
+    for (const dep of res.files) {
+      const dependency = parse(fs.readFileSync(dep, 'utf8')).program;
+      index.addProgram(dependency, dep);
+      if (path.resolve(dep) === path.resolve(INCLUDE, 'std', 'io.pj')) {
+        for (const declaration of dependency.decls) {
+          if (declaration.kind === 'ProcDecl' && (declaration.name.name === 'print' || declaration.name.name === 'println')) {
+            trustedNonBlockingNativeDeclarations.add(declaration);
+          }
+        }
+      }
+    }
     const unresolved = res.imports.some((i) => i.files.length === 0);
-    const r = check(parsed.program, { index, importsStd: res.importsStd, unresolvedImports: unresolved });
+    const r = check(parsed.program, {
+      index,
+      importsStd: res.importsStd,
+      unresolvedImports: unresolved,
+      trustedNonBlockingNativeDeclarations,
+    });
     const all = [...importDiagnostics(res, true), ...r.diagnostics];
     const actual = all.filter((d) => d.severity !== 'info').map((d) => d.code ?? '?').sort();
     if (unresolved) problems.push(`${f}: unresolved import`);

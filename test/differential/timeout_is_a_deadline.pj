@@ -1,0 +1,10 @@
+// outcome: runs-wrong
+import std.*;
+// `t.timeout(300)` is an absolute wall-clock deadline that has long passed, so
+// it returns at once. Verified: 1 ms elapsed here, 306 ms with t.read() + 300.
+public void main(string[] args) {
+    timer t;
+    long before = t.read();
+    t.timeout(300);
+    println("elapsed " + (t.read() - before));
+}

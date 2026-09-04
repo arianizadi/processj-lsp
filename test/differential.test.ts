@@ -9,10 +9,14 @@ import { parse } from '../src/parser/parser';
 const DIR = path.join(__dirname, '..', '..', 'test', 'differential');
 const INCLUDE = path.join(__dirname, '..', '..', 'test', 'fixtures', 'include');
 const BLOCKING = new Set(['pj/channel-no-writer', 'pj/channel-no-reader', 'pj/channel-self-deadlock', 'pj/par-deadlock', 'pj/starving-loop']);
+/** Warnings about runtime lock-ups the checker cannot prove but must at least point out. */
+const MAY_DEADLOCK = new Set(['pj/shared-unlocked-end']);
 
 /**
- * Each program records what the real compiler and runtime did with it (`// outcome: runs` or `runs-wrong` (builds and runs, but wrong; kept as a corpus, no claim is checked) or `error` (does not build: an error must say so), `runs-wrong`, `error`
- * means it built and finished). The checker must never claim that a program that runs
+ * Each program records what the real compiler and runtime did with it: `// outcome: runs` (built and
+ * finished), `runs-wrong` (builds and runs, but wrong; kept as a corpus, no claim is checked), `error`
+ * (does not build: an error must say so), `compiler-limit` (crashes the compiler: a limit note must say
+ * so), or `deadlocks` (builds but never finishes: a blocking or may-deadlock warning must say so). The checker must never claim that a program that runs
  * blocks or has an error. `npm run validate test/differential` re-derives the outcomes.
  */
 test('the checker never contradicts a program that really runs', () => {
@@ -38,6 +42,7 @@ test('the checker never contradicts a program that really runs', () => {
     if (outcome === 'runs' && claims.length) problems.push(`${f} runs, but the checker says: ${claims.map((d) => `L${d.line + 1} ${d.code}`).join(', ')}`);
     if (outcome === 'compiler-limit' && !r.diagnostics.some((d) => d.code === 'pj/compiler-limit')) problems.push(`${f} cannot be built by this compiler, but nothing in the file says so`);
     if (outcome === 'error' && !r.diagnostics.some((d) => d.severity === 'error')) problems.push(`${f} does not build, but the checker reports no error`);
+    if (outcome === 'deadlocks' && !r.diagnostics.some((d) => BLOCKING.has(d.code ?? '') || MAY_DEADLOCK.has(d.code ?? ''))) problems.push(`${f} builds but never finishes, and nothing in the file warns about it`);
   }
   assert.deepEqual(problems, []);
 });

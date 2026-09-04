@@ -1,0 +1,16 @@
+// outcome: compiler-limit
+import std.*;
+// A read inside an alt timeout guard is generated inline and javac rejects it.
+// Computing the deadline into a local first builds and runs.
+public void main(string[] args) {
+    chan<int> c;
+    timer t;
+    int x;
+    par {
+        c.write(1);
+        alt {
+            x = c.read() : { println("read " + x); }
+            t.timeout(t.read() + 1000) : { println("late"); }
+        }
+    }
+}

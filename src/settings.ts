@@ -12,7 +12,7 @@ export interface Settings {
   runTimeoutMs: number;
   /** Turn the built-in static analysis on or off. */
   lint: boolean;
-  /** Offer Run / Build code lenses above main. */
+  /** Offer inline Run, Build, effect, graph, and protocol code lenses. */
   codeLens: boolean;
 }
 

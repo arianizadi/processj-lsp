@@ -1,0 +1,17 @@
+// outcome: deadlocks
+import std.*;
+// Two branches write the shared channel inline. The code generator only emits the
+// runtime's claimWrite/unclaimWrite lock for a parameter declared
+// `shared chan<int>.write`, so both writers race and the program hangs after
+// the first rendezvous.
+public void main(string[] args) {
+    shared chan<int> c;
+    par {
+        seq {
+            c.write(5);
+        }
+        c.write(5);
+        println(c.read());
+        println(c.read());
+    }
+}

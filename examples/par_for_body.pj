@@ -1,0 +1,13 @@
+// expect: pj/par-for-body
+import std.*;
+
+// A `par for` body behaves like a `par` block: every statement in it becomes its
+// own process. The declaration and the print below are therefore two processes,
+// and the print sees `x` at its default value instead of `i * 10`. Wrapping the
+// body in an inner block makes each iteration one process again.
+public void main(string[] args) {
+    par for (int i = 0; i < 2; i++) {
+        int x = i * 10;
+        println("i=" + i + " x=" + x);
+    }
+}

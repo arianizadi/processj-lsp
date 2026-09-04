@@ -1,8 +1,10 @@
-// expect: pj/parallel-usage, pj/shared-channel-end
+// expect: pj/par-for-body, pj/parallel-usage, pj/shared-channel-end
 import std.*;
 
 // Every iteration of a `par for` is its own process. All of them write `sum`
-// (a race) and all of them hold `c.write` (needs a shared channel).
+// (a race) and all of them hold `c.write` (needs a shared channel). The body's
+// two statements are separate processes as well, so they do not even run in
+// order: built and run, this program deadlocks.
 public void main(string[] args) {
     chan<int> c;
     int sum = 0;

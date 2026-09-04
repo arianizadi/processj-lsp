@@ -22,6 +22,11 @@ Open a `.pj` file and use any of:
 
 - the play button in the editor title or the **▶ Run** code lens above `main`
 - **ProcessJ: Run Current File** / **ProcessJ: Build Current File** in the Command Palette
+- **ProcessJ: Show Concurrency Graph** for a filterable, source-linked process/channel map with proven deadlocks
+- **ProcessJ: Show Protocol Flow** for inheritance, case coverage and observed message producers/consumers
+- **ProcessJ: Show Procedure Effects** for direct and transitive channel, blocking, parallel, timer and mobile effects
+- channel inlay hints and effect/protocol code lenses; hover any procedure or channel for the detailed summary
+- **Quick Fix…** on a diagnostic, or a selection, for conservative channel repairs, procedure extraction and safe `par` conversion
 - the ProcessJ language-status entry to see whether the server is ready and open its output
 - **ProcessJ: Restart Language Server** if you are troubleshooting
 

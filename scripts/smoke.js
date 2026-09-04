@@ -109,7 +109,17 @@ public void main(string[] args) {
   const init = await request('initialize', {
     processId: process.pid,
     rootUri: pathToFileURL(path.join(__dirname, '..')).toString(),
-    capabilities: { window: { showDocument: { support: true } } },
+    capabilities: {
+      window: { showDocument: { support: true } },
+      textDocument: {
+        codeAction: {
+          disabledSupport: true,
+          codeActionLiteralSupport: {
+            codeActionKind: { valueSet: ['quickfix', 'refactor', 'refactor.extract', 'refactor.rewrite'] },
+          },
+        },
+      },
+    },
     initializationOptions: { debounceMs: 0 },
   });
   console.log('initialize ok:', Object.keys(init.result.capabilities).join(', '));
@@ -159,7 +169,7 @@ public void main(string[] args) {
 
   // Lint-only checks on a second document that the compiler would accept.
   const uri2 = pathToFileURL(path.join(__dirname, 'smoke-par.pj')).toString();
-  const PAR = 'import std.*;\n\npublic void w(chan<int>.write o) { o.write(1); }\npublic void r(chan<int>.read i) { println(i.read()); }\n\npublic void main(string[] args) {\n    chan<int> c;\n    int x = 0;\n    par {\n        w(c.write);\n        w(c.write);\n        r(c.read);\n        x = 1;\n        println(x);\n    }\n}\n';
+  const PAR = 'import std.*;\n\nprivate void w(chan<int>.write o) { o.write(1); }\nprivate void r(chan<int>.read i) { println(i.read()); }\n\npublic void main(string[] args) {\n    chan<int> c;\n    int x = 0;\n    par {\n        w(c.write);\n        w(c.write);\n        r(c.read);\n        x = 1;\n        println(x);\n    }\n}\n';
   notify('textDocument/didOpen', { textDocument: { uri: uri2, languageId: 'processj', version: 1, text: PAR } });
   const diag2 = await waitForDiagnostics(uri2, false);
   const codes2 = diag2.params.diagnostics.map((d) => d.code);

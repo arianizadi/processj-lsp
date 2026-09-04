@@ -117,7 +117,7 @@ test('server publishes lexer diagnostics and keeps completion/rename binding-awa
     rootUri: pathToFileURL(root).toString(),
     // Real editors advertise workspace folders, which makes vscode-languageserver
     // install its own handler for the change notification.
-    capabilities: { workspace: { workspaceFolders: true } },
+    capabilities: { workspace: { workspaceFolders: true, applyEdit: true } },
     initializationOptions: { installDir: path.join(root, 'missing-processj') },
   });
   assert.equal(initialized.error, undefined);
@@ -125,6 +125,7 @@ test('server publishes lexer diagnostics and keeps completion/rename binding-awa
   assert.equal(typeof packageVersion, 'string');
   assert.equal(initialized.result.serverInfo.version, packageVersion);
   assert.equal(initialized.result.capabilities.workspace.workspaceFolders.supported, true);
+  assert.equal(initialized.result.capabilities.codeActionProvider, true, 'legacy clients get the pre-literal CodeAction capability');
   client.notify('initialized', {});
 
   const uri = pathToFileURL(path.join(root, 'bindings.pj')).toString();
@@ -137,13 +138,18 @@ test('server publishes lexer diagnostics and keeps completion/rename binding-awa
     value++;
     // value in a comment; completion before the declaration below
     int later = value;
+    chan<int> stranded;
+    int blocked = stranded.read();
 }
 
 public void other() {
     int privateToOther = 1;
 }`;
   client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: source } });
-  await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+  const initialDiagnostics = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+  const stranded = initialDiagnostics.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/channel-no-writer');
+  assert.ok(stranded);
+  assert.equal(stranded.relatedInformation, undefined, 'related diagnostic locations are omitted unless the client advertises support');
 
   const innerRefs = await client.request('textDocument/references', {
     textDocument: { uri },
@@ -435,7 +441,7 @@ public a::Foo[] qualified(a::Foo[] values) { return values; }`;
     textDocument: { uri: timerUri },
     position: { line: 2, character: 10 },
   });
-  assert.deepEqual(timerMembers.result.map((item: any) => item.label), ['read()', 'timeout(ms)']);
+  assert.deepEqual(timerMembers.result.map((item: any) => item.label), ['read()', 'timeout(when)']);
   assert.match(timerMembers.result[0].detail, /^long:/);
 
   const lexUri = pathToFileURL(path.join(root, 'lexer.pj')).toString();
@@ -453,6 +459,542 @@ public a::Foo[] qualified(a::Foo[] values) { return values; }`;
   });
   assert.equal(stringRename.result, null, 'string contents are not renameable symbols');
 
+  // LSP clients that do not advertise versioned documentChanges still receive
+  // the original `changes` form instead of an edit they are allowed to ignore.
+  const legacyEditUri = pathToFileURL(path.join(root, 'legacy-edit.pj')).toString();
+  const legacyEditSource = 'public void main(string[] args) {\n    pa { skip; }\n}\n';
+  client.notify('textDocument/didOpen', { textDocument: { uri: legacyEditUri, languageId: 'processj', version: 1, text: legacyEditSource } });
+  const legacyPublished = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === legacyEditUri);
+  const typo = legacyPublished.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/syntax' && /did you mean 'par'/.test(diagnostic.message));
+  assert.ok(typo);
+  const legacyActions = await client.request('textDocument/codeAction', { textDocument: { uri: legacyEditUri }, range: typo.range, context: { diagnostics: [typo] } });
+  const legacyFix = legacyActions.result.find((action: any) => action.title === "Change to 'par'");
+  assert.equal(legacyFix.command, 'processj.applyWorkspaceEdit');
+  assert.equal(legacyFix.arguments[0].documentChanges, undefined);
+  assert.equal(legacyFix.arguments[0].changes[legacyEditUri][0].newText, 'par');
+
+  const unknownCommand = await client.request('workspace/executeCommand', { command: 'processj.typo', arguments: [legacyEditUri] });
+  assert.match(unknownCommand.error?.message ?? '', /Unknown ProcessJ command/, 'unknown commands never fall through to build or run');
+
   await client.request('shutdown', null);
   client.notify('exit', null);
+});
+
+test('legacy clients without workspace/applyEdit are not offered inert edit commands', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-no-apply-edit-'));
+  const server = path.join(__dirname, '..', 'src', 'server.js');
+  const client = new LspClient(server);
+  t.after(() => {
+    client.child.kill('SIGKILL');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const initialized = await client.request('initialize', {
+    processId: process.pid,
+    rootUri: pathToFileURL(root).toString(),
+    capabilities: {},
+    initializationOptions: { installDir: path.join(root, 'missing-processj') },
+  });
+  assert.equal(initialized.result.capabilities.codeActionProvider, true);
+  assert.ok(!initialized.result.capabilities.executeCommandProvider.commands.includes('processj.applyWorkspaceEdit'));
+  client.notify('initialized', {});
+
+  const uri = pathToFileURL(path.join(root, 'legacy-no-edit.pj')).toString();
+  const source = 'public void main(string[] args) {\n    pa { skip; }\n}\n';
+  client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: source } });
+  const published = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+  const typo = published.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/syntax');
+  assert.ok(typo);
+  const actions = await client.request('textDocument/codeAction', {
+    textDocument: { uri },
+    range: typo.range,
+    context: { diagnostics: [typo] },
+  });
+  assert.deepEqual(actions.result, []);
+  const forged = await client.request('workspace/executeCommand', {
+    command: 'processj.applyWorkspaceEdit',
+    arguments: [{ changes: { [uri]: [] } }],
+  });
+  assert.match(forged.error?.message ?? '', /does not support workspace\/applyEdit/);
+
+  await client.request('shutdown', null);
+  client.notify('exit', null);
+});
+
+test('server exposes concurrency, protocol, inlay and refactoring features through LSP', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-features-'));
+  fs.mkdirSync(path.join(root, 'helper'));
+  fs.writeFileSync(path.join(root, 'helper', 'ops.pj'), 'package helper;\npublic void externalWork() { }\n');
+  const server = path.join(__dirname, '..', 'src', 'server.js');
+  const client = new LspClient(server);
+  t.after(() => {
+    client.child.kill('SIGKILL');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const initialized = await client.request('initialize', {
+    processId: process.pid,
+    rootUri: pathToFileURL(root).toString(),
+    capabilities: {
+      workspace: { workspaceFolders: true, workspaceEdit: { documentChanges: true } },
+      textDocument: {
+        inlayHint: {},
+        publishDiagnostics: { relatedInformation: true },
+        codeAction: {
+          disabledSupport: true,
+          codeActionLiteralSupport: {
+            codeActionKind: { valueSet: ['quickfix', 'refactor', 'refactor.extract', 'refactor.rewrite'] },
+          },
+        },
+      },
+    },
+    initializationOptions: { installDir: path.join(root, 'missing-processj') },
+  });
+  assert.equal(initialized.result.capabilities.inlayHintProvider, true);
+  assert.ok(initialized.result.capabilities.codeActionProvider.codeActionKinds.includes('refactor.extract'));
+  client.notify('initialized', {});
+
+  const uri = pathToFileURL(path.join(root, 'features.pj')).toString();
+  const source = [
+    'protocol Message { ping: { int value; } pong: { } }',
+    'void consume(chan<Message>.read input) {',
+    '    Message message = input.read();',
+    '    switch (message) {',
+    '    case ping:',
+    '        println(message.value);',
+    '        break;',
+    '    }',
+    '}',
+    'void inline(Message message) { switch (message) { case ping: break; } }',
+    'public void main(string[] args) {',
+    '    chan<Message> messages;',
+    '    chan<int> stranded;',
+    '    int blocked = stranded.read();',
+    '    par {',
+    '        messages.write(new Message { ping: value = 1 });',
+    '        consume(messages.read);',
+    '    }',
+    '}',
+  ].join('\r\n');
+  client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: source } });
+  const published = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+  const missing = published.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/protocol/missing-cases');
+  assert.ok(missing, JSON.stringify(published.params.diagnostics));
+  const channelHazard = published.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/channel-no-writer');
+  assert.equal(channelHazard?.relatedInformation?.length, 1, 'advertised related locations are retained');
+
+  const hints = await client.request('textDocument/inlayHint', {
+    textDocument: { uri },
+    range: { start: { line: 0, character: 0 }, end: { line: 20, character: 0 } },
+  });
+  assert.ok(hints.result.some((hint: any) => String(hint.label).includes('read endpoint')));
+  assert.ok(hints.result.some((hint: any) => String(hint.label).includes('messages') === false && String(hint.label).includes('exclusive')));
+
+  const graph = await client.request('processj/concurrencyGraph', { textDocument: { uri } });
+  assert.equal(graph.result.version, 1);
+  assert.ok(graph.result.nodes.some((node: any) => node.kind === 'parallel'));
+  assert.ok(graph.result.edges.some((edge: any) => edge.kind === 'write'));
+  assert.ok(graph.result.procedureEffects && Object.keys(graph.result.procedureEffects).length >= 2);
+
+  const protocols = await client.request('processj/protocolModel', { textDocument: { uri } });
+  assert.equal(protocols.result.switches[0].coverage, 'non-exhaustive');
+  assert.ok(protocols.result.flows.some((flow: any) => flow.kind === 'send' && flow.caseName === 'ping'));
+  assert.ok(protocols.result.flows.some((flow: any) => flow.kind === 'match'));
+
+  const actions = await client.request('textDocument/codeAction', {
+    textDocument: { uri },
+    range: missing.range,
+    context: { diagnostics: [missing] },
+  });
+  const generated = actions.result.find((action: any) => /Generate 1 missing protocol case/.test(action.title));
+  assert.ok(generated);
+  assert.equal(generated.edit.documentChanges[0].textDocument.version, 1);
+  assert.match(generated.edit.documentChanges[0].edits[0].newText, /case pong:\r\n\s+break;/);
+
+  const inlineMissing = published.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/protocol/missing-cases' && diagnostic.range.start.line === 9);
+  assert.ok(inlineMissing);
+  const inlineActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri },
+    range: inlineMissing.range,
+    context: { diagnostics: [inlineMissing] },
+  });
+  const inlineGenerated = inlineActions.result.find((action: any) => /Generate 1 missing protocol case/.test(action.title));
+  assert.match(inlineGenerated?.edit.documentChanges[0].edits[0].newText ?? '', /^\r\n\s+case pong:\r\n\s+break;\r\n\s*$/);
+
+  // The closing brace shares a line with a case, so the indentation has to come
+  // from where `switch` really starts rather than from that line's text.
+  const braceUri = pathToFileURL(path.join(root, 'brace.pj')).toString();
+  const braceSource = 'protocol Message { ping: { int value; } pong: { int value; } }\nvoid consume(Message message) {\n    switch (message) {\n    case ping: break; }\n}\npublic void main(string[] args) { }\n';
+  client.notify('textDocument/didOpen', { textDocument: { uri: braceUri, languageId: 'processj', version: 1, text: braceSource } });
+  const bracePublished = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === braceUri);
+  const braceMissing = bracePublished.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/protocol/missing-cases');
+  assert.ok(braceMissing, JSON.stringify(bracePublished.params.diagnostics));
+  const braceActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri: braceUri },
+    range: braceMissing.range,
+    context: { diagnostics: [braceMissing] },
+  });
+  const braceGenerated = braceActions.result.find((action: any) => /Generate 1 missing protocol case/.test(action.title));
+  assert.equal(braceGenerated?.edit.documentChanges[0].edits[0].newText, '\n        case pong:\n            break;\n    ');
+
+  const lenses = await client.request('textDocument/codeLens', { textDocument: { uri } });
+  assert.ok(lenses.result.some((lens: any) => lens.command?.command === 'processj.showConcurrencyReport'));
+  assert.ok(lenses.result.some((lens: any) => /producer.*consumer/.test(lens.command?.title ?? '')));
+  assert.ok(lenses.result.some((lens: any) => /effects:/.test(lens.command?.title ?? '')));
+
+  const duplicateA = pathToFileURL(path.join(root, 'one', 'same.pj')).toString();
+  const duplicateB = pathToFileURL(path.join(root, 'two', 'same.pj')).toString();
+  client.notify('textDocument/didOpen', { textDocument: { uri: duplicateA, languageId: 'processj', version: 1, text: 'void first() { }' } });
+  client.notify('textDocument/didOpen', { textDocument: { uri: duplicateB, languageId: 'processj', version: 1, text: 'void second() { }' } });
+  await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === duplicateA);
+  await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === duplicateB);
+  const firstEffects = await client.request('workspace/executeCommand', { command: 'processj.showEffectReport', arguments: [duplicateA] });
+  const secondEffects = await client.request('workspace/executeCommand', { command: 'processj.showEffectReport', arguments: [duplicateB] });
+  const repeatedEffects = await client.request('workspace/executeCommand', { command: 'processj.showEffectReport', arguments: [duplicateA] });
+  assert.equal(path.basename(firstEffects.result), 'same.effects.md', 'reports keep a readable filename');
+  assert.notEqual(path.dirname(firstEffects.result), path.dirname(secondEffects.result), 'same-basename documents have private report directories');
+  assert.equal(repeatedEffects.result, firstEffects.result, 'one document reuses its stable report path');
+  assert.match(fs.readFileSync(firstEffects.result, 'utf8'), /## first/);
+  assert.match(fs.readFileSync(secondEffects.result, 'utf8'), /## second/);
+
+  const raceUri = pathToFileURL(path.join(root, 'race.pj')).toString();
+  const raceSource = [
+    'public void main(string[] args) {',
+    '    int value = 0;',
+    '    int seen = 0;',
+    '    par {',
+    '        value = 42;',
+    '        seen = value;',
+    '    }',
+    '}',
+  ].join('\n');
+  client.notify('textDocument/didOpen', { textDocument: { uri: raceUri, languageId: 'processj', version: 1, text: raceSource } });
+  const racePublished = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === raceUri);
+  const race = racePublished.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/parallel-usage');
+  assert.ok(race);
+  const raceActions = await client.request('textDocument/codeAction', { textDocument: { uri: raceUri }, range: race.range, context: { diagnostics: [race] } });
+  const channelAction = raceActions.result.find((action: any) => /Communicate 'value' through/.test(action.title));
+  assert.ok(channelAction);
+  assert.equal(channelAction.kind, 'refactor.rewrite');
+  assert.equal(channelAction.edit.documentChanges[0].textDocument.version, 1);
+  const quickFixOnly = await client.request('textDocument/codeAction', {
+    textDocument: { uri: raceUri },
+    range: race.range,
+    context: { diagnostics: [race], only: ['quickfix'] },
+  });
+  assert.ok(!quickFixOnly.result.some((action: any) => action.kind?.startsWith('refactor')), 'CodeActionContext.only filters out refactors');
+
+  const selectionActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri: raceUri },
+    range: { start: { line: 4, character: 8 }, end: { line: 5, character: 21 } },
+    context: { diagnostics: [] },
+  });
+  assert.ok(selectionActions.result.some((action: any) => action.kind === 'refactor.extract' || action.disabled?.reason));
+
+  const importedUri = pathToFileURL(path.join(root, 'imported-refactor.pj')).toString();
+  const importedSource = [
+    'import helper.ops;',
+    'public void main(string[] args) {',
+    '    externalWork();',
+    '    int left;',
+    '    int right;',
+    '    left = 1;',
+    '    right = 2;',
+    '}',
+  ].join('\n');
+  client.notify('textDocument/didOpen', { textDocument: { uri: importedUri, languageId: 'processj', version: 1, text: importedSource } });
+  await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === importedUri);
+  const importedActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri: importedUri },
+    range: { start: { line: 5, character: 4 }, end: { line: 6, character: 14 } },
+    context: { diagnostics: [] },
+  });
+  const importedPar = importedActions.result.find((action: any) => action.title === 'Run independent statements in parallel');
+  assert.ok(importedPar, JSON.stringify(importedActions.result));
+  assert.equal(importedPar.edit.documentChanges[0].textDocument.version, 1);
+  const extractOnly = await client.request('textDocument/codeAction', {
+    textDocument: { uri: importedUri },
+    range: { start: { line: 5, character: 4 }, end: { line: 6, character: 14 } },
+    context: { diagnostics: [], only: ['refactor.extract'] },
+  });
+  assert.ok(extractOnly.result.length > 0 && extractOnly.result.every((action: any) => action.kind === 'refactor.extract'));
+
+  const multiChannelUri = pathToFileURL(path.join(root, 'multi-channel.pj')).toString();
+  const multiChannelSource = [
+    'public void main(string[] args) {',
+    '    chan<int> a, b;',
+    '    par {',
+    '        { int first = a.read(); }',
+    '        { int second = a.read(); }',
+    '        { a.write(1); a.write(2); }',
+    '    }',
+    '}',
+  ].join('\n');
+  client.notify('textDocument/didOpen', { textDocument: { uri: multiChannelUri, languageId: 'processj', version: 1, text: multiChannelSource } });
+  const multiChannelPublished = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === multiChannelUri);
+  const sharedEnd = multiChannelPublished.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/shared-channel-end');
+  assert.ok(sharedEnd);
+  const sharedActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri: multiChannelUri },
+    range: sharedEnd.range,
+    context: { diagnostics: [sharedEnd], only: ['quickfix'] },
+  });
+  const sharedAction = sharedActions.result.find((action: any) => /shared/i.test(action.title));
+  assert.ok(sharedAction?.disabled?.reason.includes('multi-variable'));
+  assert.equal(sharedActions.result.some((action: any) => action.edit), false, 'an imprecise token hint cannot bypass the binding-aware sharing planner');
+
+  const directionUri = pathToFileURL(path.join(root, 'public-direction.pj')).toString();
+  const directionSource = 'public void writer(chan<int>.read output) { output.write(1); }\n';
+  client.notify('textDocument/didOpen', { textDocument: { uri: directionUri, languageId: 'processj', version: 1, text: directionSource } });
+  const directionPublished = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === directionUri);
+  const direction = directionPublished.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/channel-direction');
+  assert.ok(direction);
+  const directionActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri: directionUri },
+    range: direction.range,
+    context: { diagnostics: [direction], only: ['quickfix'] },
+  });
+  const disabledDirection = directionActions.result.find((action: any) => action.title === 'Correct channel endpoint direction');
+  assert.match(disabledDirection?.disabled?.reason ?? '', /public\/protected signature/, 'a refused direction repair explains why it is unsafe');
+
+  const controlRaceUri = pathToFileURL(path.join(root, 'control-race.pj')).toString();
+  const controlRaceSource = [
+    'public void main(string[] args) {',
+    '    int value = 0;',
+    '    int seen = 0;',
+    '    par {',
+    '        { value = 42; return; }',
+    '        { seen = value; }',
+    '    }',
+    '}',
+  ].join('\n');
+  client.notify('textDocument/didOpen', { textDocument: { uri: controlRaceUri, languageId: 'processj', version: 1, text: controlRaceSource } });
+  const controlRacePublished = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === controlRaceUri);
+  const controlRace = controlRacePublished.params.diagnostics.find((diagnostic: any) => diagnostic.code === 'pj/parallel-usage');
+  assert.ok(controlRace);
+  const controlRaceActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri: controlRaceUri },
+    range: controlRace.range,
+    context: { diagnostics: [controlRace], only: ['refactor.rewrite'] },
+  });
+  const disabledRace = controlRaceActions.result.find((action: any) => action.title === 'Communicate the raced value through a channel');
+  assert.match(disabledRace?.disabled?.reason ?? '', /control transfers first|contains return/, 'a refused race repair exposes its control-flow hazard');
+
+  client.notify('textDocument/didChange', {
+    textDocument: { uri, version: 2 },
+    contentChanges: [{ text: `${source}\r\n` }],
+  });
+  await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri && message.params?.version === 2);
+  const staleActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri },
+    range: missing.range,
+    context: { diagnostics: [missing] },
+  });
+  assert.ok(!staleActions.result.some((action: any) => /Generate .* missing protocol case/.test(action.title)), 'stale diagnostic coordinates are not stamped onto the current document version');
+
+  const yieldUri = pathToFileURL(path.join(root, 'yield-chain.pj')).toString();
+  const yieldSource = [
+    'void wait1() { timer clock; clock.timeout(1); }',
+    'void middle() { wait1(); }',
+    'void outer() { middle(); }',
+  ].join('\n');
+  client.notify('textDocument/didOpen', { textDocument: { uri: yieldUri, languageId: 'processj', version: 1, text: yieldSource } });
+  const yieldPublished = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === yieldUri);
+  const oldYieldDiagnostics = yieldPublished.params.diagnostics.filter((diagnostic: any) => diagnostic.code === 'pj/needs-yield-annotation');
+  assert.equal(oldYieldDiagnostics.length, 2);
+  const currentYieldActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri: yieldUri },
+    range: oldYieldDiagnostics[0].range,
+    context: { diagnostics: oldYieldDiagnostics, only: ['refactor.rewrite'] },
+  });
+  assert.ok(currentYieldActions.result.some((action: any) => /throughout the 2-procedure call chain/.test(action.title)), 'current diagnostics offer the bulk yield repair');
+  client.notify('textDocument/didChange', {
+    textDocument: { uri: yieldUri, version: 2 },
+    contentChanges: [{ text: `${yieldSource}\n` }],
+  });
+  await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === yieldUri && message.params?.version === 2);
+  const staleYieldActions = await client.request('textDocument/codeAction', {
+    textDocument: { uri: yieldUri },
+    range: oldYieldDiagnostics[0].range,
+    context: { diagnostics: oldYieldDiagnostics, only: ['refactor.rewrite'] },
+  });
+  assert.ok(!staleYieldActions.result.some((action: any) => /yield=true.*throughout/.test(action.title)), 'stale yield diagnostics cannot authorize a fresh multi-edit');
+
+  await client.request('shutdown', null);
+  client.notify('exit', null);
+});
+
+test('server follows reachable imported bodies for effects, yield overloads and overlay invalidation', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-import-analysis-'));
+  const lib = path.join(root, 'lib');
+  fs.mkdirSync(lib);
+  const depPath = path.join(lib, 'dep.pj');
+  const bridgePath = path.join(lib, 'bridge.pj');
+  const deepPath = path.join(lib, 'deep.pj');
+  fs.writeFileSync(depPath, [
+    'package lib;',
+    'public void leaf(int value) { }',
+    'public void leaf(chan<int>.read input) { int value = input.read(); }',
+    'public void neutral() { leaf(1); }',
+  ].join('\n'));
+  fs.writeFileSync(deepPath, [
+    'package lib;',
+    'public void deepRead(chan<int>.read input) { int value = input.read(); }',
+    'public void waiter() { }',
+  ].join('\n'));
+  fs.writeFileSync(bridgePath, [
+    'package lib;',
+    'import lib.deep;',
+    'public void bridge(chan<int>.read input) { deepRead(input); }',
+    'public void waiting() { waiter(); }',
+  ].join('\n'));
+
+  const server = path.join(__dirname, '..', 'src', 'server.js');
+  const client = new LspClient(server);
+  t.after(() => {
+    client.child.kill('SIGKILL');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  await client.request('initialize', {
+    processId: process.pid,
+    rootUri: pathToFileURL(root).toString(),
+    capabilities: { workspace: { workspaceFolders: true } },
+    initializationOptions: { installDir: path.join(root, 'missing-processj') },
+  });
+  client.notify('initialized', {});
+
+  const rootPath = path.join(root, 'main.pj');
+  const uri = pathToFileURL(rootPath).toString();
+  const source = [
+    'import lib.dep;',
+    'import lib.bridge;',
+    'void ordinary() { neutral(); }',
+    'void effect(chan<int>.read source) { bridge(source); }',
+    'void caller() { waiting(); }',
+  ].join('\n');
+  client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: source } });
+  const initial = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+  assert.deepEqual(initial.params.diagnostics.filter((diagnostic: any) => diagnostic.code === 'pj/needs-yield-annotation'), [], 'the imported leaf(int) overload stays non-yielding');
+
+  const graph = await client.request('processj/concurrencyGraph', { textDocument: { uri } });
+  const effectNode = graph.result.nodes.find((node: any) => node.kind === 'procedure' && node.label === 'effect');
+  assert.ok(effectNode);
+  assert.ok(graph.result.procedureEffects[effectNode.id].some((fact: any) => fact.label === 'reads channel #1' && fact.confidence === 'exact'), JSON.stringify(graph.result.procedureEffects[effectNode.id]));
+  assert.ok(!graph.result.procedureEffects[effectNode.id].some((fact: any) => fact.confidence === 'unknown'), 'the transitive imported channel effect is fully resolved');
+
+  // `deep.pj` is not imported by the root. Opening an unsaved version must
+  // still invalidate the root because it is an analysis dependency of the
+  // reachable bridge body, and the editor buffer must win over the disk copy.
+  const deepUri = pathToFileURL(deepPath).toString();
+  const unsavedDeep = [
+    'package lib;',
+    'public void deepRead(chan<int>.read input) { int value = input.read(); }',
+    'public void waiter() { timer clock; clock.timeout(1); }',
+  ].join('\n');
+  client.notify('textDocument/didOpen', { textDocument: { uri: deepUri, languageId: 'processj', version: 2, text: unsavedDeep } });
+  const overlaid = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+  assert.deepEqual(overlaid.params.diagnostics.filter((diagnostic: any) => diagnostic.code === 'pj/needs-yield-annotation').map((diagnostic: any) => diagnostic.range.start.line), [4]);
+
+  client.notify('textDocument/didClose', { textDocument: { uri: deepUri } });
+  const restored = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+  assert.deepEqual(restored.params.diagnostics.filter((diagnostic: any) => diagnostic.code === 'pj/needs-yield-annotation'), [], 'closing the overlay restores the non-yielding disk dependency');
+
+  await client.request('shutdown', null);
+  client.notify('exit', null);
+});
+
+test('protocol transition reports never combine distinct overload bodies', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-protocol-overloads-'));
+  const server = path.join(__dirname, '..', 'src', 'server.js');
+  const client = new LspClient(server);
+  t.after(() => {
+    client.child.kill('SIGKILL');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  await client.request('initialize', {
+    processId: process.pid,
+    rootUri: pathToFileURL(root).toString(),
+    capabilities: { workspace: { workspaceFolders: true } },
+    initializationOptions: { installDir: path.join(root, 'missing-processj') },
+  });
+  client.notify('initialized', {});
+
+  const uri = pathToFileURL(path.join(root, 'overloads.pj')).toString();
+  const source = [
+    'protocol Message { ping: { } pong: { } }',
+    'void step(Message message) { switch (message) { case ping: break; default: break; } }',
+    'void step(int ignored) { Message next = new Message { pong: }; }',
+  ].join('\n');
+  client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: source } });
+  await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+  const report = await client.request('workspace/executeCommand', {
+    command: 'processj.showProtocolReport',
+    arguments: [uri],
+  });
+  assert.equal(typeof report.result, 'string');
+  const markdown = fs.readFileSync(report.result, 'utf8');
+  assert.doesNotMatch(markdown, /`ping` → `pong`/, 'same-named overloads are distinct procedures, not one observed transition');
+
+  await client.request('shutdown', null);
+  client.notify('exit', null);
+});
+
+test('only install-loaded std output declarations are transparent to exact rendezvous analysis', async (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-trusted-native-'));
+  const installRoot = path.join(base, 'compiler');
+  const trustedWorkspace = path.join(base, 'trusted-workspace');
+  const spoofWorkspace = path.join(base, 'spoof-workspace');
+  fs.mkdirSync(path.join(installRoot, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(installRoot, 'resources', 'jars'), { recursive: true });
+  fs.mkdirSync(path.join(installRoot, 'include', 'std'), { recursive: true });
+  fs.mkdirSync(trustedWorkspace, { recursive: true });
+  fs.mkdirSync(path.join(spoofWorkspace, 'std'), { recursive: true });
+  fs.writeFileSync(path.join(installRoot, 'bin', 'ProcessJc.class'), '');
+  for (const jar of ['java_cup_runtime.jar', 'ST-4.0.7.jar', 'asm-all-5.2.jar']) {
+    fs.writeFileSync(path.join(installRoot, 'resources', 'jars', jar), '');
+  }
+  const outputHeader = 'public native void println(int value);\n';
+  fs.writeFileSync(path.join(installRoot, 'include', 'std', 'io.pj'), outputHeader);
+  fs.writeFileSync(path.join(spoofWorkspace, 'std', 'io.pj'), outputHeader);
+
+  const server = path.join(__dirname, '..', 'src', 'server.js');
+  const clients: LspClient[] = [];
+  t.after(() => {
+    for (const client of clients) client.child.kill('SIGKILL');
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  const diagnosticsFor = async (workspaceRoot: string, name: string): Promise<any[]> => {
+    const client = new LspClient(server);
+    clients.push(client);
+    await client.request('initialize', {
+      processId: process.pid,
+      rootUri: pathToFileURL(workspaceRoot).toString(),
+      capabilities: { workspace: { workspaceFolders: true } },
+      initializationOptions: { installDir: installRoot },
+    });
+    client.notify('initialized', {});
+    const uri = pathToFileURL(path.join(workspaceRoot, name)).toString();
+    const source = [
+      'import std.*;',
+      'public void main(string[] args) {',
+      '    chan<int> a;',
+      '    chan<int> b;',
+      '    par {',
+      '        { println(1); a.write(1); int fromB = b.read(); }',
+      '        { b.write(1); int fromA = a.read(); }',
+      '    }',
+      '}',
+    ].join('\n');
+    client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: source } });
+    const published = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+    await client.request('shutdown', null);
+    client.notify('exit', null);
+    return published.params.diagnostics;
+  };
+
+  const trusted = await diagnosticsFor(trustedWorkspace, 'trusted.pj');
+  assert.ok(trusted.some((diagnostic: any) => diagnostic.code === 'pj/par-deadlock'), 'the real install declaration retains the useful exact proof');
+  const spoofed = await diagnosticsFor(spoofWorkspace, 'spoofed.pj');
+  assert.ok(!spoofed.some((diagnostic: any) => diagnostic.code === 'pj/par-deadlock'), 'a workspace std/io.pj lookalike remains an opaque call boundary');
 });

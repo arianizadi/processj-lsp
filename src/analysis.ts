@@ -11,5 +11,12 @@ export interface FixHint {
   text?: string;
 }
 
-export type LintDiagnostic = RawDiagnostic & { fix?: FixHint };
+/** A same-document location that explains why a lint was emitted. */
+export interface LintRelated {
+  line: number;
+  startCol: number;
+  endCol: number;
+  message: string;
+}
 
+export type LintDiagnostic = RawDiagnostic & { fix?: FixHint; related?: LintRelated[] };

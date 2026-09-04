@@ -1,0 +1,16 @@
+// outcome: compiler-limit
+import std.*;
+// A read through a `shared chan<int>.read` parameter crashes the code generator
+// ("no such attribute: type") unless it sits inside `while (true)` with no break.
+public void take(shared chan<int>.read in) { int v; v = in.read(); println(v); }
+public void main(string[] args) {
+    shared read chan<int> c;
+    par {
+        {
+            c.write(5);
+            c.write(6);
+        }
+        take(c.read);
+        take(c.read);
+    }
+}

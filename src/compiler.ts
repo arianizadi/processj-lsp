@@ -3,7 +3,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { Install } from './config';
-import { withYieldAnnotations } from './yieldfix';
+import type { RawDiagnostic } from './diagnostics';
+import { augmentYieldAnnotations, mapYieldGeneratedRange, type YieldAnnotationContext, type YieldSourceMap } from './yieldfix';
 
 export interface ExecResult {
   stdout: string;
@@ -82,10 +83,12 @@ export interface Sandbox {
   work: string;
   fileName: string;
   sourcePath: string;
+  /** Maps token columns in the private compiler copy back to the editor text. */
+  yieldSourceMap: YieldSourceMap;
   cleanup: () => void;
 }
 
-export function makeSandbox(install: Install, sourcePath: string, text: string): Sandbox {
+export function makeSandbox(install: Install, sourcePath: string, text: string, yieldContext?: YieldAnnotationContext): Sandbox {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-'));
   const home = path.join(root, '.pjlsp-home');
   const work = path.join(home, 'work');
@@ -94,7 +97,12 @@ export function makeSandbox(install: Install, sourcePath: string, text: string):
   const base = path.basename(sourcePath);
   const fileName = base.endsWith('.pj') ? base : 'buffer.pj';
   const src = path.join(root, fileName);
-  fs.writeFileSync(src, withYieldAnnotations(text));
+  const augmented = augmentYieldAnnotations(text, yieldContext);
+  fs.writeFileSync(src, augmented.text);
+  // Java canonicalizes macOS' /var symlink to /private/var when it reports a
+  // diagnostic. Capture the same stable spelling while the temp file exists;
+  // compile() starts asynchronous cleanup before the server maps diagnostics.
+  const canonicalSourcePath = fs.realpathSync(src);
   // The compiler resolves `import a.b;` relative to its working directory before the
   // include directory, so mirror the file's own directory here with symlinks (no copies):
   // sibling .pj files and subdirectories become visible exactly as with `pjc`.
@@ -121,7 +129,8 @@ export function makeSandbox(install: Install, sourcePath: string, text: string):
     home,
     work,
     fileName,
-    sourcePath: src,
+    sourcePath: canonicalSourcePath,
+    yieldSourceMap: augmented.sourceMap,
     cleanup: () => fs.rm(root, { recursive: true, force: true }, () => {}),
   };
 }
@@ -133,14 +142,46 @@ export function processjcArgs(install: Install, sb: Sandbox): string[] {
 
 export interface CompileResult extends ExecResult {
   sourcePath: string;
+  yieldSourceMap: YieldSourceMap;
+}
+
+/** Whether a compiler message belongs to the private copy of the current file. */
+export function compilerDiagnosticTargetsBuffer(
+  result: Pick<CompileResult, 'sourcePath'>,
+  diagnostic: Pick<RawDiagnostic, 'file'>,
+): boolean {
+  if (!diagnostic.file) return true;
+  const sourcePath = path.resolve(result.sourcePath);
+  const reported = path.normalize(diagnostic.file);
+  // The compiler normally prints just the input filename for the root unit.
+  // A relative path with directories, however, identifies an imported unit.
+  const candidate = path.isAbsolute(reported)
+    ? path.resolve(reported)
+    : path.dirname(reported) === '.'
+      ? path.join(path.dirname(sourcePath), reported)
+      : path.resolve(path.dirname(sourcePath), reported);
+  return process.platform === 'win32'
+    ? candidate.toLowerCase() === sourcePath.toLowerCase()
+    : candidate === sourcePath;
+}
+
+/** Translate only diagnostics emitted for the augmented private buffer. */
+export function remapCompilerDiagnostic(
+  result: Pick<CompileResult, 'sourcePath' | 'yieldSourceMap'>,
+  diagnostic: RawDiagnostic,
+): RawDiagnostic {
+  if (diagnostic.line < 0 || !compilerDiagnosticTargetsBuffer(result, diagnostic)) return diagnostic;
+  const mapped = mapYieldGeneratedRange(result.yieldSourceMap, diagnostic.line, diagnostic.startCol, diagnostic.endCol);
+  if (mapped.startCol === diagnostic.startCol && mapped.endCol === diagnostic.endCol) return diagnostic;
+  return { ...diagnostic, ...mapped };
 }
 
 /** Run only the ProcessJ compiler (front end + Java codegen) over `text`, for diagnostics. */
-export async function compile(install: Install, sourcePath: string, text: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CompileResult> {
-  const sb = makeSandbox(install, sourcePath, text);
+export async function compile(install: Install, sourcePath: string, text: string, opts: { timeoutMs?: number; signal?: AbortSignal; yieldContext?: YieldAnnotationContext } = {}): Promise<CompileResult> {
+  const sb = makeSandbox(install, sourcePath, text, opts.yieldContext);
   try {
     const r = await exec(install.javaBin, processjcArgs(install, sb), { cwd: sb.root, timeoutMs: opts.timeoutMs, signal: opts.signal });
-    return { ...r, sourcePath: sb.sourcePath };
+    return { ...r, sourcePath: sb.sourcePath, yieldSourceMap: sb.yieldSourceMap };
   } finally {
     sb.cleanup();
   }

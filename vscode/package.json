@@ -1,7 +1,7 @@
 {
   "name": "processj-lsp-vscode",
   "displayName": "ProcessJ",
-  "description": "ProcessJ language support: diagnostics, type checking, formatting, semantic highlighting, run from the editor.",
+  "description": "ProcessJ language support with causal concurrency diagnostics, graphs, protocol and effect analysis, safe refactors, formatting, navigation and run-from-editor.",
   "version": "0.1.5",
   "publisher": "arianizadi",
   "license": "Apache-2.0",
@@ -25,6 +25,9 @@
     "onLanguage:processj",
     "onCommand:processj.runCurrentFile",
     "onCommand:processj.buildCurrentFile",
+    "onCommand:processj.showConcurrencyGraph",
+    "onCommand:processj.showProtocolFlow",
+    "onCommand:processj.showProcedureEffects",
     "onCommand:processj.restartServer",
     "onCommand:processj.showOutput"
   ],
@@ -65,6 +68,27 @@
         "enablement": "editorLangId == processj"
       },
       {
+        "command": "processj.showConcurrencyGraph",
+        "title": "Show Concurrency Graph",
+        "category": "ProcessJ",
+        "icon": "$(type-hierarchy)",
+        "enablement": "editorLangId == processj"
+      },
+      {
+        "command": "processj.showProtocolFlow",
+        "title": "Show Protocol Flow",
+        "category": "ProcessJ",
+        "icon": "$(git-merge)",
+        "enablement": "editorLangId == processj"
+      },
+      {
+        "command": "processj.showProcedureEffects",
+        "title": "Show Procedure Effects",
+        "category": "ProcessJ",
+        "icon": "$(pulse)",
+        "enablement": "editorLangId == processj"
+      },
+      {
         "command": "processj.restartServer",
         "title": "Restart Language Server",
         "category": "ProcessJ",
@@ -83,9 +107,34 @@
           "command": "processj.runCurrentFile",
           "when": "editorLangId == processj",
           "group": "navigation@1"
+        },
+        {
+          "command": "processj.showConcurrencyGraph",
+          "when": "editorLangId == processj",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "processj.showConcurrencyGraph",
+          "when": "editorLangId == processj",
+          "group": "navigation@10"
+        },
+        {
+          "command": "processj.showProtocolFlow",
+          "when": "editorLangId == processj",
+          "group": "navigation@11"
+        },
+        {
+          "command": "processj.showProcedureEffects",
+          "when": "editorLangId == processj",
+          "group": "navigation@12"
         }
       ]
     },
+    "semanticTokenScopes": [
+      { "scopes": { "variable.channelRead:processj": ["variable.other.readwrite.processj"], "parameter.channelRead:processj": ["variable.parameter.read.processj"], "property.channelRead:processj": ["variable.other.property.read.processj"], "variable.channelWrite:processj": ["variable.other.write.processj"], "parameter.channelWrite:processj": ["variable.parameter.write.processj"], "property.channelWrite:processj": ["variable.other.property.write.processj"], "variable.channelShared:processj": ["variable.other.shared.processj"], "parameter.channelShared:processj": ["variable.parameter.shared.processj"], "property.channelShared:processj": ["variable.other.property.shared.processj"] } }
+    ],
     "configuration": {
       "title": "ProcessJ",
       "properties": {
@@ -114,7 +163,7 @@
         "processj.codeLens": {
           "type": "boolean",
           "default": true,
-          "description": "Show Run and Build code lenses above main. The commands remain available from the editor title and Command Palette when disabled."
+          "description": "Show inline Run, Build, effect, concurrency-graph, and protocol-summary code lenses. Commands remain available from the editor title and Command Palette when disabled."
         },
         "processj.debounceMs": {
           "type": "integer",

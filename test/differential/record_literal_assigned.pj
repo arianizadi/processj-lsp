@@ -1,0 +1,10 @@
+// outcome: compiler-limit
+import std.*;
+record Point { int x; int y; }
+// A record literal only compiles as a declaration initialiser; assigning one
+// later makes the compiler throw inside its yield pass.
+public void main(string[] args) {
+    Point p;
+    p = new Point { x = 1, y = 2 };
+    println("x " + p.x);
+}

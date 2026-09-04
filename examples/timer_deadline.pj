@@ -1,0 +1,12 @@
+// expect: pj/timeout-deadline
+import std.*;
+
+// `.timeout()` takes the absolute millisecond at which to wake up, not how long
+// to wait, so this returns immediately instead of pausing for 300 ms. Measured:
+// 1 ms here against 306 ms for `t.timeout(t.read() + 300)`.
+public void main(string[] args) {
+    timer t;
+    long before = t.read();
+    t.timeout(300);
+    println("elapsed " + (t.read() - before));
+}

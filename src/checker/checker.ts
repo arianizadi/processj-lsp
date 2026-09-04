@@ -10,14 +10,16 @@
  * The result also exposes the resolutions (which declaration each name refers to)
  * and the type of every expression, for hover and semantic highlighting.
  */
-import type { LintDiagnostic } from '../analysis';
+import type { LintDiagnostic, LintRelated } from '../analysis';
 import type { FixHint } from '../analysis';
 import type * as A from '../parser/ast';
 import { identToString, qualifierToString } from '../parser/ast';
 import { PRIMITIVE_TYPES } from '../keywords';
 import { suggest } from '../parser/parser';
+import { directlyTransfersControl } from './controlflow';
 import { DeclIndex, signatureStr, type ProcSig } from './index';
-import { YieldAnalysis, yieldAnnotationEdit } from './yields';
+import { searchRendezvousHeads } from './rendezvous';
+import { YieldAnalysis, yieldAnnotationEdit, type YieldCallProvider } from './yields';
 import { assignable, endOf, isIntegral, isLenient, isNumeric, isPrim, isReference, isSubtype, promote, sameType, T, typeStr, whyNotAssignable, type Type } from './types';
 
 export interface VarInfo {
@@ -44,6 +46,12 @@ export interface CheckOptions {
   unresolvedImports?: boolean;
   /** Source text, used to build quick fixes that rewrite a statement. */
   text?: string;
+  /** Exact calls inside reachable imported bodies, used only for transitive yield analysis. */
+  yieldCalls?: ReadonlyMap<A.Invocation, ProcSig>;
+  /** Lazily resolve calls from an imported body in that file's own import scope. */
+  yieldCallProvider?: YieldCallProvider;
+  /** Exact compiler-distributed native declarations proven not to block or rendezvous. */
+  trustedNonBlockingNativeDeclarations?: ReadonlySet<A.ProcDecl>;
 }
 
 export interface CheckResult {
@@ -55,12 +63,51 @@ export interface CheckResult {
   calls: Map<A.Invocation, ProcSig>;
   /** Type of every expression. */
   types: Map<A.Expr, Type>;
+  /** Structured channel topology retained for inlays, graphs and refactor safety. */
+  channels: ChannelFact[];
+  /** Confirmed straight-line rendezvous deadlocks with every blocked operation. */
+  deadlocks: DeadlockFact[];
+}
+
+export interface ChannelOperationFact {
+  end: 'read' | 'write';
+  span: A.Span;
+  /** False when an end is passed/selected rather than operated directly. */
+  direct: boolean;
+  /** The lexical par branch, when this use occurs inside one. */
+  branch?: number;
+  replicated: boolean;
+}
+
+export interface ChannelFact {
+  variable: VarInfo;
+  procedure: A.ProcDecl;
+  operations: ChannelOperationFact[];
+  /** The whole channel escaped or was used opaquely. */
+  escaped: boolean;
+  branchCount: number;
+  hazard?: 'no-writer' | 'no-reader' | 'self-deadlock';
+}
+
+export interface DeadlockWait {
+  branch: number;
+  operation: 'read' | 'write';
+  channel: VarInfo;
+  span: A.Span;
+}
+
+export interface DeadlockFact {
+  par: A.ParBlock;
+  waits: DeadlockWait[];
+  finishedBranches: number[];
+  confidence: 'exact';
+  cause: 'circular-wait' | 'missing-peer';
 }
 
 export function check(program: A.Program, opts: CheckOptions): CheckResult {
   const c = new Checker(opts);
   c.program(program);
-  return { diagnostics: c.diags, vars: c.allVars, resolutions: c.resolutions, calls: c.calls, types: c.types };
+  return { diagnostics: c.diags, vars: c.allVars, resolutions: c.resolutions, calls: c.calls, types: c.types, channels: c.channelFacts, deadlocks: c.deadlocks };
 }
 
 class Scope {
@@ -79,6 +126,7 @@ class Scope {
 
 /** Variable traffic of one `par` branch, for the parallel-usage and shared-end rules. */
 interface BranchUse {
+  id: number;
   reads: Map<VarInfo, A.Span>;
   writes: Map<VarInfo, A.Span>;
   ends: Map<string, { v: VarInfo; span: A.Span }>; // "name.read" / "name.write"
@@ -86,6 +134,32 @@ interface BranchUse {
   depth: number;
   /** A `par for` body: one branch in the source, many processes at runtime. */
   replicated: boolean;
+}
+
+/**
+ * One use of a channel end from inside a par branch.
+ *
+ * The ProcessJ code generator emits the runtime's `claimRead`/`claimWrite` lock
+ * only when the operated expression's static type is a *shared channel end*,
+ * which in practice means a parameter declared `shared chan<T>.read/.write`.
+ * Every operation written directly on a whole-channel variable is unlocked, and
+ * so is one handed to a parameter that drops the `shared` keyword.
+ */
+interface EndOperation {
+  variable: VarInfo;
+  end: 'read' | 'write';
+  span: A.Span;
+  branch: BranchUse;
+  /** Proven to run without the runtime's lock for this side. */
+  unlocked: boolean;
+  /** The parameter the end was handed to, when it was passed rather than operated here. */
+  via?: { procedure: string; parameter: string };
+}
+
+/** Is the `end` side of this channel type declared shared? */
+function sharedSideOf(t: Type, end: 'read' | 'write'): boolean {
+  if (t.k !== 'chan') return false;
+  return t.shared && (!t.sharedSide || t.sharedSide === end);
 }
 
 interface ChanUse {
@@ -97,6 +171,7 @@ interface ChanUse {
   first?: A.Span;
   /** Every place an end of the channel is used. */
   spans: A.Span[];
+  operations: ChannelOperationFact[];
 }
 
 class Checker {
@@ -105,6 +180,8 @@ class Checker {
   readonly resolutions = new Map<A.NameExpr, VarInfo>();
   readonly calls = new Map<A.Invocation, ProcSig>();
   readonly types = new Map<A.Expr, Type>();
+  readonly channelFacts: ChannelFact[] = [];
+  readonly deadlocks: DeadlockFact[] = [];
 
   private readonly index: DeclIndex;
   private scope = new Scope(undefined, 0);
@@ -116,8 +193,18 @@ class Checker {
   private activeCase = new Map<VarInfo, string>();
   private branchStack: BranchUse[] = [];
   private chanUses = new Map<VarInfo, ChanUse>();
+  /** Channel-end uses of the current procedure, for the runtime-lock rules. */
+  private endOperations: EndOperation[] = [];
+  /** The `c.read` / `c.write` expression that produced each pending end operation. */
+  private endOperationBySite = new Map<A.Expr, EndOperation>();
   private insideAlt = 0;
-  private altCount = 0;
+  /**
+   * Limits the compiler applies per *generated process class* rather than per
+   * procedure. It emits one class for a procedure body, one for each par branch
+   * and one for each statement of a par for body.
+   */
+  private processAlts = 0;
+  private processParFors = 0;
   /** >0 while inside a par block's branches. */
   private parDepth = 0;
   /** >0 while checking a read guard of an alt that has other guards: such a read does not block by itself. */
@@ -130,12 +217,15 @@ class Checker {
   private syncs: Array<{ v: VarInfo; span: A.Span }> = [];
   /** Par blocks whose straight-line branches are simulated once the whole proc is known. */
   private pendingSims: Array<{ par: A.ParBlock; queues: Op[][] }> = [];
+  private nextBranchId = 1;
+  /** False only while type-checking code that cannot execute after a transfer. */
+  private collectExecutionFacts = true;
 
   private readonly lines: string[] | undefined;
 
   constructor(private readonly opts: CheckOptions) {
     this.index = opts.index;
-    this.yields = new YieldAnalysis(this.index);
+    this.yields = new YieldAnalysis(this.index, this.calls, opts.yieldCalls, opts.yieldCallProvider);
     this.lines = opts.text?.split('\n');
   }
 
@@ -157,8 +247,8 @@ class Checker {
   // Reporting
   // -------------------------------------------------------------------------
 
-  private report(span: A.Span, severity: LintDiagnostic['severity'], code: string, message: string, fix?: FixHint): void {
-    this.diags.push({ line: span.start.line, startCol: span.start.col, endCol: span.end.line === span.start.line ? span.end.col : span.start.col + 1, message, severity, code, source: 'lsp', fix });
+  private report(span: A.Span, severity: LintDiagnostic['severity'], code: string, message: string, fix?: FixHint, related?: LintRelated[]): void {
+    this.diags.push({ line: span.start.line, startCol: span.start.col, endCol: span.end.line === span.start.line ? span.end.col : span.start.col + 1, message, severity, code, source: 'lsp', fix, related });
   }
 
   private error(span: A.Span, code: string, message: string, fix?: FixHint): Type {
@@ -166,8 +256,8 @@ class Checker {
     return T.error;
   }
 
-  private warn(span: A.Span, code: string, message: string): void {
-    this.report(span, 'warning', code, message);
+  private warn(span: A.Span, code: string, message: string, related?: LintRelated[]): void {
+    this.report(span, 'warning', code, message, undefined, related);
   }
 
   // -------------------------------------------------------------------------
@@ -196,7 +286,7 @@ class Checker {
       const param = this.proc.params.find((p) => p.name.name === id.name);
       if (param) this.warn(id.span, 'pj/shadows-parameter', `'${id.name}' shadows a parameter of '${this.proc.name.name}'; rename one of them`);
     }
-    if (type.k === 'chan' && !type.end && !isParam) this.chanUses.set(info, { bare: false, branches: new Set(), spans: [] });
+    if (this.collectExecutionFacts && type.k === 'chan' && !type.end && !isParam) this.chanUses.set(info, { bare: false, branches: new Set(), spans: [], operations: [] });
     return info;
   }
 
@@ -214,7 +304,10 @@ class Checker {
    */
   private checkCompilable(node: A.TypeNode): void {
     if (node.kind === 'ArrayType' && node.elem.kind === 'ChanType') this.report(node.span, 'warning', 'pj/compiler-limit', 'Arrays of channels cannot be compiled by this ProcessJ build; use separate channels');
-    if (node.kind === 'ArrayType') return this.checkCompilable(node.elem);
+    if (node.kind === 'ChanType' && node.elem.kind === 'PrimitiveType' && node.elem.name === 'string') {
+      this.report(node.span, 'warning', 'pj/compiler-limit', "A channel carrying 'string' cannot be compiled by this ProcessJ build: its code generator has no wrapper type for string and throws while generating the channel. Send the value as a 'chan<int>' code or a 'chan<char>' sequence instead.");
+    }
+    if (node.kind === 'ArrayType' || node.kind === 'ChanType') return this.checkCompilable(node.elem);
   }
 
   /** Warn about a named type nothing declares; suggest a close name. */
@@ -346,9 +439,17 @@ class Checker {
       if (d.kind === 'ProtocolDecl' && this.memberCycle(d.name.name, 'protocol')) this.report(d.name.span, 'warning', 'pj/compiler-limit', `Protocol '${d.name.name}' refers back to itself through its case fields, which overflows this ProcessJ build's stack; break the cycle`);
     }
     for (const d of p.decls) if (d.kind === 'ProcDecl') this.procDecl(d);
-    for (const d of this.yields.needingAnnotation(p)) {
+    // Earlier lints may consult yieldability before every call in the file has
+    // been resolved. Use a fresh analysis here so overload decisions are exact.
+    for (const d of p.decls) {
+      if (d.kind !== 'ProcDecl' || !d.body) continue;
+      const ret = this.index.resolve(d.returnType);
+      if (isPrim(ret, 'void') || !this.yields.procYields(d)) continue;
+      this.report(d.returnType.span, 'warning', 'pj/compiler-limit', `'${d.name.name}' returns ${typeStr(ret)} and can suspend, which this ProcessJ build cannot compile: it puts the 'return' inside the generated process body and turns every call into a process start. Make it 'void' and hand the result back through a channel parameter.`);
+    }
+    for (const d of new YieldAnalysis(this.index, this.calls, this.opts.yieldCalls, this.opts.yieldCallProvider, { unresolvedRootCallsYield: false }).needingAnnotation(p)) {
       const at = yieldAnnotationEdit(d);
-      this.report(d.name.span, 'warning', 'pj/needs-yield-annotation', `'${d.name.name}' suspends only through the procedures it calls, which this ProcessJ build does not notice; mark it [yield=true] so it is compiled as a suspending process`, { kind: 'edit', title: 'Add [yield=true]', line: at.line, col: at.col, endCol: at.col, text: at.text });
+      this.report(d.name.span, 'warning', 'pj/needs-yield-annotation', `'${d.name.name}' suspends only through the procedures it calls, which this ProcessJ build does not notice; mark it [yield=true] so it is compiled as a suspending process`, { kind: 'edit', title: 'Add [yield=true]', line: at.line, col: at.col, endCol: at.endCol, text: at.text });
     }
   }
 
@@ -375,11 +476,15 @@ class Checker {
     this.proc = d;
     this.procRet = this.resolveType(d.returnType);
     this.chanUses = new Map();
+    this.endOperations = [];
+    this.endOperationBySite = new Map();
     this.activeCase = new Map();
-    this.altCount = 0;
+    this.processAlts = 0;
+    this.processParFors = 0;
     this.enrolled = new Set();
     this.syncs = [];
     this.pendingSims = [];
+    this.nextBranchId = 1;
     const firstVar = this.allVars.length;
     this.push();
     for (const p of d.params) {
@@ -408,15 +513,44 @@ class Checker {
         this.report(v.decl.span, v.isParam ? 'info' : 'warning', 'pj/unused', `'${v.name}' is never used`);
       }
     }
-    for (const [v, use] of this.chanUses) {
-      if (use.bare) continue;
-      if (use.reads && !use.writes) this.warn(use.reads, 'pj/channel-no-writer', `Nothing ever writes '${v.name}', so this read blocks forever`);
-      else if (use.writes && !use.reads) this.warn(use.writes, 'pj/channel-no-reader', `Nothing ever reads '${v.name}', so this write blocks forever`);
-      else if (use.reads && use.writes && use.branches.size <= 1 && use.first && ![...use.branches].some((b) => b?.replicated)) {
-        this.warn(use.first, 'pj/channel-self-deadlock', `This process is both the writer and the reader of '${v.name}', so this ${use.first === use.writes ? 'write' : 'read'} blocks forever. Put the two sides in different branches of a par.`);
-      }
-    }
+    // Run the branch-order simulation first so its causal diagnostic precedes
+    // the channel-topology diagnostics below. Keep both kinds of finding: a
+    // par-level missing-peer explanation does not make an accurate
+    // no-reader/no-writer warning redundant (and consumers use those stable
+    // codes independently of the richer deadlock fact).
     for (const sim of this.pendingSims) this.runSimulation(sim.par, sim.queues);
+    for (const [v, use] of this.chanUses) {
+      let hazard: ChannelFact['hazard'];
+      // An alt choice is not itself a guaranteed wait, but it is still a real
+      // endpoint operation that can rendezvous with a peer in another process.
+      // Use all direct operations to decide whether a peer exists, and retain
+      // `reads`/`writes` for the operation that can definitely block.
+      const hasDirectRead = use.operations.some((op) => op.direct && op.end === 'read');
+      const hasDirectWrite = use.operations.some((op) => op.direct && op.end === 'write');
+      if (!use.bare) {
+        if (use.reads && !hasDirectWrite) {
+          hazard = 'no-writer';
+          this.warn(use.reads, 'pj/channel-no-writer', `Nothing ever writes '${v.name}', so this read blocks forever`, [{ line: v.decl.span.start.line, startCol: v.decl.span.start.col, endCol: v.decl.span.end.col, message: `'${v.name}' is declared here, but no matching writer is reachable in this procedure.` }]);
+        } else if (use.writes && !hasDirectRead) {
+          hazard = 'no-reader';
+          this.warn(use.writes, 'pj/channel-no-reader', `Nothing ever reads '${v.name}', so this write blocks forever`, [{ line: v.decl.span.start.line, startCol: v.decl.span.start.col, endCol: v.decl.span.end.col, message: `'${v.name}' is declared here, but no matching reader is reachable in this procedure.` }]);
+        } else if (use.reads && use.writes && use.branches.size <= 1 && use.first && ![...use.branches].some((b) => b?.replicated)) {
+          hazard = 'self-deadlock';
+          this.warn(use.first, 'pj/channel-self-deadlock', `This process is both the writer and the reader of '${v.name}', so this ${use.first === use.writes ? 'write' : 'read'} blocks forever. Put the two sides in different branches of a par.`, [
+            { line: use.reads.start.line, startCol: use.reads.start.col, endCol: use.reads.end.line === use.reads.start.line ? use.reads.end.col : use.reads.start.col + 1, message: `The same sequential process reads '${v.name}' here.` },
+            { line: use.writes.start.line, startCol: use.writes.start.col, endCol: use.writes.end.line === use.writes.start.line ? use.writes.end.col : use.writes.start.col + 1, message: `The same sequential process writes '${v.name}' here.` },
+          ]);
+        }
+      }
+      this.channelFacts.push({
+        variable: v,
+        procedure: d,
+        operations: [...use.operations],
+        escaped: use.bare || use.operations.some((op) => !op.direct),
+        branchCount: new Set(use.operations.map((op) => op.branch).filter((id): id is number => id !== undefined)).size,
+        hazard,
+      });
+    }
     for (const { v, span } of this.syncs) {
       if (!v.isParam && !this.enrolled.has(v)) this.warn(span, 'pj/barrier-not-enrolled', `No 'par enroll (${v.name})' here, so this sync() waits for nobody and returns at once`);
     }
@@ -428,6 +562,7 @@ class Checker {
 
   /** A loop that never ends (constant-true condition) and cannot suspend starves every other process. */
   private checkStarvingLoop(loopSpan: A.Span, cond: A.Expr | undefined, body: A.Stmt, keyword: string): void {
+    if (!this.collectExecutionFacts) return;
     if (cond && !isTrueLiteral(cond)) return;
     if (containsExit(body) || this.yields.stmtYields(body, 'calls')) return;
     const head: A.Span = { start: loopSpan.start, end: { line: loopSpan.start.line, col: loopSpan.start.col + keyword.length } };
@@ -444,18 +579,27 @@ class Checker {
     this.pop();
   }
 
-  /** A statement list; reports the first statement after a return/break/continue/stop. */
+  /** Type-check every statement, but collect execution facts only for the reachable prefix. */
   private stmts(list: A.Stmt[]): void {
-    let dead = false;
+    let reachable = true;
+    let reported = false;
     for (const s of list) {
-      if (dead) {
-        if (s.kind !== 'EmptyStmt') {
-          this.warn(s.span, 'pj/unreachable', 'Unreachable code');
-          dead = false; // one report per block
-        }
+      if (!reachable && !reported && s.kind !== 'EmptyStmt') {
+        this.warn(s.span, 'pj/unreachable', 'Unreachable code');
+        reported = true;
       }
-      this.stmt(s);
-      if (s.kind === 'ReturnStmt' || s.kind === 'BreakStmt' || s.kind === 'ContinueStmt' || s.kind === 'StopStmt') dead = true;
+      this.withExecutionFacts(reachable, () => this.stmt(s));
+      if (reachable && directlyTransfersControl(s)) reachable = false;
+    }
+  }
+
+  private withExecutionFacts(reachable: boolean, body: () => void): void {
+    const previous = this.collectExecutionFacts;
+    this.collectExecutionFacts = previous && reachable;
+    try {
+      body();
+    } finally {
+      this.collectExecutionFacts = previous;
     }
   }
 
@@ -485,8 +629,10 @@ class Checker {
       }
       case 'WhileStmt':
         this.condition(s.cond, 'while');
-        this.checkStarvingLoop(s.span, s.cond, s.body, 'while');
         this.loop(() => this.stmt(s.body));
+        // Resolve calls in the body before asking whether it can suspend. This
+        // keeps overload-sensitive yield analysis exact without another file pass.
+        this.checkStarvingLoop(s.span, s.cond, s.body, 'while');
         return;
       case 'DoStmt':
         this.loop(() => this.stmt(s.body));
@@ -506,12 +652,22 @@ class Checker {
           this.expectType(b, T.barrier, 'enroll');
           if (b.kind === 'NameExpr') {
             const v = this.resolutions.get(b);
-            if (v) this.enrolled.add(v);
+            if (v && this.collectExecutionFacts) this.enrolled.add(v);
           }
         }
-        if (!s.isPar) this.checkStarvingLoop(s.span, s.cond, s.body, 'for');
         if (s.isPar) {
-          const use = this.branch(this.scope.depth, () => this.loop(() => this.stmt(s.body)), true);
+          const head: A.Span = { start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + 3 } };
+          this.processParFors++;
+          if (this.processParFors === 2) {
+            this.report(head, 'warning', 'pj/compiler-limit', "A second 'par for' in the same process cannot be compiled by this ProcessJ build (its generated process array is declared twice); move this one into its own procedure");
+          }
+          // The generated code turns every statement of the body into its own
+          // process, exactly as in a par block, so locals declared beside the
+          // work are copied per process instead of being shared with it.
+          if (s.body.kind === 'Block' && s.body.stmts.length > 1) {
+            this.warn(s.body.span, 'pj/par-for-body', `Each of these ${s.body.stmts.length} statements becomes its own process, so they run in parallel rather than in sequence and a local declared in one is not visible to the others. Wrap the body in an inner '{ ... }' block to make each iteration a single process.`);
+          }
+          const use = this.branch(this.scope.depth, () => this.inProcess(() => this.loop(() => this.stmt(s.body))), true);
           // Every iteration is its own process, so anything from outside the loop is shared by all of them.
           const seen = new Set<VarInfo>();
           for (const [v, span] of use.writes) {
@@ -521,12 +677,19 @@ class Checker {
             }
           }
           for (const [key, { v, span }] of use.ends) {
-            if (v.depth <= outerDepth && v.type.k === 'chan' && !v.type.shared) {
+            // Only the side actually held needs sharing: `shared write chan<T>`
+            // leaves its read side with a single-reader slot.
+            const side = key.endsWith('.read') ? 'read' : 'write';
+            if (v.depth <= outerDepth && v.type.k === 'chan' && !sharedSideOf(v.type, side)) {
               const typeCol = Math.max(0, v.decl.span.start.col - (typeStr(v.type).length + 1));
               this.error(span, 'pj/shared-channel-end', `Every iteration of this par for holds '${key}'; declare it 'shared chan<${typeStr(v.type.elem)}>'`, { kind: 'make-shared', line: v.decl.span.start.line, col: typeCol, title: `Declare '${v.name}' as shared` });
             }
           }
-        } else this.loop(() => this.stmt(s.body));
+          this.reportUnlockedEnds([use]);
+        } else {
+          this.loop(() => this.stmt(s.body));
+          this.checkStarvingLoop(s.span, s.cond, s.body, 'for');
+        }
         this.pop();
         return;
       }
@@ -535,7 +698,7 @@ class Checker {
           this.expectType(b, T.barrier, 'enroll');
           if (b.kind === 'NameExpr') {
             const v = this.resolutions.get(b);
-            if (v) this.enrolled.add(v);
+            if (v && this.collectExecutionFacts) this.enrolled.add(v);
           }
         }
         if (s.body.stmts.length === 0) this.report(s.span, 'info', 'pj/trivial-par', "Empty par: nothing runs");
@@ -605,6 +768,21 @@ class Checker {
     let inner = e;
     while (inner.kind === 'ParenExpr') inner = inner.expr;
     if (inner.kind === 'AssignExpr' && inner.op === '=' && isPrim(t, 'boolean')) this.warn(e.span, 'pj/assign-in-condition', `This assigns '${exprText(inner.target)}' instead of comparing it; did you mean '=='?`);
+    const isLoopOrBranch = owner === 'if' || owner === 'while' || owner === 'do ... while' || owner === 'for';
+    let negatedOperand = inner.kind === 'UnaryExpr' && inner.op === '!' && inner.prefix ? inner.operand : undefined;
+    while (negatedOperand?.kind === 'ParenExpr') negatedOperand = negatedOperand.expr;
+    // A negated call has its own, more specific rule below.
+    if (inner.kind === 'UnaryExpr' && inner.op === '!' && inner.prefix && isLoopOrBranch && negatedOperand?.kind !== 'Invocation') {
+      // The generated code renders a whole-condition `!x` as a statement and the
+      // javac step then fails on the stray `;`. Inside a larger condition
+      // (`!a && b`) the same operand compiles.
+      const operand = this.slice(inner.operand.span);
+      const fix: FixHint | undefined = operand && inner.span.start.line === inner.span.end.line
+        ? { kind: 'edit', title: `Compare with '== false'`, line: inner.span.start.line, col: inner.span.start.col, endCol: inner.span.end.col, text: `${operand} == false` }
+        : undefined;
+      this.report(inner.span, 'warning', 'pj/compiler-limit', `'!' as the whole condition of '${owner}' cannot be compiled by this ProcessJ build; write '${operand ?? 'x'} == false' instead`, fix);
+      return;
+    }
     let call: A.Expr = inner;
     let negated = false;
     while (call.kind === 'UnaryExpr' && call.op === '!' && call.prefix) {
@@ -612,8 +790,13 @@ class Checker {
       call = call.operand;
       while (call.kind === 'ParenExpr') call = call.expr;
     }
-    if (call.kind === 'Invocation' && (owner === 'if' || owner === 'while' || owner === 'do ... while' || owner === 'for')) {
-      const fix: FixHint | undefined = negated ? undefined : { kind: 'edit', title: "Compare with '== true'", line: call.span.end.line, col: call.span.end.col, endCol: call.span.end.col, text: ' == true' };
+    if (call.kind === 'Invocation' && isLoopOrBranch) {
+      const negatedText = negated ? this.slice(call.span) : undefined;
+      const fix: FixHint | undefined = negated
+        ? negatedText && inner.span.start.line === inner.span.end.line
+          ? { kind: 'edit', title: "Compare with '== false'", line: inner.span.start.line, col: inner.span.start.col, endCol: inner.span.end.col, text: `${negatedText} == false` }
+          : undefined
+        : { kind: 'edit', title: "Compare with '== true'", line: call.span.end.line, col: call.span.end.col, endCol: call.span.end.col, text: ' == true' };
       this.error(e.span, 'pj/call-as-condition', `A call cannot be the whole condition of '${owner}'; compare its result (${negated ? `${exprText(call)} == false` : `${exprText(call)} == true`}) or store it in a boolean first`, fix);
     }
   }
@@ -701,7 +884,7 @@ class Checker {
     const seenLabels = new Set<string>();
     this.switchDepth++;
     for (const g of s.groups) {
-      let tag: string | undefined;
+      const groupTags: string[] = [];
       for (const l of g.labels) {
         if (!l) continue;
         if (cases) {
@@ -714,10 +897,11 @@ class Checker {
             this.error(l.span, 'pj/type/switch', `'${l.name.name}' is not a case of protocol ${typeStr(t)} (cases: ${[...cases.keys()].join(', ')})${sug ? `; did you mean '${sug}'?` : ''}`);
             continue;
           }
-          tag = l.name.name;
+          const caseName = l.name.name;
+          groupTags.push(caseName);
           this.types.set(l, t);
-          if (seenLabels.has(tag)) this.error(l.span, 'pj/type/switch', `Duplicate case '${tag}'`);
-          seenLabels.add(tag);
+          if (seenLabels.has(caseName)) this.error(l.span, 'pj/type/switch', `Duplicate case '${caseName}'`);
+          seenLabels.add(caseName);
         } else {
           const lt = this.expr(l);
           if (!isLenient(t) && !isLenient(lt) && !assignable(t, lt, this.index)) this.error(l.span, 'pj/type/switch', `Case value of type ${typeStr(lt)} does not match the switch expression (${typeStr(t)})`);
@@ -726,6 +910,10 @@ class Checker {
           seenLabels.add(key);
         }
       }
+      if (cases && groupTags.length > 1) {
+        this.report(g.span, 'warning', 'pj/compiler-limit', `This ProcessJ build rejects multiple protocol labels in one switch group (${groupTags.join(', ')}); give each case its own body and break`);
+      }
+      const tag = groupTags.length === 1 ? groupTags[0] : undefined;
       this.push();
       this.withCase(protoVar && tag ? [protoVar, tag] : undefined, () => this.stmts(g.stmts));
       this.pop();
@@ -762,8 +950,8 @@ class Checker {
   private altStmt(s: A.AltStmt, nested = false): void {
     // The compiler merges a nested non-replicated alt into its parent, so only
     // top-level and replicated alts count towards the one-alt limit.
-    if (!nested || s.replicated) this.altCount++;
-    if (this.altCount === 2) this.error({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + (s.isPri ? 7 : 3) } }, 'pj/multiple-alts', `A procedure can contain only one alt; move this one into its own procedure`);
+    if (!nested || s.replicated) this.processAlts++;
+    if (this.processAlts === 2) this.error({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + (s.isPri ? 7 : 3) } }, 'pj/multiple-alts', `A second alt in the same process cannot be compiled by this ProcessJ build (its generated guard array is declared twice); move this one into its own procedure or into a separate par branch`);
     this.insideAlt++;
     this.push();
     if (s.replicated) {
@@ -822,7 +1010,7 @@ class Checker {
     this.parDepth++;
     this.push();
     for (const st of s.body.stmts) {
-      const use = this.branch(this.scope.depth, () => this.stmt(st));
+      const use = this.branch(this.scope.depth, () => this.inProcess(() => this.stmt(st)));
       branches.push(use);
     }
     this.pop();
@@ -854,12 +1042,14 @@ class Checker {
         }
         if (first === x || first === -1) continue;
         seenEnds.set(key, -1);
-        if (v.type.k !== 'chan' || v.type.shared || v.depth > branches[x].depth) continue;
+        const side = key.endsWith('.read') ? 'read' : 'write';
+        if (v.type.k !== 'chan' || sharedSideOf(v.type, side) || v.depth > branches[x].depth) continue;
         const declLine = v.decl.span.start.line;
         const typeCol = Math.max(0, v.decl.span.start.col - (typeStr(v.type).length + 1));
         this.error(span, 'pj/shared-channel-end', `'${key}' is used by more than one branch of this par; declare it 'shared chan<${typeStr(v.type.elem)}>'`, { kind: 'make-shared', line: declLine, col: typeCol, title: `Declare '${v.name}' as shared` });
       }
     }
+    this.reportUnlockedEnds(branches);
   }
 
   /**
@@ -870,6 +1060,7 @@ class Checker {
    * channels are opaque, and then the whole par is left alone.
    */
   private simulateRendezvous(s: A.ParBlock): void {
+    if (!this.collectExecutionFacts) return;
     if (s.body.stmts.length < 2) return;
     const queues: Op[][] = [];
     for (const st of s.body.stmts) {
@@ -897,32 +1088,60 @@ class Checker {
         if (use.branches.size <= 1) return; // a single-process channel is already a self-deadlock report
       }
     }
-    const heads = queues.map(() => 0);
-    for (;;) {
-      let progressed = false;
-      for (let i = 0; i < queues.length && !progressed; i++) {
-        const a = queues[i][heads[i]];
-        if (!a) continue;
-        for (let j = 0; j < queues.length; j++) {
-          if (i === j) continue;
-          const b = queues[j][heads[j]];
-          if (b && b.chan === a.chan && b.kind !== a.kind) {
-            heads[i]++;
-            heads[j]++;
-            progressed = true;
-            break;
-          }
-        }
-      }
-      if (!progressed) break;
-    }
+    // A channel with several ready peers is nondeterministic. A greedy first
+    // match can manufacture a dead end even when another legal rendezvous
+    // completes, making the result depend on source branch order. Explore the
+    // bounded head-state graph and report only when *every* legal schedule is
+    // stuck. If the proof budget is exhausted, fail closed and make no claim.
+    const proof = searchRendezvousHeads(queues, (left, right) => left.chan === right.chan && left.kind !== right.kind);
+    if (proof.kind !== 'deadlock') return;
+    const heads = proof.heads;
     const stuck = queues.map((q, i) => ({ i, op: q[heads[i]] })).filter((x) => x.op);
-    if (stuck.length === 0) return;
     const first = stuck[0];
     const describe = (x: { i: number; op: Op }) => `branch ${x.i + 1} waits to ${x.op.kind} '${x.op.chan.name}'`;
     const others = stuck.slice(1).map(describe);
     const finished = stuck.length === 1 ? ' but every other branch has finished' : '';
-    this.warn(first.op.span, 'pj/par-deadlock', `Deadlock: ${describe(first)}${others.length ? `, ${others.join(', ')}` : ''}${finished}. Writes and reads must pair up across branches in the same order.`);
+    const finishedBranches = queues.map((_, i) => i).filter((i) => !queues[i][heads[i]]).map((i) => i + 1);
+    // A collection of blocked heads is not necessarily a circular wait. For
+    // each head, look for the opposite operation in another branch's remaining
+    // work. If none exists, that wait has a genuinely missing peer and is a
+    // root cause. If every head has a future peer, the finite dependency graph
+    // necessarily contains a cycle: each branch is waiting for another blocked
+    // branch to advance before its peer can be reached.
+    const remainingByChannel = new Map<VarInfo, { read: Set<number>; write: Set<number> }>();
+    queues.forEach((queue, branch) => {
+      for (let i = heads[branch]; i < queue.length; i++) {
+        const op = queue[i];
+        let remaining = remainingByChannel.get(op.chan);
+        if (!remaining) {
+          remaining = { read: new Set(), write: new Set() };
+          remainingByChannel.set(op.chan, remaining);
+        }
+        remaining[op.kind].add(branch);
+      }
+    });
+    const missingPeers = stuck.filter((x) => {
+      const peers = remainingByChannel.get(x.op.chan)?.[x.op.kind === 'read' ? 'write' : 'read'];
+      return !peers || peers.size === 0 || (peers.size === 1 && peers.has(x.i));
+    });
+    const cause = missingPeers.length > 0 ? 'missing-peer' : 'circular-wait';
+    this.deadlocks.push({
+      par: s,
+      waits: stuck.map((x) => ({ branch: x.i + 1, operation: x.op.kind, channel: x.op.chan, span: x.op.span })),
+      finishedBranches,
+      confidence: 'exact',
+      cause,
+    });
+    const why = cause === 'missing-peer'
+      ? `No unfinished branch can reach ${missingPeers.map((x) => `a matching ${x.op.kind === 'read' ? 'write' : 'read'} on '${x.op.chan.name}' for branch ${x.i + 1}`).join(' or ')}.`
+      : 'Each listed branch is blocked at its next rendezvous, so none can reach the operation another branch needs.';
+    const related = stuck.map((x) => ({
+      line: x.op.span.start.line,
+      startCol: x.op.span.start.col,
+      endCol: x.op.span.end.line === x.op.span.start.line ? x.op.span.end.col : x.op.span.start.col + 1,
+      message: `Branch ${x.i + 1} is blocked here waiting to ${x.op.kind} '${x.op.chan.name}'.`,
+    }));
+    this.warn(first.op.span, 'pj/par-deadlock', `Deadlock: ${describe(first)}${others.length ? `, ${others.join(', ')}` : ''}${finished}. ${why}`, related);
   }
 
   /** Channel operations of a straight-line branch, or undefined if the branch is opaque. */
@@ -954,16 +1173,21 @@ class Checker {
   private exprOps(e: A.Expr, ops: Op[]): boolean {
     switch (e.kind) {
       case 'ChanWrite': {
-        if (e.target.kind !== 'NameExpr' || !this.exprOps(e.value, ops)) return false;
-        const v = this.resolutions.get(e.target);
-        if (!v) return false;
+        const target = this.channelRoot(e.target);
+        const targetType = this.types.get(e.target);
+        if (!target || targetType?.k !== 'chan' || targetType.end === 'read' || !this.exprOps(e.value, ops)) return false;
+        const v = this.resolutions.get(target);
+        if (!v || v.type.k !== 'chan') return false;
         ops.push({ kind: 'write', chan: v, span: e.span });
         return true;
       }
       case 'ChanRead': {
-        if (e.extended || e.target.kind !== 'NameExpr') return false;
-        const v = this.resolutions.get(e.target);
-        if (!v) return false;
+        const targetType = this.types.get(e.target);
+        if (targetType?.k === 'prim' && targetType.name === 'timer') return !e.extended;
+        const target = this.channelRoot(e.target);
+        if (e.extended || !target || targetType?.k !== 'chan' || targetType.end === 'write') return false;
+        const v = this.resolutions.get(target);
+        if (!v || v.type.k !== 'chan') return false;
         ops.push({ kind: 'read', chan: v, span: e.span });
         return true;
       }
@@ -973,16 +1197,40 @@ class Checker {
       case 'Timeout':
         return false;
       case 'Invocation': {
-        if (e.target) return false;
+        if (e.target || e.qualifier?.length) return false;
         const chosen = this.calls.get(e);
-        const cands = chosen ? [chosen] : this.index.procs.get(e.name.name) ?? [];
-        if (cands.some((c) => this.yields.procYields(c.decl))) return false;
+        if (!chosen) return false;
+        const decl = chosen.decl;
+        // The shipped std output leaves are native but compiler-verified not
+        // to rendezvous. Every other bodyless or incompletely-resolved call is
+        // opaque: treating it as plain computation could manufacture an exact
+        // deadlock proof from only the channel operations around it.
+        const isProvenStdOutputLeaf = (decl.name.name === 'print' || decl.name.name === 'println')
+          && decl.modifiers.includes('native')
+          && !decl.modifiers.includes('mobile')
+          && !decl.body
+          && this.opts.trustedNonBlockingNativeDeclarations?.has(decl) === true
+          && !decl.annotations.some((annotation) => annotation.name === 'yield' && annotation.value === 'true');
+        // A body-bearing call can still diverge or transfer control before the
+        // following channel operation (for example `while (true) {}`). Unless
+        // the whole body is proven terminating, it is not a transparent step
+        // in an exact rendezvous schedule. Keep the proof boundary deliberately
+        // narrow: only the explicitly trusted compiler-native output leaves.
+        if (!isProvenStdOutputLeaf) return false;
         return e.args.every((a) => this.exprOps(a, ops) && this.types.get(a)?.k !== 'chan');
       }
       case 'AssignExpr':
         return (e.target.kind === 'NameExpr' || this.exprOps(e.target, ops)) && this.exprOps(e.value, ops);
-      case 'BinaryExpr':
-        return this.exprOps(e.left, ops) && this.exprOps(e.right, ops);
+      case 'BinaryExpr': {
+        if (!this.exprOps(e.left, ops)) return false;
+        if (e.op !== '&&' && e.op !== '||') return this.exprOps(e.right, ops);
+        // The right operand is conditional. Recording its channel operation as
+        // an unconditional branch head can manufacture an exact deadlock (or
+        // an exact schedule) for an operation that never executes.
+        if (this.yields.exprYields(e.right, 'calls')) return false;
+        const conditionalOps: Op[] = [];
+        return this.exprOps(e.right, conditionalOps) && conditionalOps.length === 0;
+      }
       case 'UnaryExpr':
         return this.exprOps(e.operand, ops);
       case 'ParenExpr':
@@ -1008,8 +1256,25 @@ class Checker {
     }
   }
 
+  /**
+   * Run `body` as its own generated process class, so the per-class compiler
+   * limits (one alt, one par for) are counted separately from the enclosing one.
+   */
+  private inProcess<T>(body: () => T): T {
+    const alts = this.processAlts;
+    const parFors = this.processParFors;
+    this.processAlts = 0;
+    this.processParFors = 0;
+    try {
+      return body();
+    } finally {
+      this.processAlts = alts;
+      this.processParFors = parFors;
+    }
+  }
+
   private branch(depth: number, body: () => void, replicated = false): BranchUse {
-    const use: BranchUse = { reads: new Map(), writes: new Map(), ends: new Map(), bare: new Set(), depth, replicated };
+    const use: BranchUse = { id: this.nextBranchId++, reads: new Map(), writes: new Map(), ends: new Map(), bare: new Set(), depth, replicated };
     this.branchStack.push(use);
     body();
     this.branchStack.pop();
@@ -1024,35 +1289,103 @@ class Checker {
   }
 
   private noteRead(v: VarInfo, span: A.Span): void {
+    if (!this.collectExecutionFacts) return;
     const b = this.branchStack[this.branchStack.length - 1];
     if (b && !b.reads.has(v)) b.reads.set(v, span);
   }
 
   private noteWrite(v: VarInfo, span: A.Span): void {
+    if (!this.collectExecutionFacts) return;
     const b = this.branchStack[this.branchStack.length - 1];
     if (b && !b.writes.has(v)) b.writes.set(v, span);
   }
 
-  private noteEnd(v: VarInfo, end: 'read' | 'write', span: A.Span, direct = true): void {
+  private noteEnd(v: VarInfo, end: 'read' | 'write', span: A.Span, direct = true, blocking = direct, site?: A.Expr): void {
+    if (!this.collectExecutionFacts) return;
     const b = this.branchStack[this.branchStack.length - 1];
     if (b) {
       const key = `${v.name}.${end}`;
       if (!b.ends.has(key)) b.ends.set(key, { v, span });
+      // A direct operation on a whole-channel variable is never locked. An end
+      // handed to a procedure is assumed locked until overload resolution shows
+      // the receiving parameter drops `shared`.
+      const operation: EndOperation = { variable: v, end, span, branch: b, unlocked: direct };
+      this.endOperations.push(operation);
+      if (site) this.endOperationBySite.set(site, operation);
     }
     const u = this.chanUses.get(v);
     if (!u) return;
+    u.operations.push({ end, span, direct, branch: b?.id, replicated: b?.replicated ?? false });
     if (!direct) {
       u.bare = true; // handed to another process: we cannot know what it does with it
       return;
     }
-    if (end === 'read') u.reads ??= span;
-    else u.writes ??= span;
-    u.first ??= span;
-    u.branches.add(this.branchStack[this.branchStack.length - 1]);
+    if (blocking) {
+      if (end === 'read') u.reads ??= span;
+      else u.writes ??= span;
+      u.first ??= span;
+    }
+    u.branches.add(b);
     u.spans.push(span);
   }
 
+  /**
+   * The generated code takes the runtime lock from the *parameter's* declared
+   * type, so a shared end handed to a plain `chan<T>.end` parameter is operated
+   * without it.
+   */
+  private noteEndArguments(e: A.Invocation, chosen: ProcSig): void {
+    for (let i = 0; i < e.args.length; i++) {
+      const operation = this.endOperationBySite.get(e.args[i]);
+      const parameter = chosen.params[i];
+      if (!operation || !parameter) continue;
+      operation.unlocked = !(parameter.k === 'chan' && !!parameter.end && parameter.shared);
+      operation.via = { procedure: chosen.name, parameter: typeStr(parameter) };
+    }
+  }
+
+  /**
+   * A `shared` channel only serialises its processes where the generated code
+   * claims the runtime lock. Without it several processes overwrite the single
+   * reader/writer slot the runtime keeps per channel, and the program can hang.
+   */
+  private reportUnlockedEnds(branches: readonly BranchUse[]): void {
+    const ids = new Set(branches.map((b) => b.id));
+    // Keyed by the declaration itself: two branches may each declare their own
+    // channel with the same name, and those are different channels.
+    const bySide = new Map<VarInfo, Map<'read' | 'write', EndOperation[]>>();
+    for (const operation of this.endOperations) {
+      if (!ids.has(operation.branch.id)) continue;
+      if (!sharedSideOf(operation.variable.type, operation.end)) continue;
+      let sides = bySide.get(operation.variable);
+      if (!sides) {
+        sides = new Map();
+        bySide.set(operation.variable, sides);
+      }
+      const list = sides.get(operation.end);
+      if (list) list.push(operation);
+      else sides.set(operation.end, [operation]);
+    }
+    const groups = [...bySide.values()].flatMap((sides) => [...sides.values()]);
+    for (const operations of groups) {
+      // A replicated body is one branch in the source but many processes at runtime.
+      const processes = new Set(operations.map((o) => o.branch.id)).size;
+      if (processes < 2 && !operations.some((o) => o.branch.replicated)) continue;
+      const unlocked = operations.filter((o) => o.unlocked);
+      if (unlocked.length === 0) continue;
+      const last = unlocked[unlocked.length - 1];
+      const key = `${last.variable.name}.${last.end}`;
+      const elem = last.variable.type.k === 'chan' ? typeStr(last.variable.type.elem) : '?';
+      const wanted = `shared chan<${elem}>.${last.end}`;
+      const how = last.via
+        ? `it is passed to '${last.via.procedure}', which declares it as '${last.via.parameter}'`
+        : `this build claims the lock only for a parameter declared '${wanted}', never for an operation written directly on the channel`;
+      this.warn(last.span, 'pj/shared-unlocked-end', `'${key}' is used by more than one process here without the runtime's ${last.end} lock: ${how}. The processes then share the runtime's single ${last.end} slot, so the program can hang. Pass '${key}' to a procedure whose parameter is '${wanted}'.`);
+    }
+  }
+
   private noteBare(v: VarInfo): void {
+    if (!this.collectExecutionFacts) return;
     const u = this.chanUses.get(v);
     if (u) u.bare = true;
   }
@@ -1152,9 +1485,12 @@ class Checker {
         return t.dims > 1 ? { k: 'array', elem: t.elem, dims: t.dims - 1 } : t.elem;
       }
       case 'ChanEnd': {
-        this.endTargets.add(e.target);
+        const consumedByOperation = this.endTargets.has(e);
+        this.markEndTarget(e.target);
         const t = this.expr(e.target);
-        this.noteChannel(e.target, e.end, false);
+        // `c.read` passed as a value escapes; the same syntax inside
+        // `c.read.read()` is only a selector for the direct operation.
+        if (!consumedByOperation) this.noteChannel(e.target, e.end, false, false, e);
         if (isLenient(t)) return T.unknown;
         if (t.k !== 'chan') return this.error(e.span, 'pj/type/channel', `${exprText(e.target)} is ${typeStr(t)}, not a channel; '.${e.end}' needs a channel`);
         if (t.end) return this.error(e.span, 'pj/channel-direction', `'${exprText(e.target)}' is already a ${t.end} end; it has no '.${e.end}'`);
@@ -1163,7 +1499,7 @@ class Checker {
       case 'ChanRead':
         return this.chanRead(e);
       case 'ChanWrite': {
-        this.endTargets.add(e.target);
+        this.markEndTarget(e.target);
         const t = this.expr(e.target);
         this.noteChannel(e.target, 'write', true);
         const v = this.expr(e.value);
@@ -1180,7 +1516,7 @@ class Checker {
         if (!isLenient(t) && !isPrim(t, 'barrier')) this.error(e.span, 'pj/type/barrier', `'.sync()' needs a barrier; ${exprText(e.target)} is ${typeStr(t)}`);
         if (e.target.kind === 'NameExpr') {
           const v = this.resolutions.get(e.target);
-          if (v) this.syncs.push({ v, span: e.span });
+          if (v && this.collectExecutionFacts) this.syncs.push({ v, span: e.span });
         }
         return T.void;
       }
@@ -1295,11 +1631,60 @@ class Checker {
     const d = this.expr(e.delay);
     if (!isLenient(t) && !isPrim(t, 'timer')) this.error(e.target.span, 'pj/type/timer', `'.timeout()' needs a timer; ${exprText(e.target)} is ${typeStr(t)}`);
     if (!isLenient(d) && !isIntegral(d)) this.error(e.delay.span, 'pj/type/timer', `The timeout delay must be an integer number of milliseconds, not ${typeStr(d)}`);
+    // The runtime stores the argument as the wall-clock millisecond at which the
+    // timer expires, so `t.timeout(300)` is a deadline 300 ms after the epoch:
+    // it has already passed and the timeout returns at once. Verified by running
+    // both spellings: 1 ms elapsed against 306 ms for `t.timeout(t.read() + 300)`.
+    // An alt guard is generated inline, so a read inside its deadline expression
+    // produces invalid Java. A deadline computed into a local first is fine.
+    const guardRead = inAlt ? findRead(e.delay) : undefined;
+    if (guardRead) {
+      this.report(guardRead.span, 'warning', 'pj/compiler-limit', "A read inside an alt timeout guard cannot be compiled by this ProcessJ build; compute the deadline into a variable before the alt and use that variable as the guard");
+    }
+    if (isPrim(t, 'timer') && this.isConstantDelay(e.delay)) {
+      const timer = this.slice(e.target.span);
+      const delay = this.slice(e.delay.span);
+      // The same rewrite would not compile as an alt guard, so there it is
+      // described rather than offered.
+      const fix: FixHint | undefined = !inAlt && timer && e.delay.span.start.line === e.delay.span.end.line
+        ? { kind: 'edit', title: `Wait from now: '${timer}.read() + ...'`, line: e.delay.span.start.line, col: e.delay.span.start.col, endCol: e.delay.span.start.col, text: `${timer}.read() + ` }
+        : undefined;
+      const remedy = inAlt
+        ? `Set 'long deadline = ${timer ?? 'timer'}.read() + ${delay ?? 'delay'};' before the alt and use 'deadline' here.`
+        : `Write '${timer ?? 'timer'}.read() + ${delay ?? 'delay'}' to wait that many milliseconds from now.`;
+      this.report(e.delay.span, 'warning', 'pj/timeout-deadline', `'.timeout()' takes the absolute time to wake up, not how long to wait, so this returns immediately. ${remedy}`, fix);
+    }
     return T.void;
   }
 
+  /**
+   * Is the delay a compile-time constant? Then it is certainly not a wall-clock
+   * deadline. Anything computed from a variable, parameter or call may well be
+   * one (`long when = t.read() + 300;`), so those are left alone.
+   */
+  private isConstantDelay(e: A.Expr): boolean {
+    switch (e.kind) {
+      case 'Literal':
+        return e.litKind !== 'null';
+      case 'ParenExpr':
+      case 'CastExpr':
+        return this.isConstantDelay(e.expr);
+      case 'UnaryExpr':
+        return e.op !== '++' && e.op !== '--' && this.isConstantDelay(e.operand);
+      case 'BinaryExpr':
+        return this.isConstantDelay(e.left) && this.isConstantDelay(e.right);
+      case 'NameExpr': {
+        const v = this.resolutions.get(e);
+        if (v) return v.isConst;
+        return this.index.consts.has(e.name.name);
+      }
+      default:
+        return false;
+    }
+  }
+
   private chanRead(e: A.ChanRead): Type {
-    this.endTargets.add(e.target);
+    this.markEndTarget(e.target);
     const t = this.expr(e.target);
     if (isPrim(t, 'timer')) {
       // `t.read()` on a timer is the current time in milliseconds.
@@ -1307,11 +1692,14 @@ class Checker {
       return T.long;
     }
     // A read guard among other alt guards is a choice, not a blocking read: the alt may take another guard.
-    this.noteChannel(e.target, 'read', this.inChoiceGuard === 0);
+    this.noteChannel(e.target, 'read', true, this.inChoiceGuard === 0);
     if (e.extended) this.block(e.extended);
     if (isLenient(t)) return T.unknown;
     if (t.k !== 'chan') return this.error(e.target.span, 'pj/type/channel', `${exprText(e.target)} is ${typeStr(t)}, not a channel; '.read()' needs a channel or a read end`);
     if (t.end === 'write') return this.error(e.span, 'pj/channel-direction', `'${exprText(e.target)}' is a write end (${typeStr(t)}); it cannot read`);
+    if (t.end === 'read' && t.shared) {
+      this.report(e.span, 'warning', 'pj/compiler-limit', `Reading through '${typeStr(t)}' cannot be compiled by this ProcessJ build: its code generator throws on the shared-read template. Give the reader a plain '${typeStr({ ...t, shared: false })}' parameter (one reader process), or read the channel where it is declared.`);
+    }
     return t.elem;
   }
 
@@ -1321,10 +1709,26 @@ class Checker {
    * (`f(c.read)`) only counts for the par sharing rule, since the callee may use it
    * in an alt or in another process.
    */
-  private noteChannel(target: A.Expr, end: 'read' | 'write', direct: boolean): void {
-    if (target.kind !== 'NameExpr') return;
-    const v = this.resolutions.get(target);
-    if (v && v.type.k === 'chan' && !v.type.end) this.noteEnd(v, end, target.span, direct);
+  private noteChannel(target: A.Expr, end: 'read' | 'write', direct: boolean, blocking = direct, site?: A.Expr): void {
+    const root = this.channelRoot(target);
+    if (!root) return;
+    const v = this.resolutions.get(root);
+    if (v && v.type.k === 'chan' && !v.type.end) this.noteEnd(v, end, root.span, direct, blocking, site);
+  }
+
+  /** Mark transparent endpoint wrappers so the root channel is not mistaken for an opaque use. */
+  private markEndTarget(target: A.Expr): void {
+    this.endTargets.add(target);
+    if (target.kind === 'ParenExpr' || target.kind === 'CastExpr') this.markEndTarget(target.expr);
+    else if (target.kind === 'ChanEnd') this.markEndTarget(target.target);
+  }
+
+  /** Recover a whole-channel variable through syntax that does not change its identity. */
+  private channelRoot(target: A.Expr): A.NameExpr | undefined {
+    if (target.kind === 'NameExpr') return target;
+    if (target.kind === 'ParenExpr' || target.kind === 'CastExpr') return this.channelRoot(target.expr);
+    if (target.kind === 'ChanEnd') return this.channelRoot(target.target);
+    return undefined;
   }
 
   private name(e: A.NameExpr): Type {
@@ -1380,8 +1784,13 @@ class Checker {
     const lt = this.lvalue(e.target);
     this.noteNull(e.value);
     if (e.target.kind === 'ArrayAccess') {
+      // Reading into an index is fine on the right of an assignment; only the
+      // array being written breaks the generated code.
       const nested = findRead(e.target.index);
       if (nested) this.error(nested.span, 'pj/read-placement', 'A channel read cannot index the array being assigned; read it into a variable first');
+    }
+    if (e.value.kind === 'RecordLiteral' || e.value.kind === 'ProtocolLiteral') {
+      this.report(e.value.span, 'warning', 'pj/compiler-limit', 'A record or protocol literal can only be compiled as the initialiser of a declaration in this ProcessJ build; declare the variable together with the literal, then assign that variable');
     }
     if (e.value.kind === 'ArrayLiteral') {
       this.arrayLiteral(e.value, lt, exprText(e.target));
@@ -1510,9 +1919,9 @@ class Checker {
         const owners = [...cases].filter(([, f]) => f.has(m)).map(([c]) => c);
         return this.error(e.member.span, 'pj/type/field', owners.length ? `'${m}' belongs to case ${owners.join('/')}, but here '${exprText(e.target)}' is case '${active}' (fields: ${[...(fields?.keys() ?? [])].join(', ') || 'none'})` : `Protocol ${t.name} has no field '${m}' in any case`);
       }
-      for (const [, fields] of cases) {
-        const ft = fields.get(m);
-        if (ft) return ft;
+      const owners = [...cases].filter(([, fields]) => fields.has(m)).map(([caseName]) => caseName);
+      if (owners.length) {
+        return this.error(e.member.span, 'pj/type/field', `Field '${m}' of protocol ${t.name} can only be inspected after a protocol switch proves the active case (${owners.join('/')})`);
       }
       return this.error(e.member.span, 'pj/type/field', `Protocol ${t.name} has no field '${m}' in any case (cases: ${[...cases.keys()].join(', ')})`);
     }
@@ -1563,7 +1972,12 @@ class Checker {
     }
     if (best.length > 1 && !args.some(isLenient)) this.warn(e.span, 'pj/type/call', `Ambiguous call to '${n}': ${best.map(signatureStr).join(' or ')}`);
     const chosen = best[0];
-    this.calls.set(e, chosen);
+    // Keep checking with a provisional return type, but expose a declaration
+    // identity only when overload selection is actually proved. In particular,
+    // an unknown argument can manufacture one "most specific" candidate even
+    // though its real type may select another overload.
+    if (best.length === 1 && !args.some(isLenient)) this.calls.set(e, chosen);
+    if (best.length === 1) this.noteEndArguments(e, chosen);
     return chosen.ret;
   }
 
@@ -1572,8 +1986,8 @@ class Checker {
     const v = this.resolutions.get(a);
     if (v && v.type.k === 'chan' && !v.type.end) {
       this.noteBare(v);
-      this.noteEnd(v, 'read', a.span);
-      this.noteEnd(v, 'write', a.span);
+      this.noteEnd(v, 'read', a.span, false);
+      this.noteEnd(v, 'write', a.span, false);
     }
   }
 

@@ -32,7 +32,7 @@ function M.default_config()
       runTimeoutMs = 30000,
       checkOnChange = false, -- run the real compiler only on open and save; the checker runs as you type
       lint = true,
-      codeLens = true, -- "▶ Run | Build" above main; :ProcessJRun and :ProcessJBuild do the same
+      codeLens = true, -- Run, Build, effect, graph, and protocol lenses; commands remain available when hidden
     },
   }
 end
@@ -76,6 +76,9 @@ function M.setup(opts)
   vim.lsp.enable "processj_ls"
   vim.api.nvim_create_user_command("ProcessJRun", function() exec "processj.run" end, { desc = "Compile and run the current ProcessJ file" })
   vim.api.nvim_create_user_command("ProcessJBuild", function() exec "processj.build" end, { desc = "Compile the current ProcessJ file" })
+  vim.api.nvim_create_user_command("ProcessJGraph", function() exec "processj.showConcurrencyReport" end, { desc = "Show the current file's concurrency graph" })
+  vim.api.nvim_create_user_command("ProcessJEffects", function() exec "processj.showEffectReport" end, { desc = "Show procedure effect summaries for the current file" })
+  vim.api.nvim_create_user_command("ProcessJProtocols", function() exec "processj.showProtocolReport" end, { desc = "Show protocol structure and observed flow for the current file" })
   -- AstroNvim applies its LSP keymaps (<Leader>la, <Leader>lf, gd, ...) from AstroLSP's
   -- on_attach, which only runs for servers AstroLSP started itself. Run it for ours too.
   vim.api.nvim_create_autocmd("LspAttach", {

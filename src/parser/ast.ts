@@ -89,6 +89,8 @@ export type Decl = ProcDecl | RecordDecl | ProtocolDecl | ConstDecl | ExternDecl
 export interface Annotation {
   name: string;
   value: string;
+  /** Exact token span of the value, retained so code actions can replace it. */
+  span: Span;
 }
 
 export interface Param {

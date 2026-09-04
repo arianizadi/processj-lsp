@@ -9,6 +9,7 @@ import {
   type LanguageClientOptions,
   type ServerOptions,
 } from 'vscode-languageclient/node';
+import { showConcurrencyGraph, showProtocolGraph } from './graphPanel';
 
 const DOCUMENT_SELECTOR = [
   { scheme: 'file', language: 'processj' },
@@ -40,6 +41,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.commands.registerCommand('processj.runCurrentFile', () => executeForActiveEditor('processj.run')),
     vscode.commands.registerCommand('processj.buildCurrentFile', () => executeForActiveEditor('processj.build')),
+    vscode.commands.registerCommand('processj.showConcurrencyGraph', async () => {
+      if (!client?.isRunning()) {
+        void vscode.window.showWarningMessage('ProcessJ: the language server is not ready.');
+        return;
+      }
+      await showConcurrencyGraph(client);
+    }),
+    vscode.commands.registerCommand('processj.showProtocolFlow', async () => {
+      if (!client?.isRunning()) {
+        void vscode.window.showWarningMessage('ProcessJ: the language server is not ready.');
+        return;
+      }
+      await showProtocolGraph(client);
+    }),
+    vscode.commands.registerCommand('processj.showProcedureEffects', () => executeForActiveEditor('processj.showEffectReport')),
     vscode.commands.registerCommand('processj.showOutput', () => {
       if (client) client.outputChannel.show(true);
       else void vscode.window.showWarningMessage('ProcessJ: the language server has not started.');
@@ -87,7 +103,7 @@ export function deactivate(): Thenable<void> | undefined {
   });
 }
 
-async function executeForActiveEditor(command: 'processj.run' | 'processj.build'): Promise<unknown> {
+async function executeForActiveEditor(command: 'processj.run' | 'processj.build' | 'processj.showEffectReport'): Promise<unknown> {
   const editor = vscode.window.activeTextEditor;
   if (!editor || editor.document.languageId !== 'processj') {
     void vscode.window.showWarningMessage('ProcessJ: open a ProcessJ editor first.');

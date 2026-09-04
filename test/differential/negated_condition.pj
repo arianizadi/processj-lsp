@@ -1,0 +1,8 @@
+// outcome: compiler-limit
+import std.*;
+// The generated code renders a whole-condition `!b` as a statement, so javac
+// fails with "')' expected". `b == false` builds and runs.
+public void main(string[] args) {
+    boolean b = false;
+    if (!b) println("not b");
+}

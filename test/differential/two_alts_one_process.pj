@@ -1,0 +1,14 @@
+// outcome: error
+import std.*;
+// javac: "variable __booleanGuards1 is already defined in method run()".
+public void main(string[] args) {
+    chan<int> a;
+    int x;
+    par {
+        a.write(1);
+        {
+            alt { x = a.read() : { println("A " + x); } }
+            alt { x = a.read() : { println("B " + x); } }
+        }
+    }
+}

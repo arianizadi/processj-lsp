@@ -1,0 +1,7 @@
+// outcome: compiler-limit
+import std.*;
+// The code generator has no wrapper type for string and throws a NullPointerException.
+public void main(string[] args) {
+    chan<string> c;
+    par { c.write("hi"); println(c.read()); }
+}

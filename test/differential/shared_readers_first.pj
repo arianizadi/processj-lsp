@@ -1,0 +1,14 @@
+// outcome: deadlocks
+import std.*;
+// Two unlocked readers waiting at once deadlock exactly like two writers.
+public void main(string[] args) {
+    shared chan<int> c;
+    par {
+        println(c.read());
+        println(c.read());
+        {
+            c.write(5);
+            c.write(6);
+        }
+    }
+}

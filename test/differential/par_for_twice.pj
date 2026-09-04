@@ -1,0 +1,7 @@
+// outcome: compiler-limit
+import std.*;
+// javac: "variable processes is already defined in method run()".
+public void main(string[] args) {
+    par for (int i = 0; i < 2; i++) println("a" + i);
+    par for (int j = 0; j < 2; j++) println("b" + j);
+}

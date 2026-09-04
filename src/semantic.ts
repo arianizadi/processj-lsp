@@ -9,7 +9,7 @@ import type { CheckResult } from './checker/checker';
 import type { DeclIndex } from './checker/index';
 
 export const TOKEN_TYPES = ['namespace', 'type', 'struct', 'enum', 'enumMember', 'function', 'variable', 'parameter', 'property'] as const;
-export const TOKEN_MODIFIERS = ['declaration', 'readonly', 'defaultLibrary'] as const;
+export const TOKEN_MODIFIERS = ['declaration', 'readonly', 'defaultLibrary', 'channelRead', 'channelWrite', 'channelShared', 'blocking', 'escaped'] as const;
 
 type TokenType = (typeof TOKEN_TYPES)[number];
 type Modifier = (typeof TOKEN_MODIFIERS)[number];
@@ -29,12 +29,26 @@ export interface SemanticOptions {
 
 export function semanticTokens(program: A.Program, checked: CheckResult, index: DeclIndex, opts: SemanticOptions = {}): number[] {
   const toks: Tok[] = [];
+  const toksBySpan = new Map<string, Tok>();
+  const choiceReads = new WeakSet<A.ChanRead>();
   const typeIdx = (t: TokenType) => TOKEN_TYPES.indexOf(t);
   const modBits = (...ms: Modifier[]) => ms.reduce((acc, m) => acc | (1 << TOKEN_MODIFIERS.indexOf(m)), 0);
   const add = (id: A.Ident | { span: A.Span }, type: TokenType, ...mods: Modifier[]) => {
     const s = id.span;
     if (s.start.line !== s.end.line || s.end.col <= s.start.col) return;
-    toks.push({ line: s.start.line, col: s.start.col, len: s.end.col - s.start.col, type: typeIdx(type), mods: modBits(...mods) });
+    const key = `${s.start.line}:${s.start.col}:${s.end.col}`;
+    const bits = modBits(...mods);
+    const existing = toksBySpan.get(key);
+    if (existing) {
+      // The AST can expose the same identifier through a wrapper and its
+      // operation. LSP forbids overlapping semantic tokens, so merge modifier
+      // facts into the one token rather than emitting a duplicate range.
+      existing.mods |= bits;
+      return;
+    }
+    const token = { line: s.start.line, col: s.start.col, len: s.end.col - s.start.col, type: typeIdx(type), mods: bits };
+    toksBySpan.set(key, token);
+    toks.push(token);
   };
   const addQualified = (id: A.Ident, type: TokenType, ...mods: Modifier[]): void => {
     for (const q of id.qualifier ?? []) add(q, 'namespace');
@@ -57,20 +71,73 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
     }
   };
 
+  const nameExpr = (e: A.NameExpr, ...extra: Modifier[]): void => {
+    for (const q of e.qualifier ?? []) add(q, 'namespace');
+    const v = checked.resolutions.get(e);
+    if (v) add(e.name, v.isParam ? 'parameter' : 'variable', ...(v.isConst ? (['readonly'] as Modifier[]) : []), ...extra);
+    else if (index.consts.has(e.name.name)) add(e.name, 'variable', 'readonly', ...extra);
+    else if (checked.types.get(e)?.k === 'protocol' && !e.qualifier) add(e.name, 'enumMember', ...extra);
+    else if (index.procs.has(e.name.name)) add(e.name, 'function', ...extra);
+    else if (index.records.has(e.name.name)) add(e.name, 'struct', ...extra);
+    else if (index.protocols.has(e.name.name)) add(e.name, 'enum', ...extra);
+  };
+
+  const operationModifiers = (target: A.Expr, end?: 'read' | 'write', blocking = false, escaped = false): Modifier[] => {
+    const modifiers: Modifier[] = [];
+    const t = checked.types.get(target);
+    if (t?.k === 'chan') {
+      if (end === 'read') modifiers.push('channelRead');
+      if (end === 'write') modifiers.push('channelWrite');
+      if (t.shared) modifiers.push('channelShared');
+    }
+    if (blocking) modifiers.push('blocking');
+    if (escaped) modifiers.push('escaped');
+    return modifiers;
+  };
+
+  const operationTarget = (target: A.Expr, end?: 'read' | 'write', blocking = false, escaped = false): void => {
+    const modifiers = operationModifiers(target, end, blocking, escaped);
+    const carrier = (candidate: A.Expr): void => {
+      switch (candidate.kind) {
+        case 'NameExpr':
+          nameExpr(candidate, ...modifiers);
+          return;
+        case 'ParenExpr':
+          return carrier(candidate.expr);
+        case 'CastExpr':
+          typeNode(candidate.type);
+          return carrier(candidate.expr);
+        case 'ChanEnd':
+          // In `c.read.read()` the selected end is part of the direct read,
+          // not an escaped endpoint value.
+          return carrier(candidate.target);
+        case 'RecordAccess':
+          expr(candidate.target);
+          add(candidate.member, 'property', ...modifiers);
+          return;
+        case 'ArrayAccess':
+          carrier(candidate.target);
+          expr(candidate.index);
+          return;
+        default:
+          return expr(candidate);
+      }
+    };
+    carrier(target);
+  };
+
+  const isExplicitChanEnd = (argument: A.Expr): boolean => {
+    while (argument.kind === 'ParenExpr' || argument.kind === 'CastExpr') argument = argument.expr;
+    return argument.kind === 'ChanEnd';
+  };
+
   const expr = (e: A.Expr): void => {
     switch (e.kind) {
       case 'Literal':
       case 'ErrorExpr':
         return;
       case 'NameExpr': {
-        for (const q of e.qualifier ?? []) add(q, 'namespace');
-        const v = checked.resolutions.get(e);
-        if (v) add(e.name, v.isParam ? 'parameter' : 'variable', ...(v.isConst ? (['readonly'] as Modifier[]) : []));
-        else if (index.consts.has(e.name.name)) add(e.name, 'variable', 'readonly');
-        else if (checked.types.get(e)?.k === 'protocol' && !e.qualifier) add(e.name, 'enumMember'); // switch case label
-        else if (index.procs.has(e.name.name)) add(e.name, 'function');
-        else if (index.records.has(e.name.name)) add(e.name, 'struct');
-        else if (index.protocols.has(e.name.name)) add(e.name, 'enum');
+        nameExpr(e);
         return;
       }
       case 'ParenExpr':
@@ -104,7 +171,19 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
         const sig = checked.calls.get(e);
         const lib = sig?.file && opts.libraryFiles?.has(sig.file);
         add(e.name, 'function', ...(lib ? (['defaultLibrary'] as Modifier[]) : []));
-        for (const a of e.args) expr(a);
+        e.args.forEach((argument, index) => {
+          expr(argument);
+          // `g(c.read)` is annotated while visiting its ChanEnd. For an end
+          // already stored in a parameter or aggregate (`g(out)`, `g(r.out)`),
+          // recover the pass from the selected overload. Requiring the checked
+          // actual and formal to agree avoids inventing a role for unresolved or
+          // invalid calls, and keeps explicit selectors from gaining both roles.
+          if (isExplicitChanEnd(argument)) return;
+          const actual = checked.types.get(argument);
+          const formal = sig?.params[index];
+          if (actual?.k !== 'chan' || !actual.end || formal?.k !== 'chan' || formal.end !== actual.end) return;
+          operationTarget(argument, actual.end, false, true);
+        });
         return;
       }
       case 'RecordAccess':
@@ -116,19 +195,24 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
         expr(e.index);
         return;
       case 'ChanEnd':
-        return expr(e.target);
-      case 'ChanRead':
-        expr(e.target);
+        return operationTarget(e.target, e.end, false, true);
+      case 'ChanRead': {
+        const targetType = checked.types.get(e.target);
+        // `timer.read()` returns the current time and does not rendezvous or
+        // suspend, despite sharing the channel-read AST shape.
+        const channel = targetType?.k === 'chan';
+        operationTarget(e.target, channel ? 'read' : undefined, channel && !choiceReads.has(e));
         if (e.extended) block(e.extended);
         return;
+      }
       case 'ChanWrite':
-        expr(e.target);
+        operationTarget(e.target, 'write', true);
         expr(e.value);
         return;
       case 'Sync':
-        return expr(e.target);
+        return operationTarget(e.target, undefined, true);
       case 'Timeout':
-        expr(e.target);
+        operationTarget(e.target, undefined, true);
         expr(e.delay);
         return;
       case 'NewArray':
@@ -224,6 +308,7 @@ export function semanticTokens(program: A.Program, checked: CheckResult, index: 
           if (c.precondition) expr(c.precondition);
           if (c.guard?.kind === 'ReadGuard') {
             expr(c.guard.target);
+            if (s.cases.length > 1) choiceReads.add(c.guard.read);
             expr(c.guard.read);
           } else if (c.guard?.kind === 'TimeoutGuard') expr(c.guard.timeout);
           if (c.body) stmt(c.body);

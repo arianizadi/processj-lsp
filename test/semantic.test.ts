@@ -66,3 +66,101 @@ test('qualified-name package segments are semantic namespaces', () => {
   assert.ok(packages.every((token) => token.type === 'namespace'));
   assert.equal(toks.find((token) => spelling(token) === 'Thing')?.type, 'struct');
 });
+
+test('channel operations carry direction, sharing, blocking and escape modifiers', () => {
+  const src = [
+    'void use(shared chan<int>.read input) { int value = input.read(); }',
+    'void main() { shared read chan<int> c; use(c.read); }',
+  ].join('\n');
+  const parsed = parse(src);
+  assert.deepEqual(parsed.errors, []);
+  const index = new DeclIndex();
+  index.addProgram(parsed.program, 'channels.pj');
+  const checked = check(parsed.program, { index });
+  const tokens = decodeTokens(semanticTokens(parsed.program, checked, index));
+  const spelling = (token: (typeof tokens)[number]) => src.split('\n')[token.line].slice(token.col, token.col + token.len);
+  const operatedInput = tokens.find((token) => token.line === 0 && spelling(token) === 'input' && token.mods.includes('channelRead'));
+  assert.deepEqual(operatedInput?.mods, ['channelRead', 'channelShared', 'blocking']);
+  const passedChannel = tokens.find((token) => token.line === 1 && spelling(token) === 'c' && token.mods.includes('escaped'));
+  assert.ok(passedChannel?.mods.includes('channelRead'));
+  assert.ok(passedChannel?.mods.includes('channelShared'));
+});
+
+test('wrapped channel operations keep direct modifiers while timer reads remain non-blocking', () => {
+  const src = [
+    'void inspect(timer clock) { long now = clock.read(); }',
+    'void main() {',
+    '    chan<int> c;',
+    '    par {',
+    '        c.write.write(1);',
+    '        println((c).read());',
+    '    }',
+    '}',
+  ].join('\n');
+  const parsed = parse(src);
+  assert.deepEqual(parsed.errors, []);
+  const index = new DeclIndex();
+  index.addProgram(parsed.program, 'wrapped-channels.pj');
+  const checked = check(parsed.program, { index, unresolvedImports: true });
+  const tokens = decodeTokens(semanticTokens(parsed.program, checked, index));
+  const at = (line: number, spelling: string) => tokens.filter((token) => token.line === line && src.split('\n')[line].slice(token.col, token.col + token.len) === spelling).at(-1);
+
+  assert.deepEqual(at(0, 'clock')?.mods, [], 'reading a timer is an ordinary non-blocking value operation');
+  assert.deepEqual(at(4, 'c')?.mods, ['channelWrite', 'blocking']);
+  assert.deepEqual(at(5, 'c')?.mods, ['channelRead', 'blocking']);
+  assert.equal(new Set(tokens.map((token) => `${token.line}:${token.col}:${token.len}`)).size, tokens.length, 'semantic token ranges never overlap exactly');
+});
+
+test('a read offered among alt choices is directional but not labelled as an unconditional blocking operation', () => {
+  const src = [
+    'void choose(chan<int>.read input, timer clock) {',
+    '    int value;',
+    '    alt {',
+    '        value = input.read() : { println(value); }',
+    '        clock.timeout(10) : { }',
+    '    }',
+    '}',
+  ].join('\n');
+  const parsed = parse(src);
+  assert.deepEqual(parsed.errors, []);
+  const index = new DeclIndex();
+  index.addProgram(parsed.program, 'alt-tokens.pj');
+  const checked = check(parsed.program, { index, unresolvedImports: true });
+  const token = decodeTokens(semanticTokens(parsed.program, checked, index)).find((entry) => entry.line === 3 && src.split('\n')[3].slice(entry.col, entry.col + entry.len) === 'input');
+  assert.ok(token?.mods.includes('channelRead'));
+  assert.equal(token?.mods.includes('blocking'), false);
+});
+
+test('already-separated endpoint arguments inherit the selected formal role without duplicating explicit selectors', () => {
+  const src = [
+    'record Routes { chan<int>.read input; shared chan<int>.write output; }',
+    'void pass(chan<int>.read endpoint) { }',
+    'void pass(shared chan<int>.write endpoint) { }',
+    'void route(chan<int>.read input, shared chan<int>.write output, Routes routes) {',
+    '    pass(input);',
+    '    pass(output);',
+    '    pass(routes.input);',
+    '    pass(routes.output);',
+    '    chan<int> local;',
+    '    pass(local.read);',
+    '}',
+  ].join('\n');
+  const parsed = parse(src);
+  assert.deepEqual(parsed.errors, []);
+  const index = new DeclIndex();
+  index.addProgram(parsed.program, 'endpoint-arguments.pj');
+  const checked = check(parsed.program, { index });
+  assert.equal(checked.diagnostics.filter((diagnostic) => diagnostic.severity === 'error').length, 0);
+  const tokens = decodeTokens(semanticTokens(parsed.program, checked, index));
+  const spelling = (token: (typeof tokens)[number]) => src.split('\n')[token.line].slice(token.col, token.col + token.len);
+  const at = (line: number, text: string) => tokens.find((token) => token.line === line && spelling(token) === text);
+
+  assert.deepEqual(at(4, 'input')?.mods, ['channelRead', 'escaped']);
+  assert.deepEqual(at(5, 'output')?.mods, ['channelWrite', 'channelShared', 'escaped']);
+  assert.deepEqual(at(6, 'input'), { line: 6, col: 16, len: 5, type: 'property', mods: ['channelRead', 'escaped'] });
+  assert.deepEqual(at(7, 'output'), { line: 7, col: 16, len: 6, type: 'property', mods: ['channelWrite', 'channelShared', 'escaped'] });
+  assert.deepEqual(at(6, 'routes')?.mods, [], 'the endpoint field, not its record container, carries the role');
+  assert.deepEqual(at(9, 'local')?.mods, ['channelRead', 'escaped']);
+  assert.equal(at(9, 'local')?.mods.includes('channelWrite'), false);
+  assert.equal(tokens.filter((token) => token.line === 9 && spelling(token) === 'local').length, 1, 'an explicit selector emits one carrier token');
+});

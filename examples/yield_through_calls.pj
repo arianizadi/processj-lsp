@@ -1,7 +1,7 @@
 // expect: pj/needs-yield-annotation
 import std.*;
 
-public void wait1() { timer t; t.timeout(1); }
+public void wait1() { timer t; t.timeout(t.read() + 1); }
 
 // `twice` never communicates itself, only through what it calls, so it must be
 // marked [yield=true] to be compiled as a suspending process (the compiler

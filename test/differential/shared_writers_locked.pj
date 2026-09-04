@@ -1,0 +1,17 @@
+// outcome: runs
+import std.*;
+// The working shape: every writer goes through a `shared chan<int>.write`
+// parameter, so the generated code claims the runtime's write lock, and the
+// unshared read side stays with a single reader process.
+public void put(shared chan<int>.write out, int v) { out.write(v); }
+public void main(string[] args) {
+    shared write chan<int> c;
+    par {
+        put(c.write, 5);
+        put(c.write, 6);
+        {
+            println(c.read());
+            println(c.read());
+        }
+    }
+}

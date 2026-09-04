@@ -10,6 +10,7 @@ import * as path from 'node:path';
 import type { Install } from './config';
 import { exec, makeSandbox, processjcArgs, type ExecResult, type Sandbox } from './compiler';
 import { parseCompilerOutput, stripAnsi } from './diagnostics';
+import type { YieldAnnotationContext } from './yieldfix';
 
 export interface Stage {
   name: string;
@@ -48,8 +49,8 @@ function stage(name: string, r: ExecResult, ok: boolean): Stage {
   return { name, ok, durationMs: r.durationMs, output: r.timedOut ? `${output}\n(timed out)` : output };
 }
 
-export async function build(install: Install, sourcePath: string, text: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<BuildResult> {
-  const sb = makeSandbox(install, sourcePath, text);
+export async function build(install: Install, sourcePath: string, text: string, opts: { timeoutMs?: number; signal?: AbortSignal; yieldContext?: YieldAnnotationContext } = {}): Promise<BuildResult> {
+  const sb = makeSandbox(install, sourcePath, text, opts.yieldContext);
   const mainClass = path.basename(sb.fileName, '.pj');
   const stages: Stage[] = [];
   const timeoutMs = opts.timeoutMs ?? 60_000;

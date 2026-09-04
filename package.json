@@ -1,7 +1,7 @@
 {
   "name": "processj-lsp",
   "version": "0.3.2",
-  "description": "Language server for the ProcessJ language: full parser with specific syntax errors, formatter, compiler diagnostics, concurrency lints, run-from-editor, completion and navigation.",
+  "description": "ProcessJ language server with type checking, causal concurrency diagnostics, effect and protocol analysis, safe refactors, formatting, navigation, compiler integration and run-from-editor.",
   "license": "Apache-2.0",
   "author": "Arian Izadi",
   "type": "commonjs",
@@ -12,6 +12,7 @@
   "files": [
     "bin",
     "dist/src",
+    "docs",
     "editor",
     "README.md",
     "NOTICE"

@@ -1,0 +1,15 @@
+// outcome: deadlocks
+import std.*;
+// Passing the shared write end to a plain `chan<int>.write` parameter skips the lock too.
+public void w(chan<int>.write o, int v) { o.write(v); }
+public void main(string[] args) {
+    shared write chan<int> c;
+    par {
+        w(c.write, 5);
+        w(c.write, 6);
+        {
+            println(c.read());
+            println(c.read());
+        }
+    }
+}
