@@ -1386,7 +1386,10 @@ class Checker {
       const how = last.via
         ? `it is passed to '${last.via.procedure}', which declares it as '${last.via.parameter}'`
         : `this build claims the lock only for a parameter declared '${wanted}', never for an operation written directly on the channel`;
-      this.warn(last.span, 'pj/shared-unlocked-end', `'${key}' is used by more than one process here without the runtime's ${last.end} lock: ${how}. The processes then share the runtime's single ${last.end} slot, so the program can hang. Pass '${key}' to a procedure whose parameter is '${wanted}'.`);
+      const remedy = last.end === 'write'
+        ? `Pass '${key}' to a procedure whose parameter is '${wanted}'.`
+        : `Keep all reads in one sequential process; this compiler build cannot generate reads through a '${wanted}' parameter.`;
+      this.warn(last.span, 'pj/shared-unlocked-end', `'${key}' is used by more than one process here without the runtime's ${last.end} lock: ${how}. The processes then share the runtime's single ${last.end} slot, so the program can hang. ${remedy}`);
     }
   }
 

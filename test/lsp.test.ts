@@ -652,7 +652,7 @@ test('server exposes concurrency, protocol, inlay and refactoring features throu
   const firstEffects = await client.request('workspace/executeCommand', { command: 'processj.showEffectReport', arguments: [duplicateA] });
   const secondEffects = await client.request('workspace/executeCommand', { command: 'processj.showEffectReport', arguments: [duplicateB] });
   const repeatedEffects = await client.request('workspace/executeCommand', { command: 'processj.showEffectReport', arguments: [duplicateA] });
-  assert.equal(path.basename(firstEffects.result), 'same.effects.md', 'reports keep a readable filename');
+  assert.equal(path.basename(firstEffects.result), 'same.effects.pjreport', 'reports keep a readable, editor-safe filename');
   assert.notEqual(path.dirname(firstEffects.result), path.dirname(secondEffects.result), 'same-basename documents have private report directories');
   assert.equal(repeatedEffects.result, firstEffects.result, 'one document reuses its stable report path');
   assert.match(fs.readFileSync(firstEffects.result, 'utf8'), /## first/);
@@ -970,7 +970,7 @@ test('only install-loaded std output declarations are transparent to exact rende
     fs.rmSync(base, { recursive: true, force: true });
   });
 
-  const diagnosticsFor = async (workspaceRoot: string, name: string): Promise<any[]> => {
+  const analysisFor = async (workspaceRoot: string, name: string): Promise<{ diagnostics: any[]; effectTitle: string }> => {
     const client = new LspClient(server);
     clients.push(client);
     await client.request('initialize', {
@@ -994,13 +994,17 @@ test('only install-loaded std output declarations are transparent to exact rende
     ].join('\n');
     client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: source } });
     const published = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === uri);
+    const lenses = await client.request('textDocument/codeLens', { textDocument: { uri } });
+    const effectTitle = lenses.result.find((lens: any) => lens.command?.command === 'processj.showEffectReport')?.command?.title ?? '';
     await client.request('shutdown', null);
     client.notify('exit', null);
-    return published.params.diagnostics;
+    return { diagnostics: published.params.diagnostics, effectTitle };
   };
 
-  const trusted = await diagnosticsFor(trustedWorkspace, 'trusted.pj');
-  assert.ok(trusted.some((diagnostic: any) => diagnostic.code === 'pj/par-deadlock'), 'the real install declaration retains the useful exact proof');
-  const spoofed = await diagnosticsFor(spoofWorkspace, 'spoofed.pj');
-  assert.ok(!spoofed.some((diagnostic: any) => diagnostic.code === 'pj/par-deadlock'), 'a workspace std/io.pj lookalike remains an opaque call boundary');
+  const trusted = await analysisFor(trustedWorkspace, 'trusted.pj');
+  assert.ok(trusted.diagnostics.some((diagnostic: any) => diagnostic.code === 'pj/par-deadlock'), 'the real install declaration retains the useful exact proof');
+  assert.doesNotMatch(trusted.effectTitle, /partial/, 'trusted std output does not make procedure effects opaque');
+  const spoofed = await analysisFor(spoofWorkspace, 'spoofed.pj');
+  assert.ok(!spoofed.diagnostics.some((diagnostic: any) => diagnostic.code === 'pj/par-deadlock'), 'a workspace std/io.pj lookalike remains an opaque call boundary');
+  assert.match(spoofed.effectTitle, /partial/, 'a workspace lookalike remains opaque to effect analysis too');
 });

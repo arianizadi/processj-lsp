@@ -15,6 +15,8 @@ test('two branches operating a shared channel end inline are warned: the compile
   assert.match(writers[0][1], /'c\.write' .*without the runtime's write lock/);
   assert.match(writers[0][1], /shared chan<int>\.write/);
   assert.match(writers[1][1], /'c\.read' .*without the runtime's read lock/);
+  assert.match(writers[1][1], /Keep all reads in one sequential process/);
+  assert.doesNotMatch(writers[1][1], /Pass 'c\.read' to a procedure/);
 });
 
 test('a replicated par for body with an inline shared operation is warned', () => {

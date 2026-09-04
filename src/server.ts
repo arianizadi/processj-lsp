@@ -596,7 +596,9 @@ function analyzeProgram(program: A.Program, ownPath: string | undefined, text?: 
   });
   const yieldCalls = new Map(reachable.calls);
   for (const [invocation, selected] of checked.calls) yieldCalls.set(invocation, selected);
-  const effects = analyzeProcedureEffects([{ program, checked, file: ownPath }, ...reachable.units.slice(1)]);
+  const effects = analyzeProcedureEffects([{ program, checked, file: ownPath }, ...reachable.units.slice(1)], {
+    trustedNonBlockingExternalDeclarations: trustedNonBlockingNativeDeclarations,
+  });
   const protocols = analyzeProtocols(program, index, checked, { file: ownPath, sourceText: text, tokens });
   return { checked, yieldCalls, yieldCallProvider, index, effects, protocols, importDiags, deps: new Set(reachable.dependencies) };
 }
@@ -1134,16 +1136,16 @@ connection.onExecuteCommand(async (params: ExecuteCommandParams) => {
     const parsed = parsedFor(doc);
     const analysis = checkFor(doc);
     const graph = buildConcurrencyGraph(parsed.program, analysis.checked, analysis.index, { uri: doc.uri, effects: analysis.effects.summaries });
-    return showReport(reportName('concurrency.md'), formatConcurrencyMarkdown(fileName, graph));
+    return showReport(reportName('concurrency.pjreport'), formatConcurrencyMarkdown(fileName, graph));
   }
   if (params.command === COMMAND_SHOW_EFFECTS) {
     const name = typeof params.arguments?.[1] === 'string' ? params.arguments[1] : undefined;
     const line = typeof params.arguments?.[2] === 'number' ? params.arguments[2] : undefined;
-    return showReport(reportName('effects.md'), formatEffectMarkdown(fileName, checkFor(doc).effects, name, line));
+    return showReport(reportName('effects.pjreport'), formatEffectMarkdown(fileName, checkFor(doc).effects, name, line));
   }
   if (params.command === COMMAND_SHOW_PROTOCOLS) {
     const selectedId = typeof params.arguments?.[1] === 'string' ? params.arguments[1] : undefined;
-    return showReport(reportName('protocols.md'), formatProtocolMarkdown(fileName, checkFor(doc).protocols, selectedId));
+    return showReport(reportName('protocols.pjreport'), formatProtocolMarkdown(fileName, checkFor(doc).protocols, selectedId));
   }
   // Every report command returned above and the `known` guard rejected anything
   // else, so only Run and Build reach the compiler from here.

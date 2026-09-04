@@ -35,6 +35,11 @@ export interface EffectUnit {
   file?: string;
 }
 
+export interface EffectAnalysisOptions {
+  /** Native declarations whose implementation is known to be non-blocking and effect-free. */
+  trustedNonBlockingExternalDeclarations?: ReadonlySet<A.ProcDecl>;
+}
+
 /**
  * Summary facts for one procedure. Channel parameter sets contain zero-based
  * formal parameter indices; local-channel traffic is represented by the boolean
@@ -117,7 +122,7 @@ const CONFIDENCE_RANK: Record<EffectConfidence, number> = {
 };
 
 /** Analyze one or more already-checked programs as a single call graph. */
-export function analyzeProcedureEffects(units: readonly EffectUnit[]): EffectAnalysis {
+export function analyzeProcedureEffects(units: readonly EffectUnit[], options: EffectAnalysisOptions = {}): EffectAnalysis {
   const summaries = new Map<A.ProcDecl, MutableSummary>();
   const owners = new Map<A.ProcDecl, EffectUnit>();
   const variablesByUnit = new Map(units.map((unit) => [unit, new Map(unit.checked.vars.map((variable) => [variable.decl, variable]))]));
@@ -144,7 +149,7 @@ export function analyzeProcedureEffects(units: readonly EffectUnit[]): EffectAna
   // classified as internal/external independently of unit order.
   for (const summary of summaries.values()) {
     const unit = owners.get(summary.decl)!;
-    collectDirect(summary, unit.checked, summaries, variablesByUnit.get(unit)!);
+    collectDirect(summary, unit.checked, summaries, variablesByUnit.get(unit)!, options);
     summary.transitive = cloneFacts(summary.direct);
   }
 
@@ -219,6 +224,7 @@ function collectDirect(
   checked: CheckResult,
   all: ReadonlyMap<A.ProcDecl, MutableSummary>,
   variablesByDecl: ReadonlyMap<A.Ident, CheckResult['vars'][number]>,
+  options: EffectAnalysisOptions,
 ): void {
   const { decl, direct, sites, calls } = summary;
   const aliases = new Map<CheckResult['vars'][number], ArgumentOrigin>();
@@ -334,7 +340,7 @@ function collectDirect(
         arguments: arguments_,
       });
     }
-    if (!internal) {
+    if (!internal && !options.trustedNonBlockingExternalDeclarations?.has(target)) {
       markUnknown(direct, sites, expr.span, 'unknown');
       direct.blocking = true;
       if (target.modifiers.includes('mobile')) direct.mobile = true;

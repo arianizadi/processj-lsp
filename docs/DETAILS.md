@@ -338,7 +338,10 @@ With AstroNvim the usual mappings apply: `K` hover, `gd` definition, `gr`
 references, `<Leader>lf` format, `<Leader>la` code action (quick fixes),
 `<Leader>lr` rename, `<Leader>ll` run a code lens (▶ Run, Build). The
 `:ProcessJGraph`, `:ProcessJEffects` and `:ProcessJProtocols` commands open the
-complete analysis reports without locating a lens first. `editor/nvim/lua/plugins/processj.lua` is a ready-made copy of the spec.
+complete analysis reports without locating a lens first. Reports use the dedicated
+`processjreport` filetype: they retain lightweight Markdown highlighting without
+activating editor Markdown Tree-sitter integrations. `editor/nvim/lua/plugins/processj.lua`
+is a ready-made copy of the spec.
 
 ### 3. Neovim without a plugin manager
 

@@ -373,6 +373,24 @@ test('unresolved and unavailable calls remain conservative instead of claiming p
   assert.equal(external.transitive.blocking, true);
 });
 
+test('explicitly trusted native output calls remain exact and non-blocking', () => {
+  const { units, declarations } = checkedUnits([
+    { source: 'native void println(int value);', file: 'io.pj' },
+    { source: 'void main() { println(5); }', file: 'main.pj' },
+  ]);
+  const println = declarations.get('println')!;
+  const main = declarations.get('main')!;
+  const effects = analyzeProcedureEffects([units[1]], {
+    trustedNonBlockingExternalDeclarations: new Set([println]),
+  }).get(main)!;
+
+  assert.equal(effects.calls[0].resolution, 'external');
+  assert.equal(effects.calls[0].target, println);
+  assert.equal(effects.direct.unknown, false);
+  assert.equal(effects.direct.blocking, false);
+  assert.equal(effects.direct.confidence, 'exact');
+});
+
 test('par, alt and barrier enrollment are surfaced as composable direct facts', () => {
   const source = [
     'void orchestrate(chan<int>.read input, barrier gate) {',
