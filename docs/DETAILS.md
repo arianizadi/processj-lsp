@@ -233,6 +233,8 @@ and the exact selected procedure overload rather than text-matching equal names;
 ambiguous fields, cases, recovery-only symbols, and qualified-name cases fail
 closed instead of risking an unrelated rename. Fuzzy workspace-symbol search,
 document outline, and folding complete the navigation surface.
+Local and parameter renames reject duplicate declarations and changes that would
+make either renamed references or existing references bind to another variable.
 
 **Examples.** `examples/` holds one short program per diagnostic (and two clean
 ones); each announces the codes it produces on its first line and
@@ -284,6 +286,9 @@ changes; there is no polling or duplicate client-side watcher. A changed file
 re-checks only open documents whose direct or analyzed transitive imports include
 it. For a simpler LSP client without
 watcher support, a lookup may refresh the workspace at most once every 5 seconds;
+changed files invalidate dependent analysis and compiler diagnostics, including
+when the importing buffer has not been edited. Added or removed files also
+refresh unresolved and wildcard imports. Unchanged polls do not schedule checks;
 the fallback walk is depth/file bounded and never treats a home directory or
 filesystem root as a project.
 

@@ -83,7 +83,7 @@ import { findInstall, type Install } from './config';
 import { parseCompilerOutput, type RawDiagnostic } from './diagnostics';
 import { KEYWORD_DOCS, KEYWORDS, LITERALS, PRIMITIVE_TYPES } from './keywords';
 import { indexLibrary, type LibrarySymbol } from './library';
-import { containsPosition, namedTypeSpans, variableAt, variableSpans, visibleVariables } from './navigation';
+import { containsPosition, localRenameConflict, namedTypeSpans, variableAt, variableSpans, visibleVariables } from './navigation';
 import { build, formatReport, run } from './pipeline';
 import { buildConcurrencyGraph, formatConcurrencyMarkdown, type ConcurrencyGraph } from './concurrency';
 import { channelInlays } from './inlays';
@@ -104,7 +104,10 @@ const SERVER_VERSION = packageVersion();
 
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
-const workspace = new WorkspaceIndex();
+const workspace = new WorkspaceIndex((changed, structureChanged) => {
+  if (structureChanged) republishAll(true);
+  else for (const file of changed) republishDependents(file, undefined, true);
+});
 
 let settings: Settings = { ...DEFAULT_SETTINGS };
 let clientWatchesFiles = false;
@@ -504,6 +507,7 @@ function protocolIssueDiagnostic(doc: TextDocument, issue: ProtocolIssue): LintD
 
 /** Type-check a document against its own declarations, its imports and the standard library. */
 function checkFor(doc: TextDocument): Analysis {
+  workspace.refresh();
   const cached = checkCache.get(doc.uri);
   if (cached && cached.version === doc.version) return cached;
   const parsed = parsedFor(doc);
@@ -2168,6 +2172,10 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
   if (prepared.hits.some((hit) => hit.symbol.kind === 'field' || hit.symbol.kind === 'case' || hit.symbol.detail.startsWith('extern '))) return null;
   if (prepared.hits.some((hit) => hit.symbol.kind === 'proc' && !hit.procedure)) return null;
   if (new Set(prepared.hits.map((hit) => hit.uri)).size > 1) return null;
+  const variable = prepared.hits[0].variable;
+  if (variable && localRenameConflict(parsedFor(doc).program, checkFor(doc).checked, variable, params.newName)) {
+    throw new ResponseError(ErrorCodes.InvalidParams, `Cannot rename '${variable.name}' to '${params.newName}': it would conflict with another declaration or change a reference's binding`);
+  }
   const refs = referencesOf(doc, params.position);
   if (!refs) return null;
   const changes: Record<string, TextEdit[]> = {};

@@ -42,6 +42,36 @@ export function variableSpans(checked: CheckResult, variable: VarInfo, includeDe
   return spans;
 }
 
+/** Refuse both capture of renamed uses and capture of existing uses of the new name. */
+export function localRenameConflict(program: A.Program, checked: CheckResult, variable: VarInfo, newName: string): boolean {
+  if (variable.name === newName) return false;
+  const scopes = declarationScopes(program);
+  const scope = scopes.get(variable.decl);
+  if (!scope) return true;
+  const position = (span: A.Span): SourcePosition => ({ line: span.start.line, character: span.start.col });
+  for (const other of checked.vars) {
+    if (other === variable || other.name !== newName) continue;
+    // Duplicate declarations are unsafe even when neither variable is used.
+    if (scopes.get(other.decl) === scope) return true;
+  }
+  for (const [expr, resolved] of checked.resolutions) {
+    if (resolved !== variable) continue;
+    const other = visibleVariables(program, checked, position(expr.span)).find((v) => v.name === newName);
+    if (other && other.depth >= variable.depth) return true;
+  }
+  for (const [expr] of checked.types) {
+    if (expr.kind !== 'NameExpr' || expr.qualifier?.length || expr.name.name !== newName) continue;
+    const resolved = checked.resolutions.get(expr);
+    if (resolved && resolved.depth > variable.depth) continue;
+    // Includes top-level constants and unresolved names, whose meaning must
+    // not silently become this local variable after the rename.
+    // Test the declaration's region directly: its old name might currently
+    // be shadowed, but changing that name can expose it in the nested scope.
+    if (containsPosition(scope, position(expr.span)) && (variable.isParam || beforeOrEqual(variable.decl.span.end, expr.span.start))) return true;
+  }
+  return false;
+}
+
 /**
  * Every syntactic use of a named record/protocol type. This deliberately does
  * not collect arbitrary identifiers: field names, protocol case tags, labels,

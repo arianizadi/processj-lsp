@@ -655,3 +655,14 @@ test('an unknown lower-case type gets a primitive suggestion from the checker, n
   assert.match(d?.message ?? '', /Unknown type 'itn'; did you mean 'int'\?/);
   assert.equal(d?.fix?.text, 'int');
 });
+
+test('array access requires the compiler-supported int index type', () => {
+  for (const type of ['byte', 'short', 'char', 'long', 'float', 'double', 'boolean']) {
+    const result = run(`public int get(int[] values, ${type} index) { return values[index]; }`);
+    assert.ok(result.errors.some((d) => d.code === 'pj/type/index' && d.message.includes(`not ${type}`)), type);
+  }
+  for (const index of ['index', '(int) wide', 'small + 0']) {
+    const result = run(`public int get(int[] values, int index, long wide, short small) { return values[${index}]; }`);
+    assert.deepEqual(result.errors, [], index);
+  }
+});

@@ -1488,7 +1488,9 @@ class Checker {
       case 'ArrayAccess': {
         const t = this.expr(e.target);
         const i = this.expr(e.index);
-        if (!isLenient(i) && !isIntegral(i)) this.error(e.index.span, 'pj/type/index', `Array index must be an integer, not ${typeStr(i)}`);
+        // ProcessJ's ArrayAccessExpr requires exactly int (isIntegerType),
+        // unlike array dimensions and arithmetic, which accept integral types.
+        if (!isLenient(i) && !isPrim(i, 'int')) this.error(e.index.span, 'pj/type/index', `Array index must have type int, not ${typeStr(i)}${isNumeric(i) ? '; cast the index to int explicitly' : ''}`);
         if (isLenient(t)) return T.unknown;
         if (t.k !== 'array') return this.error(e.target.span, 'pj/type/index', `${exprText(e.target)} is ${typeStr(t)}, not an array`);
         return t.dims > 1 ? { k: 'array', elem: t.elem, dims: t.dims - 1 } : t.elem;

@@ -28,6 +28,9 @@ export function exec(cmd: string, args: string[], opts: ExecOptions): Promise<Ex
   const timeoutMs = opts.timeoutMs ?? 20_000;
   const maxOutput = opts.maxOutput ?? 2_000_000;
   const started = Date.now();
+  // A queued check may have been invalidated before it starts. In particular,
+  // never attempt to kill a child whose spawn has not succeeded yet.
+  if (opts.signal?.aborted) return Promise.resolve({ stdout: '', stderr: '', exitCode: null, timedOut: false, aborted: true, durationMs: 0 });
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
@@ -45,11 +48,11 @@ export function exec(cmd: string, args: string[], opts: ExecOptions): Promise<Ex
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL');
+      if (child.pid) child.kill('SIGKILL');
     }, timeoutMs);
     const onAbort = () => {
       aborted = true;
-      child.kill('SIGKILL');
+      if (child.pid) child.kill('SIGKILL');
     };
     if (opts.signal?.aborted) onAbort();
     opts.signal?.addEventListener('abort', onAbort, { once: true });

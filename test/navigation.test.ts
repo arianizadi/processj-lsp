@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { check } from '../src/checker/checker';
 import { DeclIndex } from '../src/checker/index';
-import { namedTypeSpans, variableAt, variableSpans, visibleVariables } from '../src/navigation';
+import { localRenameConflict, namedTypeSpans, variableAt, variableSpans, visibleVariables } from '../src/navigation';
 import { parse } from '../src/parser/parser';
 
 function checked(source: string) {
@@ -59,4 +59,26 @@ public void work(string second) {
 test('qualified type names are not treated as exact short-name references', () => {
   const program = parse('record Thing { int value; }\npublic pkg::Thing[] copy(pkg::Thing[] values) { Thing local; return values; }\n').program;
   assert.deepEqual(namedTypeSpans(program, 'Thing').map((span) => [span.start.line, span.start.col]), [[1, 48]]);
+});
+
+test('local rename refuses capture in either direction and duplicate declarations', () => {
+  const cases: Array<[string, string, boolean]> = [
+    ['int value = 1; { int renamed = 2; return value; }', 'value', true],
+    ['int renamed = 1; { int value = 2; return renamed + value; }', 'value', true],
+    ['int value = 1; int renamed = 2; return 0;', 'value', true],
+    ['int renamed = 1; { int value = 2; return value; }', 'value', false],
+    ['{ int renamed = 1; } int value = 2; return value;', 'value', false],
+    ['int value = 1; { int renamed = 2; } return value;', 'value', false],
+    ['int value = 1; return value;', 'value', false],
+  ];
+  for (const [body, name, conflict] of cases) {
+    const { parsed, result } = checked(`public int demo() { ${body} }`);
+    const variable = result.vars.find((v) => v.name === name)!;
+    assert.equal(localRenameConflict(parsed.program, result, variable, 'renamed'), conflict, body);
+    assert.equal(localRenameConflict(parsed.program, result, variable, name), false, 'same-name rename is harmless');
+  }
+  const { parsed, result } = checked('const int renamed = 1; public int demo() { int value = 2; return renamed + value; }');
+  assert.equal(localRenameConflict(parsed.program, result, result.vars.find((v) => v.name === 'value')!, 'renamed'), true, 'renaming must not capture a constant reference');
+  const shadowed = checked('const int renamed = 1; public int demo() { int value = 2; { int value = 3; return renamed + value; } }');
+  assert.equal(localRenameConflict(shadowed.parsed.program, shadowed.result, shadowed.result.vars.find((v) => v.name === 'value')!, 'renamed'), true, 'changing a shadowed outer name can capture a constant in the inner scope');
 });

@@ -1008,3 +1008,39 @@ test('only install-loaded std output declarations are transparent to exact rende
   assert.ok(!spoofed.diagnostics.some((diagnostic: any) => diagnostic.code === 'pj/par-deadlock'), 'a workspace std/io.pj lookalike remains an opaque call boundary');
   assert.match(spoofed.effectTitle, /partial/, 'a workspace lookalike remains opaque to effect analysis too');
 });
+
+test('server refuses a local rename that would capture a reference', async (t) => {
+  const client = new LspClient(path.join(__dirname, '..', 'src', 'server.js'));
+  t.after(() => client.child.kill('SIGKILL'));
+  await client.request('initialize', { processId: process.pid, capabilities: {}, initializationOptions: { javaBin: '/missing-pj-test-java' } });
+  client.notify('initialized', {});
+  const uri = 'untitled:rename.pj';
+  const text = 'public int demo() {\n int value = 1;\n { int renamed = 2; return value; }\n}';
+  client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text } });
+  const response = await client.request('textDocument/rename', { textDocument: { uri }, position: { line: 1, character: 7 }, newName: 'renamed' });
+  assert.equal(response.result, undefined);
+  assert.match(response.error?.message ?? '', /change a reference's binding/);
+});
+
+test('polling invalidates an unchanged importer after a closed dependency changes', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-lsp-poll-'));
+  const client = new LspClient(path.join(__dirname, '..', 'src', 'server.js'));
+  t.after(() => { client.child.kill('SIGKILL'); fs.rmSync(root, { recursive: true, force: true }); });
+  const library = path.join(root, 'lib.pj');
+  fs.writeFileSync(library, 'public int helper() { return 1; }');
+  await client.request('initialize', { processId: process.pid, rootUri: pathToFileURL(root).toString(), capabilities: {}, initializationOptions: { javaBin: '/missing-pj-test-java' } });
+  client.notify('initialized', {});
+  const uri = pathToFileURL(path.join(root, 'main.pj')).toString();
+  const text = 'import lib;\npublic int demo() { return helper(); }';
+  client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text } });
+  const params = { textDocument: { uri }, position: { line: 1, character: 29 } };
+  assert.match((await client.request('textDocument/hover', params)).result.contents.value, /int helper/);
+  fs.writeFileSync(library, 'public string helper() { return "changed"; }');
+  await new Promise((resolve) => setTimeout(resolve, 5100));
+  // The workspace-symbol path can refresh first; importer invalidation must
+  // still happen when the subsequent hover hits its document-version cache.
+  await client.request('workspace/symbol', { query: 'helper' });
+  assert.match((await client.request('textDocument/hover', params)).result.contents.value, /string helper/);
+  const diagnostics = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params.uri === uri && message.params.diagnostics.some((d: any) => d.code === 'pj/type/return'));
+  assert.equal(diagnostics.params.version, 1, 'the importer was never edited');
+});

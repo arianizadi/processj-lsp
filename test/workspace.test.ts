@@ -112,3 +112,34 @@ test('workspace completion is prefix-filtered, bounded, and never spends its bud
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('polling reports changed dependencies, additions and deletions once per refresh', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-workspace-poll-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  let now = 1000;
+  t.mock.method(Date, 'now', () => now);
+  const events: Array<{ files: string[]; structure: boolean }> = [];
+  const workspace = new WorkspaceIndex((changed, structure) => events.push({ files: [...changed], structure }));
+  workspace.setRoots([root]);
+  const file = path.join(root, 'lib.pj');
+  fs.writeFileSync(file, 'public int helper() { return 1; }');
+  workspace.refresh();
+  assert.deepEqual(events, [], 'initial discovery establishes the baseline');
+  fs.writeFileSync(file, 'public string helper() { return "changed"; }');
+  workspace.refresh();
+  assert.deepEqual(events, [], 'polls are throttled');
+  now += WorkspaceIndex.POLL_INTERVAL_MS;
+  workspace.refresh();
+  assert.deepEqual(events.splice(0), [{ files: [file], structure: false }]);
+  now += WorkspaceIndex.POLL_INTERVAL_MS;
+  workspace.refresh();
+  assert.deepEqual(events, [], 'unchanged files do not trigger analysis or compiler work');
+  fs.unlinkSync(file);
+  now += WorkspaceIndex.POLL_INTERVAL_MS;
+  workspace.refresh();
+  assert.deepEqual(events.splice(0), [{ files: [file], structure: true }]);
+  fs.writeFileSync(file, 'public void created() { }');
+  now += WorkspaceIndex.POLL_INTERVAL_MS;
+  workspace.refresh();
+  assert.deepEqual(events.splice(0), [{ files: [file], structure: true }]);
+});

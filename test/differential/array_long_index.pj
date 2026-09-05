@@ -1,0 +1,5 @@
+// outcome: error
+// ProcessJ TypeChecker.visitArrayAccessExpr requires int, not long.
+public int get(int[] values, long index) {
+    return values[index];
+}

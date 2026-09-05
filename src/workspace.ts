@@ -44,6 +44,8 @@ export interface WorkspaceCompletion {
 }
 
 export class WorkspaceIndex {
+  constructor(private readonly onRefresh?: (changed: ReadonlySet<string>, structureChanged: boolean) => void) {}
+
   private readonly cache = new Map<string, Entry>();
   /** Exact-name index, then file, so definition/hover do not scan every symbol. */
   private readonly symbolsByName = new Map<string, Map<string, PJSymbol[]>>();
@@ -219,13 +221,31 @@ export class WorkspaceIndex {
     }
   }
 
-  private refresh(): void {
+  /** Poll before using dependent analysis, as well as before symbol lookups. */
+  refresh(): void {
     const now = Date.now();
     if (this.lastRefresh > 0 && (this.watched || now - this.lastRefresh < WorkspaceIndex.POLL_INTERVAL_MS)) return;
+    const initialized = this.lastRefresh > 0;
     this.lastRefresh = now;
+    const previous = new Map(this.cache);
     const seen = new Set<string>();
     for (const root of this.roots) this.walk(root, 0, seen);
     for (const file of [...this.cache.keys()]) if (!seen.has(file)) this.deleteEntry(file);
+    const changed = new Set<string>();
+    let structureChanged = false;
+    for (const [file, entry] of this.cache) {
+      if (previous.get(file) !== entry) changed.add(file);
+      if (!previous.has(file)) structureChanged = true;
+    }
+    for (const file of previous.keys()) {
+      if (!this.cache.has(file)) {
+        changed.add(file);
+        structureChanged = true;
+      }
+    }
+    // Initial discovery establishes the baseline; there is no old analysis
+    // to invalidate, and aborting the check that requested it wastes work.
+    if (initialized && changed.size) this.onRefresh?.(changed, structureChanged);
   }
 
   private walk(dir: string, depth: number, seen: Set<string>): void {
