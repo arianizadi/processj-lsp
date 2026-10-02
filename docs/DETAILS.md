@@ -317,8 +317,9 @@ for deleted files.
 
 ### 1. Prerequisites
 
-- **Neovim 0.11 or newer** (uses the built-in `vim.lsp.config`).
 - **Node.js 20 or newer** with `npm` on PATH (`brew install node`, `apt install nodejs npm`, or nvm).
+- **An editor**: Neovim 0.11+ (built-in `vim.lsp.config`), VS Code with the `code` command on PATH,
+  or Emacs 29+ (built-in eglot; lsp-mode works too).
 - **A JDK** on PATH or in `JAVA_HOME`; the compiler was built with JDK 11.
 - **A ProcessJ install** for compiler diagnostics and the Run code lens: a
   checkout with a built `bin/` directory and `resources/jars`. Tell the server
@@ -327,9 +328,44 @@ for deleted files.
   `init_options.installDir`. Without one, everything except compiler
   diagnostics and Run still works.
 
-### 2. Neovim with lazy.nvim (AstroNvim, LazyVim, kickstart, ...)
+### 2. One command per editor
 
-Add one plugin spec, for example in `~/.config/nvim/lua/plugins/processj.lua`:
+```sh
+git clone https://github.com/arianizadi/processj-lsp
+cd processj-lsp
+npm run setup -- nvim vscode emacs   # or any subset; no argument means every editor found
+npm run remove -- nvim vscode emacs  # uninstall
+```
+
+`scripts/editors.js` builds the server if `dist/` is missing or older than `src/`,
+then points each editor at this checkout, so `git pull && npm run setup` updates
+everything. Add `--dry-run` to see what it would change. What it does per editor:
+
+- **Neovim with lazy.nvim** (AstroNvim, LazyVim, kickstart with a `lua/plugins`
+  directory): writes `lua/plugins/processj.lua` with `dir = "<checkout>"`. The
+  plugin registers the `processj` filetype for `*.pj`, bundled syntax
+  highlighting and indentation, and the language server. `:checkhealth
+  processj-lsp` checks the Node version, server build, optional ProcessJ/JDK
+  setup, and whether `processj_ls` attached. Uninstall deletes the spec file.
+- **Plain Neovim**: links the checkout into `pack/processj/start/`, a native
+  package, and `plugin/processj-lsp.lua` sets everything up at startup.
+  Uninstall removes the link.
+- **VS Code**: builds the bundled extension (`vscode/`), packages it as a VSIX
+  and runs `code --install-extension ... --force`. Uninstall runs
+  `code --uninstall-extension arianizadi.processj-lsp-vscode`.
+- **Emacs**: appends a marked block to your init file (`~/.emacs.d/init.el`,
+  `~/.emacs`, or `$XDG_CONFIG_HOME/emacs/init.el`, whichever exists) that loads
+  `editor/emacs/processj-mode.el`: a major mode with comments, strings, keyword
+  highlighting and a brace indenter, `.pj` in `auto-mode-alist`, and the server
+  registered with eglot (`eglot-ensure` on open) or lsp-mode. Customise
+  `processj-lsp-client` (`auto`, `eglot`, `lsp-mode`, `nil`) and
+  `processj-lsp-server-command`. Uninstall removes the block.
+
+### 3. Doing it by hand
+
+The lazy.nvim spec the installer writes is equivalent to
+`editor/nvim/lua/plugins/processj.lua`, which clones and builds from GitHub
+instead; `opts` is merged into the server configuration:
 
 ```lua
 return {
@@ -337,28 +373,17 @@ return {
     "arianizadi/processj-lsp",
     build = "npm ci && npm run build",
     ft = "processj",
-    opts = {},
+    opts = { init_options = { installDir = "~/Documents/ProcessJ", checkOnChange = true } },
   },
 }
 ```
 
-Restart Neovim (or run `:Lazy sync`). lazy.nvim clones the repository, runs the
-build, and the plugin registers the `processj` filetype for `*.pj`, bundled
-syntax highlighting and indentation, and the language server from its own
-checkout. Open any `.pj` file; `:checkhealth processj-lsp` checks the Node version,
-server build, optional ProcessJ/JDK setup, and whether `processj_ls` attached. If
-it says the server is not built, run `:Lazy build processj-lsp`.
-
-`opts` is merged into the server configuration. Useful keys:
-
-```lua
-opts = {
-  init_options = {
-    installDir = "~/Documents/ProcessJ", -- instead of ~/processjrc
-    checkOnChange = true,                -- also run the real compiler on every edit
-  },
-}
-```
+Plain Neovim: see `editor/nvim/plain.lua` (`runtimepath` plus
+`require("processj-lsp").setup {}`). VS Code: `cd vscode && npm run
+install-extension`. Emacs: `(load "/path/to/processj-lsp/editor/emacs/processj-mode.el")`.
+Any other editor: run `node <checkout>/bin/processj-lsp.js --stdio` for files of
+language id `processj` (extension `.pj`) and pass the options below as
+`initializationOptions`.
 
 With AstroNvim the usual mappings apply: `K` hover, `gd` definition, `gr`
 references, `<Leader>lf` format, `<Leader>la` code action (quick fixes),
@@ -366,49 +391,17 @@ references, `<Leader>lf` format, `<Leader>la` code action (quick fixes),
 `:ProcessJGraph`, `:ProcessJEffects` and `:ProcessJProtocols` commands open the
 complete analysis reports without locating a lens first. Reports use the dedicated
 `processjreport` filetype: they retain lightweight Markdown highlighting without
-activating editor Markdown Tree-sitter integrations. `editor/nvim/lua/plugins/processj.lua`
-is a ready-made copy of the spec.
+activating editor Markdown Tree-sitter integrations.
 
-### 3. Neovim without a plugin manager
-
-```sh
-git clone https://github.com/arianizadi/processj-lsp ~/.local/share/processj-lsp
-cd ~/.local/share/processj-lsp && npm ci && npm run build
-```
-
-Then in `init.lua`:
-
-```lua
-vim.opt.runtimepath:append(vim.fn.expand "~/.local/share/processj-lsp")
-require("processj-lsp").setup {}
-```
-
-### 4. VS Code
-
-Build and install the bundled extension from the repository:
-
-```sh
-cd vscode
-npm run install-extension
-```
-
-The play button in the editor title and the code lens above `main` run the current file. Run, Build,
+In VS Code the play button in the editor title and the code lens above `main` run the current file. Run, Build,
 Restart Language Server, and Show Language Server Output are also available under **ProcessJ** in the
 Command Palette. The language-status menu reports Starting, Ready, or Stopped and opens the server log.
 All ProcessJ settings apply automatically; use `processj.trace.server = verbose` when protocol-level logs
 are needed. An untitled editor also gets language features after changing its language mode to ProcessJ.
 
-### 5. Other editors
-
-The server speaks standard LSP over stdio: launch
-`node <checkout>/bin/processj-lsp.js --stdio` for files of language id
-`processj` (extension `.pj`). Pass the options below as `initializationOptions`.
-
-### 6. Developing
+### 4. Developing
 
 ```sh
-git clone https://github.com/arianizadi/processj-lsp
-cd processj-lsp
 npm install
 npm run build
 npm test          # parser corpus, formatter, checker, semantic tokens, imports, examples, perf budgets
@@ -499,8 +492,10 @@ examples/           one program per diagnostic, self-describing and tested
 scripts/smoke.js    talks LSP over stdio to a real server, ends with a real program run
 scripts/bench.js    complete in-memory analysis timings on generated large files
 scripts/validate.js builds and runs every program, comparing the checker's verdict against reality
-lua/, plugin/, ftdetect/, syntax/, ftplugin/   the Neovim plugin (install the repo with lazy.nvim)
+scripts/editors.js  `npm run setup` / `npm run remove`: install or uninstall the Neovim, VS Code and Emacs integrations
+lua/, plugin/, ftdetect/, syntax/, ftplugin/   the Neovim plugin
 editor/nvim/        ready-made lazy.nvim/AstroNvim spec and a plugin-manager-free config
+editor/emacs/       processj-mode.el: major mode plus eglot/lsp-mode wiring
 vscode/             VS Code extension: `npm run install-extension` builds the server, bundles it, packages and installs
 ```
 
