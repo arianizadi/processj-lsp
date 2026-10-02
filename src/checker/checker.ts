@@ -129,7 +129,8 @@ interface BranchUse {
   id: number;
   reads: Map<VarInfo, A.Span>;
   writes: Map<VarInfo, A.Span>;
-  ends: Map<string, { v: VarInfo; span: A.Span }>; // "name.read" / "name.write"
+  /** First use of each channel end per variable identity, so a shadowed `c` never collides with an outer `c`. */
+  ends: Map<VarInfo, { read?: A.Span; write?: A.Span }>;
   bare: Set<VarInfo>;
   depth: number;
   /** A `par for` body: one branch in the source, many processes at runtime. */
@@ -192,6 +193,10 @@ class Checker {
   private switchDepth = 0;
   /** Protocol variable -> case tag known to hold in the current region. */
   private activeCase = new Map<VarInfo, string>();
+  /** The statement of the innermost enclosing block or switch group that is currently being checked. */
+  private blockChild: A.Stmt | undefined;
+  /** `blockChild` is a direct statement of a `par` body, i.e. a whole process of its own. */
+  private blockChildIsBranch = false;
   private branchStack: BranchUse[] = [];
   private chanUses = new Map<VarInfo, ChanUse>();
   /** Channel-end uses of the current procedure, for the runtime-lock rules. */
@@ -444,19 +449,31 @@ class Checker {
     // been resolved. Never reuse that partially memoised analysis for a
     // file-level result after the walk: unresolved calls deliberately fail
     // closed as yielding, and that answer would otherwise become order-sensitive.
-    const resolvedYields = new YieldAnalysis(this.index, this.calls, this.opts.yieldCalls, this.opts.yieldCallProvider);
+    // Reading a timer samples the clock without suspending (effects and the
+    // concurrency model agree), so a loop doing only that still starves everyone.
+    const starvingYields = new YieldAnalysis(this.index, this.calls, this.opts.yieldCalls, this.opts.yieldCallProvider, {
+      nonYieldingRead: (read) => {
+        const target = this.types.get(read.target);
+        return !!target && isPrim(target, 'timer');
+      },
+    });
     for (const pending of this.pendingStarvingLoops) {
-      if (resolvedYields.stmtYields(pending.body, 'calls')) continue;
+      if (starvingYields.stmtYields(pending.body, 'calls')) continue;
       const head: A.Span = { start: pending.loopSpan.start, end: { line: pending.loopSpan.start.line, col: pending.loopSpan.start.col + pending.keyword.length } };
       this.warn(head, 'pj/starving-loop', 'This loop never ends and never communicates, so no other process ever runs again (the scheduler is cooperative). Add a channel operation, timeout or alt.');
     }
+    // An invalid call is not evidence that the procedure suspends: a lenient
+    // argument leaves the call unresolved on purpose, and the conservative
+    // default would turn every value-returning caller into a warning.
+    const resolvedYields = new YieldAnalysis(this.index, this.calls, this.opts.yieldCalls, this.opts.yieldCallProvider, { unresolvedRootCallsYield: false });
     for (const d of p.decls) {
-      if (d.kind !== 'ProcDecl' || !d.body) continue;
+      if (d.kind !== 'ProcDecl' || !d.body || d.name.name === '<missing>') continue;
       const ret = this.index.resolve(d.returnType);
       if (isPrim(ret, 'void') || !resolvedYields.procYields(d)) continue;
       this.report(d.returnType.span, 'warning', 'pj/compiler-limit', `'${d.name.name}' returns ${typeStr(ret)} and can suspend, which this ProcessJ build cannot compile: it puts the 'return' inside the generated process body and turns every call into a process start. Make it 'void' and hand the result back through a channel parameter.`);
     }
     for (const d of new YieldAnalysis(this.index, this.calls, this.opts.yieldCalls, this.opts.yieldCallProvider, { unresolvedRootCallsYield: false }).needingAnnotation(p)) {
+      if (d.name.name === '<missing>') continue; // parser recovery, already reported as a syntax error
       const at = yieldAnnotationEdit(d);
       this.report(d.name.span, 'warning', 'pj/needs-yield-annotation', `'${d.name.name}' suspends only through the procedures it calls, which this ProcessJ build does not notice; mark it [yield=true] so it is compiled as a suspending process`, { kind: 'edit', title: 'Add [yield=true]', line: at.line, col: at.col, endCol: at.endCol, text: at.text });
     }
@@ -464,26 +481,85 @@ class Checker {
 
   /** Does a record or protocol reach itself again through member types (records and protocol cases)? */
   private memberCycle(name: string, kind: 'record' | 'protocol'): boolean {
-    const seen = new Set<string>();
-    const visit = (n: string, k: 'record' | 'protocol', first: boolean): boolean => {
-      const key = `${k}:${n}`;
-      if (!first && key === `${kind}:${name}`) return true;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      const types: Type[] = k === 'record' ? [...this.index.recordFields(n).values()] : [...this.index.protocolCases(n).values()].flatMap((f) => [...f.values()]);
-      for (const t of types) {
-        const inner = t.k === 'array' ? t.elem : t;
-        if (inner.k === 'record' && visit(inner.name, 'record', false)) return true;
-        if (inner.k === 'protocol' && visit(inner.name, 'protocol', false)) return true;
-      }
-      return false;
+    this.memberCycles ??= this.computeMemberCycles();
+    return this.memberCycles.has(`${kind}:${name}`);
+  }
+
+  private memberCycles: Set<string> | undefined;
+
+  /**
+   * One iterative Tarjan pass over the member-type graph of every known record
+   * and protocol: a declaration is cyclic when its component has more than one
+   * node or it refers to itself directly. A per-declaration search would walk
+   * the same chains again for each of them.
+   */
+  private computeMemberCycles(): Set<string> {
+    const edges = new Map<string, string[]>();
+    const memberTypes = (key: string): Type[] => {
+      const [kind, name] = [key.slice(0, key.indexOf(':')), key.slice(key.indexOf(':') + 1)];
+      return kind === 'record' ? [...this.index.recordFields(name).values()] : [...this.index.protocolCases(name).values()].flatMap((fields) => [...fields.values()]);
     };
-    return visit(name, kind, true);
+    for (const name of this.index.records.keys()) edges.set(`record:${name}`, []);
+    for (const name of this.index.protocols.keys()) edges.set(`protocol:${name}`, []);
+    for (const [key, out] of edges) {
+      for (const t of memberTypes(key)) {
+        const inner = t.k === 'array' ? t.elem : t;
+        if (inner.k === 'record' || inner.k === 'protocol') out.push(`${inner.k}:${inner.name}`);
+      }
+    }
+    const cyclic = new Set<string>();
+    const indexOf = new Map<string, number>();
+    const low = new Map<string, number>();
+    const onStack = new Set<string>();
+    const stack: string[] = [];
+    let counter = 0;
+    for (const root of edges.keys()) {
+      if (indexOf.has(root)) continue;
+      const work: Array<{ node: string; next: number }> = [{ node: root, next: 0 }];
+      indexOf.set(root, counter);
+      low.set(root, counter++);
+      stack.push(root);
+      onStack.add(root);
+      while (work.length) {
+        const frame = work[work.length - 1];
+        const out = edges.get(frame.node) ?? [];
+        if (frame.next < out.length) {
+          const target = out[frame.next++];
+          if (!edges.has(target)) continue;
+          if (!indexOf.has(target)) {
+            indexOf.set(target, counter);
+            low.set(target, counter++);
+            stack.push(target);
+            onStack.add(target);
+            work.push({ node: target, next: 0 });
+          } else if (onStack.has(target)) {
+            low.set(frame.node, Math.min(low.get(frame.node)!, indexOf.get(target)!));
+          }
+          continue;
+        }
+        work.pop();
+        const parent = work[work.length - 1];
+        if (parent) low.set(parent.node, Math.min(low.get(parent.node)!, low.get(frame.node)!));
+        if (low.get(frame.node) === indexOf.get(frame.node)) {
+          const component: string[] = [];
+          for (;;) {
+            const node = stack.pop()!;
+            onStack.delete(node);
+            component.push(node);
+            if (node === frame.node) break;
+          }
+          if (component.length > 1 || out.includes(frame.node)) for (const node of component) cyclic.add(node);
+        }
+      }
+    }
+    return cyclic;
   }
 
   private procDecl(d: A.ProcDecl): void {
     this.proc = d;
-    this.procRet = this.resolveType(d.returnType);
+    // A recovered header (`proc main()` parses as a procedure named `<missing>`
+    // returning `main`) already carries a syntax error; do not pile type lints on it.
+    this.procRet = d.name.name === '<missing>' ? this.index.resolve(d.returnType) : this.resolveType(d.returnType);
     this.chanUses = new Map();
     this.endOperations = [];
     this.endOperationBySite = new Map();
@@ -596,7 +672,16 @@ class Checker {
         this.warn(s.span, 'pj/unreachable', 'Unreachable code');
         reported = true;
       }
-      this.withExecutionFacts(reachable, () => this.stmt(s));
+      const outerChild = this.blockChild;
+      const outerInPar = this.blockChildIsBranch;
+      this.blockChild = s;
+      this.blockChildIsBranch = false;
+      try {
+        this.withExecutionFacts(reachable, () => this.stmt(s));
+      } finally {
+        this.blockChild = outerChild;
+        this.blockChildIsBranch = outerInPar;
+      }
       if (reachable && directlyTransfersControl(s)) reachable = false;
     }
   }
@@ -684,13 +769,16 @@ class Checker {
               this.error(span, 'pj/parallel-usage', `Every iteration of this par for writes '${v.name}' at the same time (data race)`);
             }
           }
-          for (const [key, { v, span }] of use.ends) {
-            // Only the side actually held needs sharing: `shared write chan<T>`
-            // leaves its read side with a single-reader slot.
-            const side = key.endsWith('.read') ? 'read' : 'write';
-            if (v.depth <= outerDepth && v.type.k === 'chan' && !sharedSideOf(v.type, side)) {
-              const typeCol = Math.max(0, v.decl.span.start.col - (typeStr(v.type).length + 1));
-              this.error(span, 'pj/shared-channel-end', `Every iteration of this par for holds '${key}'; declare it 'shared chan<${typeStr(v.type.elem)}>'`, { kind: 'make-shared', line: v.decl.span.start.line, col: typeCol, title: `Declare '${v.name}' as shared` });
+          for (const [v, slot] of use.ends) {
+            for (const side of ['read', 'write'] as const) {
+              const span = slot[side];
+              if (!span) continue;
+              // Only the side actually held needs sharing: `shared write chan<T>`
+              // leaves its read side with a single-reader slot.
+              if (v.depth <= outerDepth && v.type.k === 'chan' && !sharedSideOf(v.type, side)) {
+                const typeCol = Math.max(0, v.decl.span.start.col - (typeStr(v.type).length + 1));
+                this.error(span, 'pj/shared-channel-end', `Every iteration of this par for holds '${v.name}.${side}'; declare it 'shared chan<${typeStr(v.type.elem)}>'`, { kind: 'make-shared', line: v.decl.span.start.line, col: typeCol, title: `Declare '${v.name}' as shared` });
+              }
             }
           }
           this.reportUnlockedEnds([use]);
@@ -809,14 +897,25 @@ class Checker {
 
   /** Quick fix for `x.write(... c.read() ...)`: read into a variable on the line above, then write it. */
   private hoistReadFix(write: A.ChanWrite, read: A.ChanRead): FixHint | undefined {
+    // Only when the write is a whole statement directly inside a block: as the
+    // brace-less body of `if (ok) d.write(c.read());` the hoisted declaration
+    // would become the body and the write would run unconditionally.
+    if (this.blockChild?.kind !== 'ExprStmt' || this.blockChild.expr !== write) return undefined;
     const stmtText = this.slice(write.span);
     const readText = this.slice(read.span);
     if (!stmtText || !readText || read.span.start.line !== read.span.end.line || write.span.start.line !== write.span.end.line) return undefined;
     const t = this.types.get(read);
     if (!t || isLenient(t)) return undefined;
-    const name = `read${read.span.start.line + 1}`;
+    let name = `read${read.span.start.line + 1}`;
+    while (this.scope.lookup(name) || this.index.consts.has(name) || this.index.procs.has(name)) name += '_';
     const indent = this.indentOf(write.span.start.line);
     const rewritten = stmtText.replace(readText, name);
+    if (this.blockChildIsBranch) {
+      // Keep the read and the write in one process: wrap both in a block.
+      const line = this.lines?.[write.span.end.line] ?? '';
+      const semicolon = line[write.span.end.col] === ';' ? 1 : 0;
+      return { kind: 'edit', title: `Read into '${name}' first`, line: write.span.start.line, col: write.span.start.col, endCol: write.span.end.col + semicolon, text: `{ ${typeStr(t)} ${name} = ${readText}; ${rewritten}; }` };
+    }
     return { kind: 'edit', title: `Read into '${name}' first`, line: write.span.start.line, col: write.span.start.col, endCol: write.span.end.col, text: `${typeStr(t)} ${name} = ${readText};\n${indent}${rewritten}` };
   }
 
@@ -911,15 +1010,18 @@ class Checker {
         } else {
           const lt = this.expr(l);
           if (!isLenient(t) && !isLenient(lt) && !assignable(t, lt, this.index)) this.error(l.span, 'pj/type/switch', `Case value of type ${typeStr(lt)} does not match the switch expression (${typeStr(t)})`);
-          const key = exprText(l);
-          if (seenLabels.has(key)) this.error(l.span, 'pj/type/switch', `Duplicate case ${key}`);
+          // Dedupe on the label's spelling: exprText falls back to a constant
+          // description for `-1`, `A + 1`, ..., which would make them all collide.
+          const key = (this.slice(l.span) ?? exprText(l)).replace(/\s+/g, '');
+          if (seenLabels.has(key)) this.error(l.span, 'pj/type/switch', `Duplicate case ${this.slice(l.span)?.trim() || exprText(l)}`);
           seenLabels.add(key);
         }
       }
       if (cases && groupTags.length > 1) {
         this.report(g.span, 'warning', 'pj/compiler-limit', `This ProcessJ build rejects multiple protocol labels in one switch group (${groupTags.join(', ')}); give each case its own body and break`);
       }
-      const tag = groupTags.length === 1 ? groupTags[0] : undefined;
+      // `case a: default:` also runs for every other case, so it proves nothing.
+      const tag = groupTags.length === 1 && !g.labels.some((label) => label === undefined) ? groupTags[0] : undefined;
       this.push();
       this.withCase(protoVar && tag ? [protoVar, tag] : undefined, () => this.stmts(g.stmts));
       this.pop();
@@ -1016,8 +1118,19 @@ class Checker {
     this.parDepth++;
     this.push();
     for (const st of s.body.stmts) {
-      const use = this.branch(this.scope.depth, () => this.inProcess(() => this.stmt(st)));
-      branches.push(use);
+      // Each statement is its own branch: a quick fix that splits one into two
+      // statements would create two processes, so it has to wrap them instead.
+      const outerChild = this.blockChild;
+      const outerInPar = this.blockChildIsBranch;
+      this.blockChild = st;
+      this.blockChildIsBranch = true;
+      try {
+        const use = this.branch(this.scope.depth, () => this.inProcess(() => this.stmt(st)));
+        branches.push(use);
+      } finally {
+        this.blockChild = outerChild;
+        this.blockChildIsBranch = outerInPar;
+      }
     }
     this.pop();
     this.parDepth--;
@@ -1038,21 +1151,26 @@ class Checker {
         }
       }
     }
-    const seenEnds = new Map<string, number>();
+    const seenEnds = new Map<VarInfo, { read?: number; write?: number }>();
     for (let x = 0; x < branches.length; x++) {
-      for (const [key, { v, span }] of branches[x].ends) {
-        const first = seenEnds.get(key);
-        if (first === undefined) {
-          seenEnds.set(key, x);
-          continue;
+      for (const [v, slot] of branches[x].ends) {
+        for (const side of ['read', 'write'] as const) {
+          const span = slot[side];
+          if (!span) continue;
+          let seen = seenEnds.get(v);
+          if (!seen) seenEnds.set(v, (seen = {}));
+          const first = seen[side];
+          if (first === undefined) {
+            seen[side] = x;
+            continue;
+          }
+          if (first === x || first === -1) continue;
+          seen[side] = -1;
+          if (v.type.k !== 'chan' || sharedSideOf(v.type, side) || v.depth > branches[x].depth) continue;
+          const declLine = v.decl.span.start.line;
+          const typeCol = Math.max(0, v.decl.span.start.col - (typeStr(v.type).length + 1));
+          this.error(span, 'pj/shared-channel-end', `'${v.name}.${side}' is used by more than one branch of this par; declare it 'shared chan<${typeStr(v.type.elem)}>'`, { kind: 'make-shared', line: declLine, col: typeCol, title: `Declare '${v.name}' as shared` });
         }
-        if (first === x || first === -1) continue;
-        seenEnds.set(key, -1);
-        const side = key.endsWith('.read') ? 'read' : 'write';
-        if (v.type.k !== 'chan' || sharedSideOf(v.type, side) || v.depth > branches[x].depth) continue;
-        const declLine = v.decl.span.start.line;
-        const typeCol = Math.max(0, v.decl.span.start.col - (typeStr(v.type).length + 1));
-        this.error(span, 'pj/shared-channel-end', `'${key}' is used by more than one branch of this par; declare it 'shared chan<${typeStr(v.type.elem)}>'`, { kind: 'make-shared', line: declLine, col: typeCol, title: `Declare '${v.name}' as shared` });
       }
     }
     this.reportUnlockedEnds(branches);
@@ -1289,7 +1407,12 @@ class Checker {
     if (outer) {
       for (const [v, s] of use.reads) if (!outer.reads.has(v)) outer.reads.set(v, s);
       for (const [v, s] of use.writes) if (!outer.writes.has(v)) outer.writes.set(v, s);
-      for (const [k, e] of use.ends) if (!outer.ends.has(k)) outer.ends.set(k, e);
+      for (const [v, slot] of use.ends) {
+        let outerSlot = outer.ends.get(v);
+        if (!outerSlot) outer.ends.set(v, (outerSlot = {}));
+        if (!outerSlot.read && slot.read) outerSlot.read = slot.read;
+        if (!outerSlot.write && slot.write) outerSlot.write = slot.write;
+      }
     }
     return use;
   }
@@ -1310,8 +1433,9 @@ class Checker {
     if (!this.collectExecutionFacts) return;
     const b = this.branchStack[this.branchStack.length - 1];
     if (b) {
-      const key = `${v.name}.${end}`;
-      if (!b.ends.has(key)) b.ends.set(key, { v, span });
+      let slot = b.ends.get(v);
+      if (!slot) b.ends.set(v, (slot = {}));
+      if (!slot[end]) slot[end] = span;
       // A direct operation on a whole-channel variable is never locked. An end
       // handed to a procedure is assumed locked until overload resolution shows
       // the receiving parameter drops `shared`.
@@ -1793,6 +1917,11 @@ class Checker {
 
   private assign(e: A.AssignExpr): Type {
     const lt = this.lvalue(e.target);
+    if (e.target.kind === 'NameExpr') {
+      // A protocol variable proven to hold one case may hold any case after it is reassigned.
+      const reassigned = this.resolutions.get(e.target);
+      if (reassigned) this.activeCase.delete(reassigned);
+    }
     this.noteNull(e.value);
     if (e.target.kind === 'ArrayAccess') {
       // Reading into an index is fine on the right of an assignment; only the

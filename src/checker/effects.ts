@@ -227,6 +227,9 @@ function collectDirect(
   options: EffectAnalysisOptions,
 ): void {
   const { decl, direct, sites, calls } = summary;
+  // A loop body is walked more than once (alias fixed point), so the same
+  // invocation comes back; find it by identity rather than scanning the list.
+  const callsByInvocation = new Map<A.Invocation, ProcedureCallEffect>(calls.map((entry) => [entry.call, entry]));
   const aliases = new Map<CheckResult['vars'][number], ArgumentOrigin>();
   const aggregateAliases = new Map<CheckResult['vars'][number], Map<string, ArgumentOrigin>>();
   const captureAliases = (): AliasState => ({
@@ -320,10 +323,14 @@ function collectDirect(
   const call = (expr: A.Invocation): void => {
     const selected = checked.calls.get(expr);
     const arguments_ = expr.args.map(parameterOrigin);
-    const existing = calls.find((entry) => entry.call === expr);
+    const existing = callsByInvocation.get(expr);
     if (existing) existing.arguments = existing.arguments.map((origin, index) => joinArgumentOrigins([origin, arguments_[index] ?? { kind: 'unknown' }]));
     if (!selected) {
-      if (!existing) calls.push({ call: expr, resolution: 'unresolved', arguments: arguments_ });
+      if (!existing) {
+        const entry: ProcedureCallEffect = { call: expr, resolution: 'unresolved', arguments: arguments_ };
+        calls.push(entry);
+        callsByInvocation.set(expr, entry);
+      }
       markUnknown(direct, sites, expr.span, 'unknown');
       // An unresolved call must not make a "non-blocking" summary unsound.
       direct.blocking = true;
@@ -332,13 +339,15 @@ function collectDirect(
     const target = selected.decl;
     const internal = all.has(target);
     if (!existing) {
-      calls.push({
+      const entry: ProcedureCallEffect = {
         call: expr,
         target,
         targetFile: selected.file,
         resolution: internal ? 'exact' : 'external',
         arguments: arguments_,
-      });
+      };
+      calls.push(entry);
+      callsByInvocation.set(expr, entry);
     }
     if (!internal && !options.trustedNonBlockingExternalDeclarations?.has(target)) {
       markUnknown(direct, sites, expr.span, 'unknown');

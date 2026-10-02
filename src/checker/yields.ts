@@ -31,6 +31,8 @@ export interface YieldAnalysisOptions {
    * that the author forgot a yield annotation.
    */
   unresolvedRootCallsYield?: boolean;
+  /** A `.read()` that does not suspend (a timer sample); its target is still scanned. */
+  nonYieldingRead?: (read: A.ChanRead) => boolean;
 }
 
 export class YieldAnalysis {
@@ -260,6 +262,12 @@ export class YieldAnalysis {
       const value = work.value;
       switch (value.kind) {
         case 'ChanRead':
+          if (this.options.nonYieldingRead?.(value)) {
+            expression(value.target);
+            break;
+          }
+          direct = true;
+          break;
         case 'ChanWrite':
         case 'Sync':
         case 'Timeout':

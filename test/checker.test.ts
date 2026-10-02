@@ -458,7 +458,8 @@ test('reads that must be their own statement: inside ?:, inside a write value; c
   const placement = r.diagnostics.filter((d) => d.code === 'pj/read-placement');
   assert.deepEqual(placement.map((d) => d.line + 1), [9, 13]);
   assert.equal(placement[1].fix?.title, "Read into 'read13' first");
-  assert.equal(placement[1].fix?.text, 'int read13 = c.read();\n        d.write(read13 + 1)');
+  // The write is a whole par branch, so the fix wraps read and write in one block instead of making two branches.
+  assert.equal(placement[1].fix?.text, '{ int read13 = c.read(); d.write(read13 + 1); }');
   const calls = r.diagnostics.filter((d) => d.code === 'pj/call-as-condition');
   assert.deepEqual(calls.map((d) => d.line + 1), [16, 17]);
   assert.equal(calls[0].fix?.text, ' == true');
