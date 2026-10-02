@@ -8,7 +8,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Install } from './config';
-import { exec, makeSandbox, processjcArgs, type ExecResult, type Sandbox } from './compiler';
+import { exec, makeSandbox, processjcArgs, type ExecResult, type ImportMirror, type Sandbox } from './compiler';
 import { parseCompilerOutput, stripAnsi } from './diagnostics';
 import type { YieldAnnotationContext } from './yieldfix';
 
@@ -21,6 +21,8 @@ export interface Stage {
 
 export interface BuildResult {
   ok: boolean;
+  /** The caller cancelled before the build finished; nothing below is meaningful. */
+  aborted: boolean;
   stages: Stage[];
   mainClass: string;
   /** Generated Java source, when the first stage got that far. */
@@ -30,6 +32,7 @@ export interface BuildResult {
 
 export interface RunResult {
   stages: Stage[];
+  aborted: boolean;
   output: string;
   exitCode: number | null;
   timedOut: boolean;
@@ -49,8 +52,18 @@ function stage(name: string, r: ExecResult, ok: boolean): Stage {
   return { name, ok, durationMs: r.durationMs, output: r.timedOut ? `${output}\n(timed out)` : output };
 }
 
-export async function build(install: Install, sourcePath: string, text: string, opts: { timeoutMs?: number; signal?: AbortSignal; yieldContext?: YieldAnnotationContext } = {}): Promise<BuildResult> {
-  const sb = makeSandbox(install, sourcePath, text, opts.yieldContext);
+export async function build(install: Install, sourcePath: string, text: string, opts: { timeoutMs?: number; signal?: AbortSignal; yieldContext?: YieldAnnotationContext; mirrors?: readonly ImportMirror[] } = {}): Promise<BuildResult> {
+  const sb = makeSandbox(install, sourcePath, text, opts.yieldContext, opts.mirrors);
+  try {
+    return await buildInSandbox(install, sb, opts);
+  } catch (error) {
+    // The caller only cleans up a result it received.
+    sb.cleanup();
+    throw error;
+  }
+}
+
+async function buildInSandbox(install: Install, sb: Sandbox, opts: { timeoutMs?: number; signal?: AbortSignal }): Promise<BuildResult> {
   const mainClass = path.basename(sb.fileName, '.pj');
   const stages: Stage[] = [];
   const timeoutMs = opts.timeoutMs ?? 60_000;
@@ -58,10 +71,16 @@ export async function build(install: Install, sourcePath: string, text: string, 
   const asmJar = path.join(install.installDir, 'resources', 'jars', 'asm-all-5.2.jar');
   const binDir = path.join(install.installDir, 'bin');
   const libJvm = path.join(install.installDir, 'lib', 'JVM');
-  const result: BuildResult = { ok: false, stages, mainClass, sandbox: sb };
+  const result: BuildResult = { ok: false, aborted: false, stages, mainClass, sandbox: sb };
+  const cancelled = (r: ExecResult): boolean => {
+    if (!r.aborted && !opts.signal?.aborted) return false;
+    result.aborted = true;
+    return true;
+  };
 
   // 1. ProcessJ compiler: exit code is unreliable, so we look for the success banner.
   const pjc = await exec(install.javaBin, processjcArgs(install, sb), { cwd: sb.root, ...common });
+  if (cancelled(pjc)) return result;
   const parsed = parseCompilerOutput(pjc.stdout, pjc.stderr);
   const javaFile = path.join(sb.work, `${mainClass}.java`);
   const generated = parsed.succeeded && fs.existsSync(javaFile);
@@ -72,17 +91,20 @@ export async function build(install: Install, sourcePath: string, text: string, 
   // 2. javac. Standard-library sources live in lib/JVM and are compiled on demand.
   const javaFiles = fs.readdirSync(sb.work).filter((f) => f.endsWith('.java')).map((f) => path.join(sb.work, f));
   const javac = await exec(javacFor(install), ['--release', '8', '-nowarn', '-cp', `${binDir}${path.delimiter}${libJvm}`, '-sourcepath', libJvm, '-d', sb.work, ...javaFiles], { cwd: sb.work, ...common });
+  if (cancelled(javac)) return result;
   stages.push(stage('javac', javac, javac.exitCode === 0));
   if (javac.exitCode !== 0) return result;
 
   // 3 + 4. Bytecode rewriting: turn the yield/label/resume markers into real jumps.
   const asmCp = [binDir, asmJar, '.'].join(path.delimiter);
   const goto = await exec(install.javaBin, ['-cp', asmCp, 'instrument.GotoLabelRewrite', '.'], { cwd: sb.work, ...common });
+  if (cancelled(goto)) return result;
   const gotoOk = goto.exitCode === 0 && /\*\* REWRITING DONE \*\*/.test(goto.stdout);
   stages.push(stage('GotoLabelRewrite', goto, gotoOk));
   if (!gotoOk) return result;
 
   const instr = await exec(install.javaBin, ['-cp', asmCp, 'instrument.Instrumenter', '.'], { cwd: sb.work, ...common });
+  if (cancelled(instr)) return result;
   // The instrumenter prints its success banner even after an exception, so also require a clean stderr.
   const instrOk = instr.exitCode === 0 && /\*\* INSTRUMENTATION SUCCEEDED \*\*/.test(instr.stdout) && !/Exception/.test(instr.stderr);
   stages.push(stage('Instrumenter', instr, instrOk));
@@ -98,7 +120,7 @@ export async function run(install: Install, built: BuildResult, opts: { timeoutM
   const r = await exec(install.javaBin, ['-cp', cp, built.mainClass], { cwd: built.sandbox.work, timeoutMs: opts.timeoutMs ?? 30_000, signal: opts.signal, maxOutput: opts.maxOutput ?? 500_000 });
   const stages = [...built.stages, stage('run', r, r.exitCode === 0 && !r.timedOut)];
   const output = [r.stdout, r.stderr].filter((s) => s.trim()).join('\n');
-  return { stages, output, exitCode: r.exitCode, timedOut: r.timedOut, durationMs: r.durationMs };
+  return { stages, output, exitCode: r.exitCode, timedOut: r.timedOut, aborted: r.aborted, durationMs: r.durationMs };
 }
 
 /** Human-readable report for a build (and optional run), shown in the editor. */

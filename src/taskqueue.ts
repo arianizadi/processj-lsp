@@ -31,6 +31,11 @@ export class LatestTaskQueue<K> {
     else this.timers.set(key, setTimeout(enqueue, delayMs));
   }
 
+  /** Drop every pending job and abort every active one (server shutdown). */
+  dispose(): void {
+    for (const key of [...this.timers.keys(), ...this.queued.keys(), ...this.active.keys()]) this.cancel(key);
+  }
+
   cancel(key: K): void {
     const timer = this.timers.get(key);
     if (timer) clearTimeout(timer);

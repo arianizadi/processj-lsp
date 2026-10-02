@@ -73,9 +73,9 @@ import { analyzeProtocols, effectiveProtocolCases, type ProtocolAnalysis, type P
 import { analyzeReachableCalls, DEFAULT_MAX_IMPORTED_FILES, type ReachableUnit } from './checker/reachable';
 import { YieldAnalysis, yieldAnnotationEdit, type YieldCallProvider, type YieldCallScope } from './checker/yields';
 import { typeStr, type Type } from './checker/types';
-import { compile, compilerDiagnosticTargetsBuffer, remapCompilerDiagnostic } from './compiler';
+import { compile, compilerDiagnosticTargetsBuffer, killAllChildren, remapCompilerDiagnostic, type ImportMirror } from './compiler';
 import { format } from './format';
-import { importDiagnostics, resolveImports } from './imports';
+import { importDiagnostics, resolveImports, type ImportResolution } from './imports';
 import type * as A from './parser/ast';
 import { parse, type ParseResult } from './parser/parser';
 import { semanticTokens, TOKEN_MODIFIERS, TOKEN_TYPES } from './semantic';
@@ -105,6 +105,7 @@ const SERVER_VERSION = packageVersion();
 const connection = createConnection(ProposedFeatures.all);
 const documents = new TextDocuments(TextDocument);
 const workspace = new WorkspaceIndex((changed, structureChanged) => {
+  closedAnalysisCache.clear();
   if (structureChanged) republishAll(true);
   else for (const file of changed) republishDependents(file, undefined, true);
 });
@@ -149,9 +150,21 @@ interface Analysis {
   protocols: ProtocolAnalysis;
   importDiags: LintDiagnostic[];
   deps: Set<string>;
+  /** Import facts the checker was run with, so refactor planners re-check under the same rules. */
+  importsStd: boolean;
+  unresolvedImports: boolean;
+  /** Package roots the compiler sandbox must link in to see the same imports. */
+  importMirrors: ImportMirror[];
 }
 
 const checkCache = new Map<string, Analysis & { version: number }>();
+/**
+ * Bindings of closed workspace files, for references and rename. A changed file
+ * is a miss because the workspace hands out a new program; the whole cache is
+ * dropped whenever any buffer or disk file changes, since a closed file's
+ * imports may be among them.
+ */
+const closedAnalysisCache = new Map<string, { program: A.Program; bindings: Bindings }>();
 const symbolCache = new Map<string, { version: number; symbols: PJSymbol[]; locals: PJSymbol[] }>();
 // Lint runs are coalesced so a burst of keystrokes in a large file costs one pass.
 const lintPending = new Map<string, NodeJS.Timeout>();
@@ -248,21 +261,25 @@ function loadLibrary(includeDir: string): void {
           const program = parse(fs.readFileSync(full, 'utf8')).program;
           libraryPrograms.set(full, program);
           libraryFiles.add(full);
-          if (path.basename(path.dirname(full)) === 'std') {
-            stdIndex.addProgram(program, full);
-            for (const declaration of program.decls) {
-              if (declaration.kind !== 'ProcDecl') continue;
-              if (declaration.name.name !== 'print' && declaration.name.name !== 'println') continue;
-              if (!declaration.modifiers.includes('native') || declaration.modifiers.includes('mobile') || declaration.body) continue;
-              if (declaration.annotations.some((annotation) => annotation.name === 'yield' && annotation.value === 'true')) continue;
-              trustedNonBlockingNativeDeclarations.add(declaration);
-            }
-          }
+          registerStdHeader(full, program);
         } catch {
           /* unreadable header: skip */
         }
       }
     }
+  }
+}
+
+/** `std/` headers form the std index; its native print/println are known not to rendezvous. */
+function registerStdHeader(file: string, program: A.Program): void {
+  if (path.basename(path.dirname(file)) !== 'std') return;
+  stdIndex.addProgram(program, file);
+  for (const declaration of program.decls) {
+    if (declaration.kind !== 'ProcDecl') continue;
+    if (declaration.name.name !== 'print' && declaration.name.name !== 'println') continue;
+    if (!declaration.modifiers.includes('native') || declaration.modifiers.includes('mobile') || declaration.body) continue;
+    if (declaration.annotations.some((annotation) => annotation.name === 'yield' && annotation.value === 'true')) continue;
+    trustedNonBlockingNativeDeclarations.add(declaration);
   }
 }
 
@@ -272,8 +289,12 @@ connection.onInitialized(() => {
     workspace.watched = true;
     void connection.client.register(DidChangeWatchedFilesNotification.type, { watchers: [{ globPattern: '**/*.pj' }] }).catch((error) => {
       workspace.watched = false;
+      workspace.startPolling();
       connection.console.warn(`could not register ProcessJ file watcher; falling back to polling: ${String(error)}`);
     });
+  } else {
+    // Poll in the background so no hover or completion ever pays for a directory walk.
+    workspace.startPolling();
   }
   // When the client advertises workspace folders, vscode-languageserver's own
   // WorkspaceFoldersFeature registers a handler for the same notification
@@ -306,6 +327,7 @@ function applyWorkspaceFolderChange(event: WorkspaceFoldersChangeEvent): void {
 
 documents.onDidOpen((e) => {
   openingDocuments.add(e.document.uri);
+  closedAnalysisCache.clear();
   schedulePublish(e.document);
   scheduleCheck(e.document, 0);
   // Hot-exit/session restore can open an imported file already containing
@@ -316,6 +338,7 @@ documents.onDidOpen((e) => {
 });
 documents.onDidChangeContent((e) => {
   schedulePublish(e.document);
+  closedAnalysisCache.clear();
   const opening = openingDocuments.delete(e.document.uri);
   if (!opening) {
     if (settings.checkOnChange) scheduleCheck(e.document, settings.debounceMs);
@@ -327,27 +350,53 @@ documents.onDidChangeContent((e) => {
 });
 
 connection.onDidChangeWatchedFiles((params) => {
-  let refreshAll = false;
+  let created = false;
   const changed = new Set<string>();
   for (const change of params.changes) {
     const p = safeFileUri(change.uri);
     if (!p || !p.endsWith('.pj')) continue;
     workspace.invalidate(p);
+    closedAnalysisCache.clear();
+    if (libraryFiles.has(path.resolve(p))) reloadLibraryFile(path.resolve(p));
     // Keep the saved disk snapshot current even while the document is open.
-    // Lookups overlay the editor buffer until close.
-    if (change.type !== FileChangeType.Deleted) workspace.add(p);
-    // A newly created file may satisfy a wildcard import, while a deleted file
-    // can disappear before a lint-disabled document ever cached its old deps.
-    // Both events are rare, so conservatively refresh/recompile every open file.
-    if (change.type === FileChangeType.Created || change.type === FileChangeType.Deleted) refreshAll = true;
-    else changed.add(p);
+    // Lookups overlay the editor buffer until close. The glob also reports build
+    // output and hidden directories, which a root walk would never index.
+    if (change.type !== FileChangeType.Deleted && workspace.isIndexable(p)) workspace.add(p);
+    if (change.type === FileChangeType.Created) created = true;
+    changed.add(p);
   }
-  // Refresh at most once per notification: a branch switch delivers many
-  // changes at once, and every extra schedule would abort the compiler run the
-  // previous one had just started.
-  if (refreshAll) republishAll(true);
+  // A newly created file can only matter to a document whose imports did not
+  // all resolve or that imports a whole package. Everything else, including a
+  // deletion, reaches exactly the documents that depend on the path. Refresh at
+  // most once per notification: a branch switch delivers many changes at once.
+  if (created && documents.all().some((doc) => importsMayGainFiles(doc))) republishAll(true);
   else for (const p of changed) republishDependents(p, undefined, true);
 });
+
+/** Could a file appearing on disk change what this document imports? */
+function importsMayGainFiles(doc: TextDocument): boolean {
+  const cached = checkCache.get(doc.uri);
+  if (cached) return cached.unresolvedImports || parsedFor(doc).program.imports.some((entry) => entry.wildcard);
+  const program = parsedFor(doc).program;
+  if (program.imports.some((entry) => entry.wildcard)) return true;
+  return resolveImports(program, safeFileUri(doc.uri), workspace.getRoots(), install?.includeDir).imports.some((entry) => entry.files.length === 0);
+}
+
+/** A standard-library header changed on disk: re-read it so hover, completion and the std index follow. */
+function reloadLibraryFile(file: string): void {
+  try {
+    libraryPrograms.set(file, parse(fs.readFileSync(file, 'utf8')).program);
+  } catch {
+    libraryPrograms.delete(file);
+    libraryFiles.delete(file);
+  }
+  if (!install) return;
+  library = indexLibrary(install.includeDir);
+  stdIndex = new DeclIndex();
+  trustedNonBlockingNativeDeclarations.clear();
+  for (const [headerPath, program] of libraryPrograms) registerStdHeader(headerPath, program);
+  checkCache.clear();
+}
 
 /** Re-lint every open document whose imports include `changedPath`. */
 function republishDependents(changedPath: string, exceptUri?: string, recompile = false): void {
@@ -405,6 +454,7 @@ documents.onDidSave((e) => {
 });
 documents.onDidClose((e) => {
   openingDocuments.delete(e.document.uri);
+  closedAnalysisCache.clear();
   compilerQueue.cancel(e.document.uri);
   const t = lintPending.get(e.document.uri);
   if (t) clearTimeout(t);
@@ -507,7 +557,7 @@ function protocolIssueDiagnostic(doc: TextDocument, issue: ProtocolIssue): LintD
 
 /** Type-check a document against its own declarations, its imports and the standard library. */
 function checkFor(doc: TextDocument): Analysis {
-  workspace.refresh();
+  workspace.ensureIndexed();
   const cached = checkCache.get(doc.uri);
   if (cached && cached.version === doc.version) return cached;
   const parsed = parsedFor(doc);
@@ -516,6 +566,39 @@ function checkFor(doc: TextDocument): Analysis {
   const entry = { version: doc.version, ...analysis };
   checkCache.set(doc.uri, entry);
   return entry;
+}
+
+/** What references and rename need from a closed file: name bindings and the exact overloads its calls select. */
+interface Bindings {
+  checked: CheckResult;
+  index: DeclIndex;
+}
+
+/** Bind a closed workspace file without the effect, protocol and yield passes that only the editor view needs. */
+function analyzeBindings(program: A.Program, ownPath: string | undefined): Bindings {
+  const resolution = resolveImports(program, ownPath, workspace.getRoots(), install?.includeDir);
+  const index = new DeclIndex();
+  index.addProgram(program, ownPath);
+  for (const file of resolution.files) {
+    const imported = analysisSourceForPath(file)?.program;
+    if (imported) index.addProgram(imported, file);
+  }
+  const checked = check(program, {
+    index,
+    stdIndex,
+    importsStd: resolution.importsStd,
+    unresolvedImports: resolution.imports.some((entry) => entry.files.length === 0),
+    trustedNonBlockingNativeDeclarations,
+  });
+  return { checked, index };
+}
+
+function closedBindingsFor(file: string, program: A.Program): Bindings {
+  const cached = closedAnalysisCache.get(file);
+  if (cached && cached.program === program) return cached.bindings;
+  const bindings = analyzeBindings(program, file);
+  closedAnalysisCache.set(file, { program, bindings });
+  return bindings;
 }
 
 /** Analyze an on-disk program for a rare cross-file reference request. */
@@ -604,7 +687,22 @@ function analyzeProgram(program: A.Program, ownPath: string | undefined, text?: 
     trustedNonBlockingExternalDeclarations: trustedNonBlockingNativeDeclarations,
   });
   const protocols = analyzeProtocols(program, index, checked, { file: ownPath, sourceText: text, tokens });
-  return { checked, yieldCalls, yieldCallProvider, index, effects, protocols, importDiags, deps: new Set(reachable.dependencies) };
+  return { checked, yieldCalls, yieldCallProvider, index, effects, protocols, importDiags, deps: new Set(reachable.dependencies), importsStd: resolution.importsStd, unresolvedImports: unresolved, importMirrors: importMirrorsFor(resolution, ownPath) };
+}
+
+/** Package roots found under a workspace root: the compiler would not see them from the file's own directory. */
+function importMirrorsFor(resolution: ImportResolution, ownPath: string | undefined): ImportMirror[] {
+  const ownDir = ownPath ? path.resolve(path.dirname(ownPath)) : undefined;
+  const includeDir = install ? path.resolve(install.includeDir) : undefined;
+  const mirrors = new Map<string, string>();
+  for (const resolved of resolution.imports) {
+    const first = resolved.import.path[0]?.name;
+    if (!first || !resolved.base || resolved.files.length === 0) continue;
+    const base = path.resolve(resolved.base);
+    if (base === ownDir || (includeDir && (base === includeDir || base.startsWith(includeDir + path.sep)))) continue;
+    if (!mirrors.has(first)) mirrors.set(first, path.join(base, first));
+  }
+  return [...mirrors].map(([name, target]) => ({ name, target }));
 }
 
 /** Current editor text wins over both the standard-library and workspace disk caches. */
@@ -695,6 +793,7 @@ async function runCheck(uri: string, signal: AbortSignal): Promise<void> {
     timeoutMs: settings.timeoutMs,
     signal,
     yieldContext: { program: parsedFor(doc).program, index: analysis.index, calls: analysis.checked.calls, callProvider: analysis.yieldCallProvider },
+    mirrors: analysis.importMirrors,
   });
 
   if (result.aborted) return;
@@ -1120,8 +1219,10 @@ function inferredProtocolTransitions(flows: ProtocolAnalysis['flows']): Array<{ 
 // One private directory per server process: reports keep a stable name so the
 // editor reuses the tab, without writing to a path another user could pre-create.
 let runsDir: string | undefined;
+/** One Run or Build at a time per document: a newer command (or the client cancelling) stops the older JVMs. */
+const runControllers = new Map<string, AbortController>();
 
-connection.onExecuteCommand(async (params: ExecuteCommandParams) => {
+connection.onExecuteCommand(async (params: ExecuteCommandParams, token) => {
   if (params.command === COMMAND_APPLY_EDIT) {
     if (!clientSupportsApplyEdit) throw new ResponseError(ErrorCodes.InvalidRequest, 'Client does not support workspace/applyEdit');
     const edit = params.arguments?.[0];
@@ -1167,33 +1268,68 @@ connection.onExecuteCommand(async (params: ExecuteCommandParams) => {
     return null;
   }
 
-  connection.window.showInformationMessage(`ProcessJ: building ${fileName}…`);
-  const analysis = checkFor(doc);
-  const built = await build(install, sourcePath, doc.getText(), {
-    timeoutMs: settings.timeoutMs * 3,
-    yieldContext: { program: parsedFor(doc).program, index: analysis.index, calls: analysis.checked.calls, callProvider: analysis.yieldCallProvider },
-  });
+  runControllers.get(uri)?.abort();
+  const controller = new AbortController();
+  runControllers.set(uri, controller);
+  const cancellation = token.onCancellationRequested(() => controller.abort());
   try {
-    if (!built.ok) {
-      const target = await showReport(reportName('build.txt'), formatReport(fileName, built.stages));
-      const failed = built.stages.find((s) => !s.ok);
-      connection.window.showErrorMessage(`ProcessJ: ${failed?.name ?? 'build'} failed`);
-      return target;
-    }
+    connection.window.showInformationMessage(`ProcessJ: building ${fileName}…`);
+    const analysis = checkFor(doc);
+    const built = await build(install, sourcePath, doc.getText(), {
+      timeoutMs: settings.timeoutMs * 3,
+      signal: controller.signal,
+      yieldContext: { program: parsedFor(doc).program, index: analysis.index, calls: analysis.checked.calls, callProvider: analysis.yieldCallProvider },
+      mirrors: analysis.importMirrors,
+    });
+    try {
+      if (built.aborted) return null;
+      if (!built.ok) {
+        const target = await showReport(reportName('build.txt'), formatReport(fileName, built.stages));
+        const failed = built.stages.find((s) => !s.ok);
+        connection.window.showErrorMessage(`ProcessJ: ${failed?.name ?? 'build'} failed`);
+        return target;
+      }
 
-    if (params.command === COMMAND_BUILD) {
-      const target = await showReport(reportName('build.txt'), formatReport(fileName, built.stages));
-      connection.window.showInformationMessage(`ProcessJ: ${fileName} built successfully`);
-      return target;
-    }
+      if (params.command === COMMAND_BUILD) {
+        const target = await showReport(reportName('build.txt'), formatReport(fileName, built.stages));
+        connection.window.showInformationMessage(`ProcessJ: ${fileName} built successfully`);
+        return target;
+      }
 
-    const result = await run(install, built, { timeoutMs: settings.runTimeoutMs });
-    const target = await showReport(reportName('run.txt'), formatReport(fileName, result.stages, { output: result.output, exitCode: result.exitCode, timedOut: result.timedOut }));
-    if (result.timedOut) connection.window.showWarningMessage(`ProcessJ: ${fileName} did not finish within ${settings.runTimeoutMs} ms (deadlock?)`);
-    else connection.window.showInformationMessage(`ProcessJ: ${fileName} finished (exit ${result.exitCode}) in ${result.durationMs} ms`);
-    return target;
+      const result = await run(install, built, { timeoutMs: settings.runTimeoutMs, signal: controller.signal });
+      if (result.aborted) return null;
+      const target = await showReport(reportName('run.txt'), formatReport(fileName, result.stages, { output: result.output, exitCode: result.exitCode, timedOut: result.timedOut }));
+      if (result.timedOut) connection.window.showWarningMessage(`ProcessJ: ${fileName} did not finish within ${settings.runTimeoutMs} ms (deadlock?)`);
+      else connection.window.showInformationMessage(`ProcessJ: ${fileName} finished (exit ${result.exitCode}) in ${result.durationMs} ms`);
+      return target;
+    } finally {
+      built.sandbox.cleanup();
+    }
   } finally {
-    built.sandbox.cleanup();
+    cancellation.dispose();
+    if (runControllers.get(uri) === controller) runControllers.delete(uri);
+  }
+});
+
+connection.onShutdown(() => {
+  compilerQueue.dispose();
+  for (const controller of runControllers.values()) controller.abort();
+  runControllers.clear();
+  killAllChildren();
+  workspace.stopPolling();
+  for (const timer of lintPending.values()) clearTimeout(timer);
+  lintPending.clear();
+  if (analysisDecorationRefresh) {
+    clearTimeout(analysisDecorationRefresh);
+    analysisDecorationRefresh = undefined;
+  }
+  if (runsDir) {
+    try {
+      fs.rmSync(runsDir, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+    runsDir = undefined;
   }
 });
 
@@ -1987,7 +2123,7 @@ function declarationSpans(program: A.Program, name: string, kind: PJSymbol['kind
   return spans;
 }
 
-function indexedBindingFile(analysis: Analysis, kind: PJSymbol['kind'], name: string): string | undefined {
+function indexedBindingFile(analysis: Bindings, kind: PJSymbol['kind'], name: string): string | undefined {
   if (kind === 'record') return analysis.index.records.get(name)?.file;
   if (kind === 'protocol') return analysis.index.protocols.get(name)?.file;
   if (kind === 'const') return analysis.index.consts.get(name)?.file;
@@ -1999,7 +2135,7 @@ function callTargets(sig: ProcSig, targetFile: string | undefined, targetUri: st
   return fileMatches && (!target || sameSignature(sig, target));
 }
 
-function procedureReferenceSpans(program: A.Program, analysis: Analysis, name: string, targetFile: string | undefined, targetUri: string, sourceUri: string, target: ProcSig): A.Span[] {
+function procedureReferenceSpans(program: A.Program, analysis: Bindings, name: string, targetFile: string | undefined, targetUri: string, sourceUri: string, target: ProcSig): A.Span[] {
   const spans: A.Span[] = [];
   for (const [call, sig] of analysis.checked.calls) {
     if (call.name.name === name && callTargets(sig, targetFile, targetUri, sourceUri, target)) spans.push(call.name.span);
@@ -2032,7 +2168,7 @@ function procedureReferenceSpans(program: A.Program, analysis: Analysis, name: s
   return spans;
 }
 
-function constantReferenceSpans(analysis: Analysis, name: string): A.Span[] {
+function constantReferenceSpans(analysis: Bindings, name: string): A.Span[] {
   const spans: A.Span[] = [];
   for (const [expr] of analysis.checked.types) {
     if (expr.kind === 'NameExpr' && !expr.qualifier?.length && expr.name.name === name && !analysis.checked.resolutions.has(expr)) spans.push(expr.name.span);
@@ -2131,7 +2267,7 @@ function referencesOf(doc: TextDocument, position: Position, includeDeclaration 
     const program = workspace.programFor(file);
     if (!program) continue;
     const uri = pathToFileURL(file).toString();
-    const analysis = analyzeProgram(program, file);
+    const analysis = closedBindingsFor(file, program);
     const declarations = targetKind === 'proc' && targetProcedure ? [targetProcedure.decl.name.span] : declarationSpans(program, r.word, targetKind);
     const isTargetFile = !!targetFile && sameFile(file, targetFile);
     if (targetKind === 'proc') {

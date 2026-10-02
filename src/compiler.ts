@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -23,6 +23,34 @@ export interface ExecOptions {
   maxOutput?: number;
 }
 
+/** Children still running, so a server shutdown can take its JVMs with it. */
+const liveChildren = new Set<ChildProcess>();
+/** After the child exits, wait at most this long for a descendant holding its pipes before giving up on more output. */
+const STREAM_GRACE_MS = 500;
+
+/** Kill the process (on POSIX its whole process group, so wrappers cannot leave a grandchild behind). */
+function killTree(child: ChildProcess): void {
+  if (!child.pid) return;
+  try {
+    if (process.platform === 'win32') child.kill('SIGKILL');
+    else process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+/** Stop every process this module started. Called when the server shuts down. */
+export function killAllChildren(): void {
+  for (const child of liveChildren) killTree(child);
+}
+// `exit` also fires for process.exit(), which is how the LSP library ends the
+// server; killing is synchronous, so nothing survives a shutdown or a crash.
+process.on('exit', killAllChildren);
+
 /** Run a process, capture its output, kill it on timeout or abort. */
 export function exec(cmd: string, args: string[], opts: ExecOptions): Promise<ExecResult> {
   const timeoutMs = opts.timeoutMs ?? 20_000;
@@ -37,22 +65,29 @@ export function exec(cmd: string, args: string[], opts: ExecOptions): Promise<Ex
     let timedOut = false;
     let aborted = false;
     let done = false;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
 
-    const child = spawn(cmd, args, { cwd: opts.cwd, stdio: ['ignore', 'pipe', 'pipe'] });
-    child.stdout.on('data', (d) => {
-      if (stdout.length < maxOutput) stdout += d.toString();
+    // Its own process group on POSIX, so a timeout or abort can kill the JVM
+    // together with anything it spawned.
+    const child = spawn(cmd, args, { cwd: opts.cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+    liveChildren.add(child);
+    // Decode as a stream: a multi-byte character split across two chunks must not become U+FFFD.
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (d: string) => {
+      if (stdout.length < maxOutput) stdout += d;
     });
-    child.stderr.on('data', (d) => {
-      if (stderr.length < maxOutput) stderr += d.toString();
+    child.stderr.on('data', (d: string) => {
+      if (stderr.length < maxOutput) stderr += d;
     });
 
     const timer = setTimeout(() => {
       timedOut = true;
-      if (child.pid) child.kill('SIGKILL');
+      killTree(child);
     }, timeoutMs);
     const onAbort = () => {
       aborted = true;
-      if (child.pid) child.kill('SIGKILL');
+      killTree(child);
     };
     if (opts.signal?.aborted) onAbort();
     opts.signal?.addEventListener('abort', onAbort, { once: true });
@@ -61,12 +96,23 @@ export function exec(cmd: string, args: string[], opts: ExecOptions): Promise<Ex
       if (done) return;
       done = true;
       clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
+      liveChildren.delete(child);
       opts.signal?.removeEventListener('abort', onAbort);
       resolve({ stdout, stderr, exitCode: code, timedOut, aborted, durationMs: Date.now() - started });
     };
     child.on('error', (err) => {
       stderr += `\n${String(err)}`;
       finish(null);
+    });
+    // `close` waits for the stdio pipes, which a surviving descendant may keep
+    // open forever. Give trailing output a moment after `exit`, then finish anyway.
+    child.on('exit', (code) => {
+      graceTimer = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        finish(code);
+      }, STREAM_GRACE_MS);
     });
     child.on('close', (code) => finish(code));
   });
@@ -91,7 +137,15 @@ export interface Sandbox {
   cleanup: () => void;
 }
 
-export function makeSandbox(install: Install, sourcePath: string, text: string, yieldContext?: YieldAnnotationContext): Sandbox {
+/** A package root the compiler must be able to see from the sandbox, exactly as import resolution found it. */
+export interface ImportMirror {
+  /** First segment of the import path (`geom` for `import geom.shapes;`). */
+  name: string;
+  /** The directory or file that segment resolved to. */
+  target: string;
+}
+
+export function makeSandbox(install: Install, sourcePath: string, text: string, yieldContext?: YieldAnnotationContext, mirrors: readonly ImportMirror[] = []): Sandbox {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-'));
   const home = path.join(root, '.pjlsp-home');
   const work = path.join(home, 'work');
@@ -125,6 +179,19 @@ export function makeSandbox(install: Install, sourcePath: string, text: string, 
       } catch {
         /* a name clash or unsupported symlinks: the compiler just won't see this entry */
       }
+    }
+  }
+  // Imports resolved under a workspace root rather than next to the file: the
+  // compiler searches only its working directory and the include directory, so
+  // link each package root in (siblings mirrored above take precedence).
+  for (const mirror of mirrors) {
+    if (!mirror.name || mirror.name.startsWith('.') || mirror.name.includes('/') || mirror.name.includes(path.sep)) continue;
+    const link = path.join(root, mirror.name);
+    if (fs.existsSync(link)) continue;
+    try {
+      fs.symlinkSync(mirror.target, link);
+    } catch {
+      /* unsupported symlinks: the compiler reports the import as missing, as before */
     }
   }
   return {
@@ -180,8 +247,8 @@ export function remapCompilerDiagnostic(
 }
 
 /** Run only the ProcessJ compiler (front end + Java codegen) over `text`, for diagnostics. */
-export async function compile(install: Install, sourcePath: string, text: string, opts: { timeoutMs?: number; signal?: AbortSignal; yieldContext?: YieldAnnotationContext } = {}): Promise<CompileResult> {
-  const sb = makeSandbox(install, sourcePath, text, opts.yieldContext);
+export async function compile(install: Install, sourcePath: string, text: string, opts: { timeoutMs?: number; signal?: AbortSignal; yieldContext?: YieldAnnotationContext; mirrors?: readonly ImportMirror[] } = {}): Promise<CompileResult> {
+  const sb = makeSandbox(install, sourcePath, text, opts.yieldContext, opts.mirrors);
   try {
     const r = await exec(install.javaBin, processjcArgs(install, sb), { cwd: sb.root, timeoutMs: opts.timeoutMs, signal: opts.signal });
     return { ...r, sourcePath: sb.sourcePath, yieldSourceMap: sb.yieldSourceMap };

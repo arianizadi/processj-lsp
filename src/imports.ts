@@ -15,6 +15,8 @@ export interface ResolvedImport {
   files: string[];
   /** Directories that were searched, for the diagnostic. */
   searched: string[];
+  /** The search base the import was found under (absent when unresolved). */
+  base?: string;
   /** Found outside the install's include directory: a user library the compiler cannot build against. */
   userLibrary: boolean;
 }
@@ -64,6 +66,7 @@ export function resolveImports(program: A.Program, ownPath: string | undefined, 
 
   const imports: ResolvedImport[] = [];
   const files: string[] = [];
+  const seen = new Set<string>();
   let importsStd = false;
   for (const im of program.imports) {
     const parts = im.path.map((p) => p.name);
@@ -71,6 +74,7 @@ export function resolveImports(program: A.Program, ownPath: string | undefined, 
     const found: string[] = [];
     const searched: string[] = [];
     let userLibrary = false;
+    let matchedBase: string | undefined;
     for (const base of bases) {
       const target = path.join(base, ...parts);
       searched.push(base);
@@ -79,16 +83,22 @@ export function resolveImports(program: A.Program, ownPath: string | undefined, 
         if (isDir(target)) {
           for (const f of listPj(target)) found.push(f);
           userLibrary = !inInclude;
+          matchedBase = base;
           break;
         }
       } else if (isFile(`${target}.pj`)) {
         found.push(`${target}.pj`);
         userLibrary = !inInclude;
+        matchedBase = base;
         break;
       }
     }
-    imports.push({ import: im, files: found, searched, userLibrary });
-    for (const f of found) if (!files.includes(f)) files.push(f);
+    imports.push({ import: im, files: found, searched, userLibrary, base: matchedBase });
+    for (const f of found) {
+      if (seen.has(f)) continue;
+      seen.add(f);
+      files.push(f);
+    }
   }
   return { imports, files, importsStd };
 }
@@ -109,14 +119,41 @@ function isFile(p: string): boolean {
   }
 }
 
-function listPj(dir: string): string[] {
+/** Deeper than any real package tree; also stops a symlink cycle. */
+const MAX_WILDCARD_DEPTH = 8;
+/** A wildcard import that reaches this many files is a disk, not a package. */
+const MAX_WILDCARD_FILES = 2000;
+
+/**
+ * Every `.pj` file under `dir`, including sub-directories: the compiler's
+ * ResolveImports.makeFileList walks the whole package tree for `import a.*;`.
+ * Files come before sub-directories, each group sorted, so output is stable.
+ */
+function listPj(dir: string, depth = 0, out: string[] = [], visited = new Set<string>()): string[] {
+  if (depth > MAX_WILDCARD_DEPTH || out.length >= MAX_WILDCARD_FILES) return out;
+  let real: string;
   try {
-    return fs
-      .readdirSync(dir)
-      .filter((f) => f.endsWith('.pj'))
-      .sort()
-      .map((f) => path.join(dir, f));
+    real = fs.realpathSync(dir);
   } catch {
-    return [];
+    return out;
   }
+  if (visited.has(real)) return out;
+  visited.add(real);
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of entries) {
+    if (out.length >= MAX_WILDCARD_FILES) break;
+    if (entry.name.endsWith('.pj') && (entry.isFile() || (entry.isSymbolicLink() && isFile(path.join(dir, entry.name))))) out.push(path.join(dir, entry.name));
+  }
+  for (const entry of entries) {
+    if (out.length >= MAX_WILDCARD_FILES) break;
+    if (entry.name.startsWith('.')) continue;
+    if (entry.isDirectory() || (entry.isSymbolicLink() && isDir(path.join(dir, entry.name)))) listPj(path.join(dir, entry.name), depth + 1, out, visited);
+  }
+  return out;
 }

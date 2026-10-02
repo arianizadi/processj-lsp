@@ -17,8 +17,12 @@ const SKIP_DIRS = new Set(['node_modules', '.git', 'workingpj', '.workingpj', 'd
 const MAX_DEPTH = 6;
 /** Stop indexing a root once it holds this many .pj files; it is not a project, it is a disk. */
 const MAX_FILES = 2000;
+/** Directories one walk may read: a huge tree with no .pj files at all must not stall a request either. */
+const MAX_DIRS = 3000;
 
 interface Entry {
+  /** Found by a root walk (as opposed to loaded on demand as an import dependency, possibly outside every root). */
+  discovered: boolean;
   mtimeMs: number;
   ctimeMs: number;
   size: number;
@@ -51,6 +55,7 @@ export class WorkspaceIndex {
   private readonly symbolsByName = new Map<string, Map<string, PJSymbol[]>>();
   private roots: string[] = [];
   private lastRefresh = 0;
+  private pollTimer: ReturnType<typeof setInterval> | undefined;
   /**
    * Without editor file-watch notifications the directory walk is repeated at most
    * this often (only on lookups that need it). With notifications it runs once.
@@ -70,6 +75,42 @@ export class WorkspaceIndex {
 
   getRoots(): string[] {
     return this.roots;
+  }
+
+  /**
+   * Without editor file-watch notifications, re-walk the roots in the background
+   * so lookups on the request path never pay for the directory scan themselves.
+   */
+  startPolling(intervalMs = WorkspaceIndex.POLL_INTERVAL_MS): void {
+    if (this.pollTimer) return;
+    this.pollTimer = setInterval(() => {
+      if (!this.watched) this.refresh();
+    }, intervalMs);
+    this.pollTimer.unref?.();
+  }
+
+  stopPolling(): void {
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    this.pollTimer = undefined;
+  }
+
+  /** Make sure the roots have been walked at least once; later changes arrive from the watcher or the poll timer. */
+  ensureIndexed(): void {
+    if (this.lastRefresh === 0) this.refresh();
+  }
+
+  /** Would a root walk index this path? Watcher events for build output or hidden directories should not. */
+  isIndexable(file: string): boolean {
+    const abs = path.resolve(file);
+    if (!abs.endsWith('.pj')) return false;
+    for (const root of this.roots) {
+      if (abs !== root && !abs.startsWith(root + path.sep)) continue;
+      const segments = path.relative(root, abs).split(path.sep);
+      const directories = segments.slice(0, -1);
+      if (directories.length > MAX_DEPTH + 1) return false;
+      return !directories.some((segment) => SKIP_DIRS.has(segment) || segment.startsWith('.'));
+    }
+    return false;
   }
 
   /** Parsed program for a file (from cache if unchanged), or undefined if unreadable. */
@@ -92,7 +133,7 @@ export class WorkspaceIndex {
 
   /** Find every top-level symbol named `name` across the workspace, excluding `excludePath`. */
   lookup(name: string, excludePath?: string): Array<{ file: string; symbol: PJSymbol }> {
-    this.refresh();
+    this.ensureIndexed();
     const hits: Array<{ file: string; symbol: PJSymbol }> = [];
     const excluded = excludePath ? path.resolve(excludePath) : undefined;
     for (const [file, symbols] of this.symbolsByName.get(name) ?? []) {
@@ -104,7 +145,7 @@ export class WorkspaceIndex {
 
   /** All top-level symbols in the workspace, for completion. */
   all(excludePath?: string): Array<{ file: string; symbol: PJSymbol }> {
-    this.refresh();
+    this.ensureIndexed();
     const out: Array<{ file: string; symbol: PJSymbol }> = [];
     const excluded = excludePath ? path.resolve(excludePath) : undefined;
     for (const [file, entry] of this.cache) {
@@ -119,7 +160,7 @@ export class WorkspaceIndex {
    * avoids allocating every symbol in a very large workspace on each keypress.
    */
   completions(prefix: string, limit: number, excludedFiles: ReadonlySet<string> = new Set(), excludePath?: string): WorkspaceCompletion {
-    this.refresh();
+    this.ensureIndexed();
     const items: Array<{ file: string; symbol: PJSymbol }> = [];
     const wanted = prefix.toLowerCase();
     const excluded = excludePath ? path.resolve(excludePath) : undefined;
@@ -163,7 +204,7 @@ export class WorkspaceIndex {
    * rename do not read and tokenize the entire workspace again on every request.
    */
   occurrences(name: string, excludePath?: string, excludeLocals = false): WorkspaceOccurrence[] {
-    this.refresh();
+    this.ensureIndexed();
     const excluded = excludePath ? path.resolve(excludePath) : undefined;
     const out: WorkspaceOccurrence[] = [];
     for (const [file, entry] of this.cache) {
@@ -212,7 +253,7 @@ export class WorkspaceIndex {
         if (list) list.push(token.line, token.col, token.end);
         else occurrences.set(token.text, [token.line, token.col, token.end]);
       }
-      const entry: Entry = { mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size, program: parsed.program, symbols: astSymbols(parsed).symbols, occurrences };
+      const entry: Entry = { discovered: cached?.discovered ?? false, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size, program: parsed.program, symbols: astSymbols(parsed).symbols, occurrences };
       this.replaceEntry(abs, entry);
       return entry;
     } catch {
@@ -229,8 +270,16 @@ export class WorkspaceIndex {
     this.lastRefresh = now;
     const previous = new Map(this.cache);
     const seen = new Set<string>();
-    for (const root of this.roots) this.walk(root, 0, seen);
-    for (const file of [...this.cache.keys()]) if (!seen.has(file)) this.deleteEntry(file);
+    const budget = { dirs: 0 };
+    for (const root of this.roots) this.walk(root, 0, seen, budget);
+    for (const [file, entry] of [...this.cache]) {
+      if (seen.has(file)) continue;
+      // A root file that the walk no longer finds is gone. A dependency loaded
+      // on demand (outside the roots, beyond the depth or file limit) is simply
+      // re-validated against disk, so it is not mistaken for a deletion.
+      if (entry.discovered) this.deleteEntry(file);
+      else this.entryFor(file);
+    }
     const changed = new Set<string>();
     let structureChanged = false;
     for (const [file, entry] of this.cache) {
@@ -248,8 +297,9 @@ export class WorkspaceIndex {
     if (initialized && changed.size) this.onRefresh?.(changed, structureChanged);
   }
 
-  private walk(dir: string, depth: number, seen: Set<string>): void {
-    if (depth > MAX_DEPTH || seen.size >= MAX_FILES) return;
+  private walk(dir: string, depth: number, seen: Set<string>, budget: { dirs: number }): void {
+    if (depth > MAX_DEPTH || seen.size >= MAX_FILES || budget.dirs >= MAX_DIRS) return;
+    budget.dirs++;
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -262,12 +312,13 @@ export class WorkspaceIndex {
       if (seen.size >= MAX_FILES) return;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) {
-        if (!SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) this.walk(full, depth + 1, seen);
+        if (!SKIP_DIRS.has(e.name) && !e.name.startsWith('.')) this.walk(full, depth + 1, seen, budget);
         continue;
       }
       if (!e.isFile() || !e.name.endsWith('.pj')) continue;
       seen.add(full);
-      this.entryFor(full);
+      const entry = this.entryFor(full);
+      if (entry) entry.discovered = true;
     }
   }
 
