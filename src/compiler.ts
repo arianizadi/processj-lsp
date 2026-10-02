@@ -50,6 +50,15 @@ export function killAllChildren(): void {
 // `exit` also fires for process.exit(), which is how the LSP library ends the
 // server; killing is synchronous, so nothing survives a shutdown or a crash.
 process.on('exit', killAllChildren);
+// Children live in their own process group, so a signal aimed at the server's
+// group (Ctrl-C in a terminal, an editor killing its subprocesses) no longer
+// reaches them by itself; take them along, then exit as the default would.
+for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
+  process.once(signal, () => {
+    killAllChildren();
+    process.exit();
+  });
+}
 
 /** Run a process, capture its output, kill it on timeout or abort. */
 export function exec(cmd: string, args: string[], opts: ExecOptions): Promise<ExecResult> {

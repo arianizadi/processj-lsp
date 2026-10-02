@@ -146,19 +146,18 @@ export class DeclIndex {
   /** Merge another index underneath this one (this one's definitions win). */
   addIndex(other: DeclIndex): void {
     this.invalidateDerived();
-    // This index's own pending members must still be resolved before the other
-    // index's names are visible, so they resolve now (names-only mode would be
-    // wrong: a later file does not shadow a declaration the current file saw).
+    // Type names first, so this index's still-pending member types can name a
+    // record or protocol the other index declares; existing entries still win.
+    for (const [n, r] of other.records) if (!this._records.has(n)) this._records.set(n, r);
+    for (const [n, p] of other.protocols) if (!this._protocols.has(n)) this._protocols.set(n, p);
+    for (const e of other.externs) this.externs.add(e);
     this.finalize();
     for (const [name, list] of other.procs) {
       const mine = this._procs.get(name);
       if (!mine) this._procs.set(name, [...list]);
       else for (const s of list) if (!mine.some((m) => sameSignature(m, s))) mine.push(s);
     }
-    for (const [n, r] of other.records) if (!this._records.has(n)) this._records.set(n, r);
-    for (const [n, p] of other.protocols) if (!this._protocols.has(n)) this._protocols.set(n, p);
     for (const [n, c] of other.consts) if (!this._consts.has(n)) this._consts.set(n, c);
-    for (const e of other.externs) this.externs.add(e);
   }
 
   resolve(node: A.TypeNode): Type {

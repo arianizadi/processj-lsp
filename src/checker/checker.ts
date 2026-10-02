@@ -1042,6 +1042,8 @@ class Checker {
     const prev = this.activeCase.get(v);
     this.activeCase.set(v, tag);
     body();
+    // An assignment inside the body dropped the narrowing; the outer one is gone too.
+    if (this.activeCase.get(v) !== tag) return;
     if (prev === undefined) this.activeCase.delete(v);
     else this.activeCase.set(v, prev);
   }

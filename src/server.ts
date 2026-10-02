@@ -397,6 +397,7 @@ documents.onDidChangeContent((e) => {
 
 connection.onDidChangeWatchedFiles((params) => {
   let created = false;
+  let structural = false;
   let libraryChanged = false;
   const changed = new Set<string>();
   for (const change of params.changes) {
@@ -413,6 +414,7 @@ connection.onDidChangeWatchedFiles((params) => {
     // output and hidden directories, which a root walk would never index.
     if (change.type !== FileChangeType.Deleted && workspace.isIndexable(p)) workspace.add(p);
     if (change.type === FileChangeType.Created) created = true;
+    if (change.type !== FileChangeType.Changed) structural = true;
     changed.add(p);
   }
   // A newly created file can only matter to a document whose imports did not
@@ -421,9 +423,30 @@ connection.onDidChangeWatchedFiles((params) => {
   // most once per notification: a branch switch delivers many changes at once.
   // A changed std header is rare and reaches documents through any import
   // chain, so every open document is re-checked rather than traced.
-  if (libraryChanged || (created && documents.all().some((doc) => importsMayGainFiles(doc)))) republishAll(true);
-  else for (const p of changed) republishDependents(p, undefined, true);
+  if (libraryChanged || (created && documents.all().some((doc) => importsMayGainFiles(doc)))) {
+    republishAll(true);
+    return;
+  }
+  for (const p of changed) republishDependents(p, undefined, true);
+  if (structural) {
+    // A file appearing or disappearing can change where an import resolves
+    // (a nearer `util.pj` shadows the workspace one; a deleted import now
+    // resolves nowhere). A document without a cached analysis cannot be
+    // checked against its old dependency set, so it is re-checked outright.
+    for (const doc of documents.all()) {
+      const cached = checkCache.get(doc.uri);
+      if (cached && !importsResolveDifferently(doc, cached)) continue;
+      invalidate(doc, true);
+    }
+  }
 });
+
+/** Would resolving the document's imports now reach a file its last analysis did not? */
+function importsResolveDifferently(doc: TextDocument, cached: Analysis): boolean {
+  const resolution = resolveImports(parsedFor(doc).program, safeFileUri(doc.uri), workspace.getRoots(), install?.includeDir);
+  if (resolution.imports.some((entry) => entry.files.length === 0) !== cached.unresolvedImports) return true;
+  return resolution.files.some((file) => !cached.deps.has(path.resolve(file)));
+}
 
 /** Could a file appearing on disk change what this document imports, directly or through a file it reaches? */
 function importsMayGainFiles(doc: TextDocument): boolean {
@@ -761,7 +784,9 @@ function importMirrorsFor(resolution: ImportResolution, ownPath: string | undefi
     if (!first || !resolved.base || resolved.files.length === 0) continue;
     const base = path.resolve(resolved.base);
     if (base === ownDir || (includeDir && (base === includeDir || base.startsWith(includeDir + path.sep)))) continue;
-    if (!mirrors.has(first)) mirrors.set(first, path.join(base, first));
+    // `import util;` resolves to a file, not a package directory: link the file itself.
+    const singleFile = !resolved.import.wildcard && resolved.import.path.length === 1 ? `${first}.pj` : first;
+    if (!mirrors.has(singleFile)) mirrors.set(singleFile, path.join(base, singleFile));
   }
   return [...mirrors].map(([name, target]) => ({ name, target }));
 }

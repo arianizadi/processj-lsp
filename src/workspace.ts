@@ -114,7 +114,7 @@ export class WorkspaceIndex {
       if (abs !== root && !abs.startsWith(root + path.sep)) continue;
       const segments = path.relative(root, abs).split(path.sep);
       const directories = segments.slice(0, -1);
-      if (directories.length > MAX_DEPTH + 1) return false;
+      if (directories.length > MAX_DEPTH) return false;
       return !directories.some((segment) => SKIP_DIRS.has(segment) || segment.startsWith('.'));
     }
     return false;

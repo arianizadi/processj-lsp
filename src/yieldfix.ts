@@ -64,10 +64,15 @@ export function augmentYieldAnnotations(text: string, context?: YieldAnnotationC
       generatedLineLengths: sourceLines.map((line) => line.length),
     },
   });
+  let program = context?.program;
   if (context?.syntaxErrors !== undefined) {
     if (context.syntaxErrors > 0) return identity();
-  } else if (parse(text).errors.length) return identity();
-  const program = context?.program ?? parse(text).program;
+  } else {
+    const parsed = parse(text);
+    if (parsed.errors.length) return identity();
+    program ??= parsed.program;
+  }
+  if (!program) program = parse(text).program;
   const index = context?.index ?? new DeclIndex();
   if (!context) index.addProgram(program);
   const calls = context?.calls ?? check(program, { index, text }).calls;
