@@ -86,7 +86,8 @@ export class WorkspaceIndex {
   startPolling(intervalMs = WorkspaceIndex.POLL_INTERVAL_MS): void {
     if (this.pollTimer) return;
     this.pollTimer = setInterval(() => {
-      if (!this.watched) this.refresh();
+      // The timer is the schedule; the throttle below is for callers that are not.
+      if (!this.watched) this.refresh(true);
     }, intervalMs);
     this.pollTimer.unref?.();
   }
@@ -96,9 +97,13 @@ export class WorkspaceIndex {
     this.pollTimer = undefined;
   }
 
-  /** Make sure the roots have been walked at least once; later changes arrive from the watcher or the poll timer. */
+  /**
+   * Make sure the roots have been walked at least once. Later changes arrive
+   * from the watcher or the poll timer; if that timer is overdue (the event
+   * loop was busy, or nobody started it), the request pays for one poll.
+   */
   ensureIndexed(): void {
-    if (this.lastRefresh === 0) this.refresh();
+    if (this.lastRefresh === 0 || (!this.watched && Date.now() - this.lastRefresh >= WorkspaceIndex.POLL_INTERVAL_MS)) this.refresh();
   }
 
   /** Would a root walk index this path? Watcher events for build output or hidden directories should not. */
@@ -266,9 +271,9 @@ export class WorkspaceIndex {
   }
 
   /** Poll before using dependent analysis, as well as before symbol lookups. */
-  refresh(): void {
+  refresh(force = false): void {
     const now = Date.now();
-    if (this.lastRefresh > 0 && (this.watched || now - this.lastRefresh < WorkspaceIndex.POLL_INTERVAL_MS)) return;
+    if (!force && this.lastRefresh > 0 && (this.watched || now - this.lastRefresh < WorkspaceIndex.POLL_INTERVAL_MS)) return;
     const initialized = this.lastRefresh > 0;
     this.lastRefresh = now;
     const previous = new Map(this.cache);
