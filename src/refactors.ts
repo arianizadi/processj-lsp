@@ -33,6 +33,12 @@ export type RefactorResult = { ok: true; plan: RefactorPlan } | { ok: false; rea
 export interface RefactorOptions {
   /** Declarations imported by the current file. Local declarations always win. */
   index?: DeclIndex;
+  /** Import facts the editor checked the file with, so the planner sees the same errors the user does. */
+  importsStd?: boolean;
+  unresolvedImports?: boolean;
+  stdIndex?: DeclIndex;
+  /** The editor's cached parse and check of exactly `source`, so a code-action request does not repeat them. */
+  current?: { source: string; parsed: ParseResult; checked: CheckResult; index: DeclIndex };
   /** Used only as declaration metadata when constructing the local index. */
   file?: string;
   /** Exact invocations inside reachable imported bodies for transitive yield safety. */
@@ -91,7 +97,9 @@ interface UseEvent {
 interface WalkFacts {
   uses: UseEvent[];
   invocations: A.Invocation[];
-  channelOps: Array<{ variable?: VarInfo; direction: 'read' | 'write'; span: A.Span }>;
+  channelOps: Array<{ variable?: VarInfo; direction: 'read' | 'write'; span: A.Span; conditional: boolean }>;
+  /** Depth of `&&`/`||` right operands and `?:` branches being walked: operations there may not execute. */
+  conditionalDepth: number;
   hasSynchronization: boolean;
   hasOpaqueSynchronization: boolean;
   hasNestedConcurrency: boolean;
@@ -171,12 +179,24 @@ class SourceOffsets {
 }
 
 function makeContext(source: string, options: RefactorOptions): Context | string[] {
-  const parsed = parse(source);
+  const current = options.current?.source === source ? options.current : undefined;
+  const parsed = current?.parsed ?? parse(source);
   const problems = [
     ...parsed.lexIssues.map((issue) => `The source has a lexer error at ${issue.line + 1}:${issue.col + 1}: ${issue.message}`),
     ...parsed.errors.map((error) => `The source has a syntax error at ${error.line + 1}:${error.col + 1}: ${error.message}`),
   ];
   if (problems.length) return problems;
+  if (current) {
+    return {
+      source,
+      parsed,
+      index: current.index,
+      checked: current.checked,
+      yieldCalls: options.yieldCalls,
+      trustedNonBlockingNativeDeclarations: options.trustedNonBlockingNativeDeclarations,
+      offsets: new SourceOffsets(source),
+    };
+  }
   const index = new DeclIndex();
   index.addProgram(parsed.program, options.file);
   if (options.index) index.addIndex(externalDeclarations(options.index, options.file));
@@ -187,6 +207,9 @@ function makeContext(source: string, options: RefactorOptions): Context | string
     checked: check(parsed.program, {
       index,
       text: source,
+      stdIndex: options.stdIndex,
+      importsStd: options.importsStd,
+      unresolvedImports: options.unresolvedImports,
       yieldCalls: options.yieldCalls,
       trustedNonBlockingNativeDeclarations: options.trustedNonBlockingNativeDeclarations,
     }),
@@ -283,7 +306,21 @@ function validateDiagnosticCandidate(ctx: Context, edits: RefactorEdit[], diagno
   return reasons;
 }
 
+const statementListCache = new WeakMap<A.Program, StatementList[]>();
+const declarationSiteCache = new WeakMap<A.Program, Map<A.Ident, DeclSite>>();
+const walkFactsCache = new WeakMap<CheckResult, WalkFacts>();
+const semicolonCache = new WeakMap<ParseResult, Set<string>>();
+
+/** One code-action request asks for every planner; each walks the same tree, so walk it once per parse. */
 function collectStatementLists(program: A.Program): StatementList[] {
+  let lists = statementListCache.get(program);
+  if (lists) return lists;
+  lists = collectStatementListsUncached(program);
+  statementListCache.set(program, lists);
+  return lists;
+}
+
+function collectStatementListsUncached(program: A.Program): StatementList[] {
   const lists: StatementList[] = [];
   for (const declaration of program.decls) {
     if (declaration.kind !== 'ProcDecl' || !declaration.body) continue;
@@ -382,8 +419,14 @@ function collectExpressionBlocks(expression: A.Expr, procedure: A.ProcDecl, flag
 
 /** Some parser productions (notably local declarations) stop just before `;`. */
 function effectiveStatementSpan(ctx: Context, statement: A.Stmt): A.Span {
-  const semicolon = ctx.parsed.tokens.find((token) => token.text === ';' && token.line === statement.span.end.line && token.col === statement.span.end.col);
-  return semicolon ? { start: statement.span.start, end: { line: semicolon.line, col: semicolon.end } } : statement.span;
+  let semicolons = semicolonCache.get(ctx.parsed);
+  if (!semicolons) {
+    semicolons = new Set();
+    for (const token of ctx.parsed.tokens) if (token.text === ';') semicolons.add(`${token.line}:${token.col}`);
+    semicolonCache.set(ctx.parsed, semicolons);
+  }
+  const end = statement.span.end;
+  return semicolons.has(`${end.line}:${end.col}`) ? { start: statement.span.start, end: { line: end.line, col: end.col + 1 } } : statement.span;
 }
 
 function selectStatements(ctx: Context, selection: A.Span): StatementSelection | string[] {
@@ -483,7 +526,7 @@ function forEachChildExpression(expression: A.Expr, visit: (child: A.Expr) => vo
 }
 
 function emptyFacts(): WalkFacts {
-  return { uses: [], invocations: [], channelOps: [], hasSynchronization: false, hasOpaqueSynchronization: false, hasNestedConcurrency: false, hasControlTransfer: false };
+  return { uses: [], invocations: [], channelOps: [], conditionalDepth: 0, hasSynchronization: false, hasOpaqueSynchronization: false, hasNestedConcurrency: false, hasControlTransfer: false };
 }
 
 function factsFor(statements: A.Stmt[], checked: CheckResult): WalkFacts {
@@ -495,7 +538,7 @@ function factsFor(statements: A.Stmt[], checked: CheckResult): WalkFacts {
 function emitName(expression: A.NameExpr, role: UseRole, operation: A.Span, checked: CheckResult, facts: WalkFacts, invocation?: A.Invocation, argumentIndex?: number): void {
   facts.uses.push({ expression, role, operation, invocation, argumentIndex });
   if (role === 'chan-read' || role === 'chan-write' || role === 'chan-end-read' || role === 'chan-end-write') {
-    facts.channelOps.push({ variable: checked.resolutions.get(expression), direction: role.endsWith('read') ? 'read' : 'write', span: operation });
+    facts.channelOps.push({ variable: checked.resolutions.get(expression), direction: role.endsWith('read') ? 'read' : 'write', span: operation, conditional: facts.conditionalDepth > 0 });
   }
 }
 
@@ -596,7 +639,9 @@ function walkExpression(expression: A.Expr, checked: CheckResult, facts: WalkFac
       break;
     case 'BinaryExpr':
       walkExpression(expression.left, checked, facts, invocation, argumentIndex);
+      if (expression.op === '&&' || expression.op === '||') facts.conditionalDepth++;
       walkExpression(expression.right, checked, facts, invocation, argumentIndex);
+      if (expression.op === '&&' || expression.op === '||') facts.conditionalDepth--;
       break;
     case 'UnaryExpr':
       if (expression.op === '++' || expression.op === '--') walkLValue(expression.operand, 'readwrite', expression.span, checked, facts);
@@ -608,8 +653,10 @@ function walkExpression(expression: A.Expr, checked: CheckResult, facts: WalkFac
       break;
     case 'TernaryExpr':
       walkExpression(expression.cond, checked, facts);
+      facts.conditionalDepth++;
       walkExpression(expression.then, checked, facts);
       walkExpression(expression.else, checked, facts);
+      facts.conditionalDepth--;
       break;
     case 'CastExpr':
     case 'IsExpr':
@@ -677,7 +724,7 @@ function walkChannelTarget(target: A.Expr, role: Extract<UseRole, `chan-${string
     walkChannelTarget(target.target, `chan-end-${target.end}`, operation, checked, facts, invocation, argumentIndex);
     return;
   }
-  facts.channelOps.push({ direction: role.endsWith('read') ? 'read' : 'write', span: operation });
+  facts.channelOps.push({ direction: role.endsWith('read') ? 'read' : 'write', span: operation, conditional: facts.conditionalDepth > 0 });
   walkExpression(target, checked, facts, invocation, argumentIndex);
 }
 
@@ -702,6 +749,14 @@ function rootName(expression: A.Expr): A.NameExpr | undefined {
 }
 
 function declarationSites(program: A.Program): Map<A.Ident, DeclSite> {
+  let sites = declarationSiteCache.get(program);
+  if (sites) return sites;
+  sites = declarationSitesUncached(program);
+  declarationSiteCache.set(program, sites);
+  return sites;
+}
+
+function declarationSitesUncached(program: A.Program): Map<A.Ident, DeclSite> {
   const sites = new Map<A.Ident, DeclSite>();
   for (const declaration of program.decls) {
     if (declaration.kind !== 'ProcDecl') continue;
@@ -762,8 +817,11 @@ function allUses(ctx: Context): UseEvent[] {
 }
 
 function allWalkFacts(ctx: Context): WalkFacts {
+  const cached = walkFactsCache.get(ctx.checked);
+  if (cached) return cached;
   const facts = emptyFacts();
   for (const declaration of ctx.parsed.program.decls) if (declaration.kind === 'ProcDecl' && declaration.body) walkStatement(declaration.body, ctx.checked, facts);
+  walkFactsCache.set(ctx.checked, facts);
   return facts;
 }
 
@@ -934,6 +992,9 @@ function proveChannelSchedule(branches: WalkFacts[]): string[] {
   for (const queue of queues) {
     if (queue.some((operation) => !operation.variable || operation.variable.type.k !== 'chan' || !!operation.variable.type.end)) {
       return ['A channel operation uses an unresolved or already-separated endpoint, so a matching peer cannot be proved locally.'];
+    }
+    if (queue.some((operation) => operation.conditional)) {
+      return ['A channel operation runs only on some paths (inside &&, || or ?:), so its rendezvous peer cannot be proved.'];
     }
   }
   const proof = proveAllRendezvousSchedulesComplete(queues, (left, right) => left.variable === right.variable && left.direction !== right.direction);

@@ -112,6 +112,8 @@ public void main(string[] args) {
     capabilities: {
       window: { showDocument: { support: true } },
       textDocument: {
+        documentSymbol: { hierarchicalDocumentSymbolSupport: true },
+        completion: { completionItem: { snippetSupport: true } },
         codeAction: {
           disabledSupport: true,
           codeActionLiteralSupport: {

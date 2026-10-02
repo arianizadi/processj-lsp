@@ -140,6 +140,9 @@ function showGraphPanel(graph: GraphResult, title: string, heading: string): voi
         return;
       }
       if (value.type !== 'open' || typeof value.uri !== 'string' || typeof value.line !== 'number' || typeof value.col !== 'number') return;
+      // Only locations the graph itself carries, with sane coordinates: the webview is not trusted with arbitrary paths.
+      const known = graph.nodes.some((node) => node.source?.uri === value.uri);
+      if (!known || !Number.isInteger(value.line) || !Number.isInteger(value.col) || value.line < 0 || value.col < 0) return;
       const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(value.uri));
       const target = await vscode.window.showTextDocument(document, { preview: false, preserveFocus: false });
       const position = new vscode.Position(value.line, value.col);
@@ -259,7 +262,7 @@ function graphHtml(webview: vscode.Webview, graph: GraphResult, title: string, h
     cards.push('<div class="stats">' + stat('nodes', model.nodes.length) + stat('edges', model.edges.length) + stat(protocolView ? 'cases' : 'channels', model.nodes.filter(n=>n.kind===(protocolView?'case':'channel')).length) + stat(protocolView ? 'issues' : 'deadlocks', protocolView ? (model.notices||[]).length : model.deadlocks.length) + '</div>');
     cards.push('<h2>' + (protocolView ? 'Coverage and collisions' : 'Confirmed deadlocks') + '</h2>');
     if (protocolView) { if (!(model.notices||[]).length) cards.push('<div class="empty">No protocol coverage or collision issues.</div>'); for (const notice of model.notices||[]) cards.push('<div class="card '+(notice.severity==='error'?'danger':'')+'"><strong>'+escapeText(notice.title)+'</strong><br>'+escapeText(notice.detail)+'</div>'); }
-    else { if (!model.deadlocks.length) cards.push('<div class="empty">None in the exact straight-line model.</div>'); for (const finding of model.deadlocks) cards.push('<div class="card danger"><strong>' + (finding.cause === 'circular-wait' ? 'Circular wait' : 'Missing peer') + '</strong><br>' + finding.waits.map(w => 'branch ' + w.branch + ' waits to ' + w.operation).join(' · ') + '</div>'); }
+    else { if (!model.deadlocks.length) cards.push('<div class="empty">None in the exact straight-line model.</div>'); for (const finding of model.deadlocks) cards.push('<div class="card danger"><strong>' + escapeText(finding.cause === 'circular-wait' ? 'Circular wait' : 'Missing peer') + '</strong><br>' + finding.waits.map(w => 'branch ' + escapeText(w.branch) + ' waits to ' + escapeText(w.operation)).join(' · ') + '</div>'); }
     cards.push('<h2>' + (protocolView ? 'Observed flow' : 'Procedure effects') + '</h2>');
     for (const [id, facts] of Object.entries(model.procedureEffects)) { const node = model.nodes.find(n=>n.id===id); cards.push('<div class="card"><strong>' + escapeText(node?.label || id) + '</strong><br>' + facts.map(f=>'<span class="pill">'+escapeText(f.label)+(f.confidence==='exact'?'':' · partial')+'</span>').join('') + '</div>'); }
     details.innerHTML = cards.join('');

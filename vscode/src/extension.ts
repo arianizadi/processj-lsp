@@ -191,7 +191,9 @@ function isFile(file: string): boolean {
 }
 
 async function restartClient(context: vscode.ExtensionContext, recreate: boolean): Promise<boolean> {
-  if (recreate || !client) {
+  // LanguageClient.restart() only works from the Running state: after a failed
+  // start it rethrows the cached failure forever, so start a fresh client instead.
+  if (recreate || !client || client.state !== State.Running) {
     clientStateSubscription?.dispose();
     clientStateSubscription = undefined;
     const current = client;

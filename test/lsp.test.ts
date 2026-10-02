@@ -180,6 +180,18 @@ public void other() {
   });
   assert.equal(invalidRename.result, undefined);
   assert.match(invalidRename.error?.message ?? '', /'while' is a reserved word/, 'a refused rename explains itself');
+
+  // A top-level rename must not be captured by a local in a procedure that uses the symbol.
+  const constUri = pathToFileURL(path.join(root, 'consts.pj')).toString();
+  client.notify('textDocument/didOpen', { textDocument: { uri: constUri, languageId: 'processj', version: 1, text: 'const int COUNT = 1;\npublic int demo() { int value = 2; return COUNT + value; }\npublic int fine() { return COUNT; }\n' } });
+  await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === constUri);
+  const capturedRename = await client.request('textDocument/rename', { textDocument: { uri: constUri }, position: { line: 0, character: 11 }, newName: 'value' });
+  assert.match(capturedRename.error?.message ?? '', /declares a variable named 'value'/, 'renaming COUNT to value would change what demo returns');
+  const collidingRename = await client.request('textDocument/rename', { textDocument: { uri: constUri }, position: { line: 0, character: 11 }, newName: 'demo' });
+  assert.match(collidingRename.error?.message ?? '', /already declared/, 'renaming onto another top-level declaration is refused');
+  const safeRename = await client.request('textDocument/rename', { textDocument: { uri: constUri }, position: { line: 0, character: 11 }, newName: 'TOTAL' });
+  assert.equal(safeRename.error, undefined);
+  assert.deepEqual(safeRename.result.changes[constUri].map((edit: any) => edit.range.start.line), [0, 1, 2]);
   const malformedRename = await client.request('textDocument/rename', {
     textDocument: { uri },
     position: { line: 4, character: 10 },

@@ -37,6 +37,7 @@ import {
   ResponseError,
   SignatureHelp,
   SignatureInformation,
+  SymbolInformation,
   SymbolKind,
   TextDocuments,
   TextDocumentSyncKind,
@@ -92,7 +93,7 @@ import { extractLocals, extractSymbols, wordAt, type PJSymbol } from './symbols'
 import { WorkspaceIndex } from './workspace';
 import { LatestTaskQueue } from './taskqueue';
 import type { Token } from './tokens';
-import { planChannelDiagnostic, planExtractProcedure, planRunInPar, type RefactorPlan, type RefactorResult } from './refactors';
+import { planChannelDiagnostic, planExtractProcedure, planRunInPar, type RefactorOptions, type RefactorPlan, type RefactorResult } from './refactors';
 
 const COMMAND_RUN = 'processj.run';
 const COMMAND_BUILD = 'processj.build';
@@ -120,6 +121,8 @@ let clientSupportsCodeActionLiterals = false;
 let clientSupportsDisabledCodeActions = false;
 let clientSupportsInlayHintRefresh = false;
 let clientSupportsCodeLensRefresh = false;
+let clientSupportsHierarchicalSymbols = false;
+let clientSupportsSnippets = false;
 let install: Install | undefined;
 let installError: string | undefined;
 let library: LibrarySymbol[] = [];
@@ -190,15 +193,10 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
   clientSupportsDisabledCodeActions = !!params.capabilities.textDocument?.codeAction?.disabledSupport;
   clientSupportsInlayHintRefresh = !!params.capabilities.workspace?.inlayHint?.refreshSupport;
   clientSupportsCodeLensRefresh = !!params.capabilities.workspace?.codeLens?.refreshSupport;
+  clientSupportsHierarchicalSymbols = !!params.capabilities.textDocument?.documentSymbol?.hierarchicalDocumentSymbolSupport;
+  clientSupportsSnippets = !!params.capabilities.textDocument?.completion?.completionItem?.snippetSupport;
 
-  const found = findInstall({ installDir: settings.installDir, javaBin: settings.javaBin });
-  if ('error' in found) {
-    installError = found.error;
-  } else {
-    install = found;
-    library = indexLibrary(install.includeDir);
-    loadLibrary(install.includeDir);
-  }
+  configureInstall();
 
   const roots = (params.workspaceFolders ?? [])
     .map((f) => safeFileUri(f.uri))
@@ -240,6 +238,54 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
     },
     serverInfo: { name: 'processj-lsp', version: SERVER_VERSION },
   };
+});
+
+/** Locate the ProcessJ install for the current settings and (re)load its library headers. */
+function configureInstall(): void {
+  install = undefined;
+  installError = undefined;
+  library = [];
+  libraryPrograms.clear();
+  libraryFiles.clear();
+  stdIndex = new DeclIndex();
+  trustedNonBlockingNativeDeclarations.clear();
+  const found = findInstall({ installDir: settings.installDir, javaBin: settings.javaBin });
+  if ('error' in found) {
+    installError = found.error;
+    return;
+  }
+  install = found;
+  library = indexLibrary(install.includeDir);
+  loadLibrary(install.includeDir);
+}
+
+/**
+ * Clients that push settings (Neovim's `settings`, any client with
+ * `synchronize.configurationSection`) send them here rather than through
+ * initializationOptions. Only known keys are read; the rest keep their value.
+ */
+connection.onDidChangeConfiguration((params) => {
+  const raw = (params.settings as { processj?: unknown } | null | undefined)?.processj ?? params.settings;
+  if (!raw || typeof raw !== 'object') return;
+  const incoming = raw as Record<string, unknown>;
+  const known = ['installDir', 'javaBin', 'debounceMs', 'timeoutMs', 'checkOnChange', 'runTimeoutMs', 'lint', 'codeLens'].filter((key) => key in incoming);
+  if (known.length === 0) return;
+  const previous = settings;
+  settings = normalizeSettings({ ...previous, ...Object.fromEntries(known.map((key) => [key, incoming[key]])) });
+  const installChanged = settings.installDir !== previous.installDir || settings.javaBin !== previous.javaBin;
+  if (installChanged) {
+    configureInstall();
+    if (install) connection.console.info(`ProcessJ install: ${install.installDir} (java: ${install.javaBin}); ${library.length} library symbols`);
+    else connection.console.error(installError ?? 'ProcessJ install not found');
+  }
+  if (installChanged || settings.lint !== previous.lint) {
+    checkCache.clear();
+    closedAnalysisCache.clear();
+    republishAll(installChanged);
+  } else if (settings.checkOnChange !== previous.checkOnChange || settings.timeoutMs !== previous.timeoutMs) {
+    for (const doc of documents.all()) scheduleCheck(doc, 0);
+  }
+  if (settings.codeLens !== previous.codeLens) connection.console.warn('processj.codeLens is fixed at initialization; restart the server to apply it');
 });
 
 /** Parse every header under the include directory once; `std/` headers also form the std index. */
@@ -885,15 +931,20 @@ connection.onCodeAction((params: CodeActionParams): Array<CodeAction | Command> 
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
   const actions: CodeAction[] = [];
-  let plannerOptions: { file: string | undefined; index: DeclIndex; yieldCalls: ReadonlyMap<A.Invocation, ProcSig>; trustedNonBlockingNativeDeclarations: ReadonlySet<A.ProcDecl> } | undefined;
-  const currentPlannerOptions = () => {
+  let plannerOptions: RefactorOptions | undefined;
+  const currentPlannerOptions = (): RefactorOptions => {
     if (plannerOptions) return plannerOptions;
     const analysis = checkFor(doc);
     return plannerOptions = {
       file: safeFileUri(doc.uri),
       index: analysis.index,
+      importsStd: analysis.importsStd,
+      unresolvedImports: analysis.unresolvedImports,
+      stdIndex,
       yieldCalls: analysis.yieldCalls,
       trustedNonBlockingNativeDeclarations,
+      // The planners re-check candidates, not the current text: reuse the editor's analysis for that.
+      current: { source: doc.getText(), parsed: parsedFor(doc), checked: analysis.checked, index: analysis.index },
     };
   };
   const newline = documentNewline(doc);
@@ -1461,10 +1512,19 @@ connection.onFoldingRanges((params: FoldingRangeParams): FoldingRange[] => {
   return out;
 });
 
-connection.onDocumentSymbol((params: DocumentSymbolParams) => {
+connection.onDocumentSymbol((params: DocumentSymbolParams): DocumentSymbol[] | SymbolInformation[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
-  return symbolsFor(doc).symbols.map((s) => toDocumentSymbol(doc, s));
+  const { symbols } = symbolsFor(doc);
+  if (clientSupportsHierarchicalSymbols) return symbols.map((s) => toDocumentSymbol(doc, s));
+  // A client without hierarchical support would show nothing for a DocumentSymbol tree.
+  const flat: SymbolInformation[] = [];
+  const add = (s: PJSymbol, container?: string) => {
+    flat.push({ name: s.name, kind: symbolKind(s), location: Location.create(doc.uri, Range.create(s.line, s.startCol, s.line, s.endCol)), containerName: container ?? s.container });
+    for (const child of s.children ?? []) add(child, s.name);
+  };
+  for (const s of symbols) add(s);
+  return flat;
 });
 
 /** Binding-aware highlights in the active document. */
@@ -1654,7 +1714,7 @@ connection.onCompletion((params: CompletionParams) => {
       return [
         { label: 'read()', kind: CompletionItemKind.Method, insertText: 'read()', detail: 'long: read the timer clock in milliseconds' },
         { label: 'timeout(when)', kind: CompletionItemKind.Method, insertText: 'timeout($0)', insertTextFormat: InsertTextFormat.Snippet, detail: 'Wait until this absolute millisecond; for a delay write t.read() + ms' },
-      ];
+      ].map((item) => (clientSupportsSnippets ? item : plainTextItem(item)));
     }
     const wanted = t?.k === 'chan' ? (t.end === 'read' ? ['read()'] : t.end === 'write' ? ['write(...)'] : ['read()', 'write(...)', 'read', 'write']) : t?.k === 'prim' && t.name === 'barrier' ? ['sync()', 'resign()'] : undefined;
     if (!wanted) return [];
@@ -1662,7 +1722,7 @@ connection.onCompletion((params: CompletionParams) => {
       if (!wanted.includes(label)) continue;
       items.push({ label, kind: CompletionItemKind.Method, insertText: insert, insertTextFormat: InsertTextFormat.Snippet, detail: doc });
     }
-    return items;
+    return clientSupportsSnippets ? items : items.map(plainTextItem);
   }
 
   const { symbols } = symbolsFor(doc);
@@ -1751,8 +1811,15 @@ connection.onCompletion((params: CompletionParams) => {
   for (const k of KEYWORDS) add({ label: k, kind: CompletionItemKind.Keyword, documentation: KEYWORD_DOCS[k] ? { kind: MarkupKind.Markdown, value: KEYWORD_DOCS[k] } : undefined });
   for (const t of PRIMITIVE_TYPES) add({ label: t, kind: CompletionItemKind.TypeParameter });
   for (const l of LITERALS) add({ label: l, kind: CompletionItemKind.Constant });
-  return { isIncomplete, items };
+  return { isIncomplete, items: clientSupportsSnippets ? items : items.map(plainTextItem) };
 });
+
+/** A client without snippet support would insert `$0` and `${1:name}` literally. */
+function plainTextItem(item: CompletionItem): CompletionItem {
+  if (item.insertTextFormat !== InsertTextFormat.Snippet) return item;
+  const text = (item.insertText ?? item.label).replace(/\$\{\d+:([^}]*)\}/g, '$1').replace(/\$\d+/g, '');
+  return { ...item, insertText: text, insertTextFormat: InsertTextFormat.PlainText };
+}
 
 /** Type of the widest checked expression that ends exactly at `endCol` on `line`. */
 function receiverTypeAt(checked: CheckResult, line: number, endCol: number): Type | undefined {
@@ -2323,10 +2390,59 @@ connection.onRenameRequest((params: RenameParams): WorkspaceEdit | null => {
   }
   const refs = referencesOf(doc, params.position);
   if (!refs) return null;
-  const changes: Record<string, TextEdit[]> = {};
-  for (const loc of refs.locations) (changes[loc.uri] ??= []).push(TextEdit.replace(loc.range, params.newName));
-  return { changes };
+  if (!variable) {
+    const conflict = topLevelRenameConflict(refs.locations, params.newName);
+    if (conflict) throw new ResponseError(ErrorCodes.InvalidParams, `Cannot rename '${refs.name}' to '${params.newName}': ${conflict}`);
+  }
+  const byUri = new Map<string, TextEdit[]>();
+  for (const loc of refs.locations) {
+    let edits = byUri.get(loc.uri);
+    if (!edits) byUri.set(loc.uri, (edits = []));
+    edits.push(TextEdit.replace(loc.range, params.newName));
+  }
+  if (clientSupportsDocumentChanges) {
+    // Versioned where the file is open, so an edit typed meanwhile cannot be clobbered.
+    return { documentChanges: [...byUri].map(([uri, edits]) => ({ textDocument: { uri, version: documents.get(uri)?.version ?? null }, edits })) };
+  }
+  return { changes: Object.fromEntries(byUri) };
 });
+
+/**
+ * Renaming a procedure, record, protocol or constant must not collide with
+ * another top-level declaration visible to an affected file, nor be captured
+ * by a local or parameter of the same name in a procedure that refers to it.
+ */
+function topLevelRenameConflict(locations: Location[], newName: string): string | undefined {
+  const uris = new Set(locations.map((location) => location.uri));
+  for (const uri of uris) {
+    const open = documents.get(uri);
+    let bindings: Bindings | undefined;
+    let program: A.Program | undefined;
+    if (open) {
+      bindings = checkFor(open);
+      program = parsedFor(open).program;
+    } else {
+      const file = safeFileUri(uri);
+      program = file ? workspace.programFor(file) : undefined;
+      if (file && program) bindings = closedBindingsFor(file, program);
+    }
+    if (!bindings || !program) continue;
+    const { index, checked } = bindings;
+    if (index.procs.has(newName) || index.records.has(newName) || index.protocols.has(newName) || index.consts.has(newName)) {
+      return `'${newName}' is already declared (or imported) in ${path.basename(safeFileUri(uri) ?? uri)}`;
+    }
+    const lines = new Set(locations.filter((location) => location.uri === uri).map((location) => location.range.start.line));
+    for (const v of checked.vars) {
+      if (v.name !== newName) continue;
+      const owner = program.decls.find((decl): decl is A.ProcDecl => decl.kind === 'ProcDecl' && decl.name.name === v.proc && decl.span.start.line <= v.decl.span.start.line && v.decl.span.start.line <= decl.span.end.line);
+      if (!owner) return `a variable named '${newName}' exists in ${path.basename(safeFileUri(uri) ?? uri)}`;
+      for (const line of lines) {
+        if (owner.span.start.line <= line && line <= owner.span.end.line) return `'${v.proc}' in ${path.basename(safeFileUri(uri) ?? uri)} declares a variable named '${newName}' that would capture a reference`;
+      }
+    }
+  }
+  return undefined;
+}
 
 connection.onSignatureHelp((params: SignatureHelpParams): SignatureHelp | null => {
   const doc = documents.get(params.textDocument.uri);

@@ -89,7 +89,18 @@ function M.setup(opts)
       if vim.b[args.buf].processj_lsp_attached then return end
       vim.b[args.buf].processj_lsp_attached = true
       local ok, astrolsp = pcall(require, "astrolsp")
-      if ok and type(astrolsp.on_attach) == "function" then astrolsp.on_attach(client, args.buf) end
+      if ok and type(astrolsp.on_attach) == "function" then
+        astrolsp.on_attach(client, args.buf)
+      elseif client:supports_method "textDocument/codeLens" then
+        -- Plain Neovim renders code lenses only when something asks for them.
+        local group = vim.api.nvim_create_augroup("processj_lsp_codelens_" .. args.buf, { clear = true })
+        vim.api.nvim_create_autocmd({ "BufEnter", "CursorHold", "InsertLeave" }, {
+          group = group,
+          buffer = args.buf,
+          callback = function() vim.lsp.codelens.refresh { bufnr = args.buf } end,
+        })
+        vim.lsp.codelens.refresh { bufnr = args.buf }
+      end
     end,
   })
   -- Warn once, on the first .pj buffer, if the build step was skipped.
