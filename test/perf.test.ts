@@ -197,12 +197,19 @@ test('protocol collision discovery ignores unrelated duplicated case names', () 
 
   const analyzeSmall = prepare(250);
   const analyzeLarge = prepare(1500);
-  analyzeSmall();
-  const small = time(analyzeSmall);
-  const large = time(analyzeLarge);
+  // The small run takes a few milliseconds, so one sample is mostly GC and
+  // scheduler noise (especially on a busy CI runner); compare medians instead.
+  const median = (run: () => ReturnType<typeof analyzeLarge>, samples = 5) => {
+    run();
+    const timings = Array.from({ length: samples }, () => time(run));
+    timings.sort((a, b) => a.ms - b.ms);
+    return timings[Math.floor(samples / 2)];
+  };
+  const small = median(analyzeSmall);
+  const large = median(analyzeLarge);
   assert.equal(large.value.collisions.length, 1500, 'the relevant A0/B0 collision was lost');
   assert.ok(large.ms < 750, `unrelated protocol collision analysis took ${large.ms} ms`);
-  assert.ok(large.ms / Math.max(small.ms, 1) < 12, 'unrelated duplicated tags are being rescanned for every multi-parent protocol');
+  assert.ok(large.ms / Math.max(small.ms, 1) < 12, `unrelated duplicated tags are being rescanned for every multi-parent protocol (${large.ms.toFixed(1)} ms vs ${small.ms.toFixed(1)} ms)`);
 });
 
 test('unique-case diamond ladders keep collision analysis memory linear', () => {
