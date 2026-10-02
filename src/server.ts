@@ -768,15 +768,27 @@ connection.languages.semanticTokens.on((params) => {
   return { data: semanticTokens(parsed.program, checked, index, { libraryFiles }) };
 });
 
+/** Channel hints are computed for the whole file once per analysis; hover and every inlay range reuse them. */
+const inlayCache = new WeakMap<CheckResult, ReturnType<typeof channelInlays>>();
+
+function inlaysFor(doc: TextDocument): ReturnType<typeof channelInlays> {
+  const analysis = checkFor(doc);
+  let hints = inlayCache.get(analysis.checked);
+  if (!hints) {
+    hints = channelInlays(parsedFor(doc).program, analysis.checked, analysis.effects);
+    inlayCache.set(analysis.checked, hints);
+  }
+  return hints;
+}
+
 connection.languages.inlayHint.on((params: InlayHintParams): InlayHint[] => {
   const doc = documents.get(params.textDocument.uri);
   if (!doc) return [];
-  const parsed = parsedFor(doc);
-  const analysis = checkFor(doc);
-  return channelInlays(parsed.program, analysis.checked, analysis.effects, {
+  const range: A.Span = {
     start: { line: params.range.start.line, col: params.range.start.character },
     end: { line: params.range.end.line, col: params.range.end.character },
-  }).map((hint) => ({
+  };
+  return inlaysFor(doc).filter((hint) => comparePosition(range.start, hint.position) <= 0 && comparePosition(hint.position, range.end) <= 0).map((hint) => ({
     position: Position.create(hint.position.line, hint.position.col),
     label: hint.label,
     kind: InlayHintKind.Type,
@@ -1824,9 +1836,9 @@ function plainTextItem(item: CompletionItem): CompletionItem {
 /** Type of the widest checked expression that ends exactly at `endCol` on `line`. */
 function receiverTypeAt(checked: CheckResult, line: number, endCol: number): Type | undefined {
   let best: { start: number; type: Type } | undefined;
-  for (const [expr, type] of checked.types) {
+  for (const [expr, type] of typePositionIndex(checked).byLine.get(line) ?? []) {
     const span = expr.span;
-    if (span.end.line !== line || span.end.col !== endCol || span.start.line !== line) continue;
+    if (span.end.col !== endCol) continue;
     if (type.k === 'error' || type.k === 'unknown') continue;
     if (!best || span.start.col < best.start) best = { start: span.start.col, type };
   }
@@ -2138,7 +2150,7 @@ connection.onHover((params: HoverParams): Hover | null => {
   }
   const channel = r.hits.find((hit) => hit.variable?.type.k === 'chan')?.variable;
   if (channel) {
-    const hint = channelInlays(parsedFor(doc).program, analysis.checked, analysis.effects).find((entry) => entry.variable === channel);
+    const hint = inlaysFor(doc).find((entry) => entry.variable === channel);
     if (hint) parts.push(`**Channel topology**\n\n${hint.label.replace(/^\s*⇢\s*/, '')}\n\n${hint.tooltip}`);
   }
   return { contents: { kind: MarkupKind.Markdown, value: parts.join('\n\n---\n\n') } };
@@ -2147,23 +2159,28 @@ connection.onHover((params: HoverParams): Hover | null => {
 /** Type of the smallest expression containing the position, from the checker. */
 const typePositionCache = new WeakMap<CheckResult, { byLine: Map<number, Array<[A.Expr, Type]>>; multiline: Array<[A.Expr, Type]> }>();
 
+/** Single-line typed expressions by line, plus the few multi-line ones, built once per analysis. */
+function typePositionIndex(checked: CheckResult): { byLine: Map<number, Array<[A.Expr, Type]>>; multiline: Array<[A.Expr, Type]> } {
+  let positionIndex = typePositionCache.get(checked);
+  if (positionIndex) return positionIndex;
+  positionIndex = { byLine: new Map(), multiline: [] };
+  for (const entry of checked.types) {
+    const [expr] = entry;
+    if (expr.span.start.line !== expr.span.end.line) {
+      positionIndex.multiline.push(entry);
+      continue;
+    }
+    const line = positionIndex.byLine.get(expr.span.start.line);
+    if (line) line.push(entry);
+    else positionIndex.byLine.set(expr.span.start.line, [entry]);
+  }
+  typePositionCache.set(checked, positionIndex);
+  return positionIndex;
+}
+
 function typeAtPosition(doc: TextDocument, pos: Position): string | undefined {
   const { checked } = checkFor(doc);
-  let positionIndex = typePositionCache.get(checked);
-  if (!positionIndex) {
-    positionIndex = { byLine: new Map(), multiline: [] };
-    for (const entry of checked.types) {
-      const [expr] = entry;
-      if (expr.span.start.line !== expr.span.end.line) {
-        positionIndex.multiline.push(entry);
-        continue;
-      }
-      const line = positionIndex.byLine.get(expr.span.start.line);
-      if (line) line.push(entry);
-      else positionIndex.byLine.set(expr.span.start.line, [entry]);
-    }
-    typePositionCache.set(checked, positionIndex);
-  }
+  const positionIndex = typePositionIndex(checked);
   let best: { size: number; type: string } | undefined;
   const consider = ([e, t]: [A.Expr, Type]): void => {
     const s = e.span;

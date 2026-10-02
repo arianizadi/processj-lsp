@@ -105,7 +105,7 @@ under **Settings → ProcessJ**; no JSON editing or window reload is required.
 - Deadlock findings include the exact blocked operation in every branch. Dashed graph edges and “partial” effect summaries mean the server deliberately retained uncertainty instead of claiming a runtime fact it could not prove.
 - Protocol flow and inferred transitions describe what this source constructs, sends, receives and matches; they are not a session-type promise about every runtime ordering.
 - Files that import each other are re-checked when either changes. Neovim and VS Code push file events;
-  simpler clients fall back to an on-demand workspace refresh at most once every 5 seconds.
+  simpler clients fall back to a background workspace poll every 5 seconds that never delays a request.
 - More: [docs/DETAILS.md](docs/DETAILS.md) covers every feature, the numbers, and how it works.
 
 ## Developing

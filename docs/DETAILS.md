@@ -34,9 +34,9 @@ same problem.
 canonical layout: 4-space indent, braces on the header line, spaces around
 operators, `chan<int>` without inner spaces, one field per line in records,
 protocol cases on one line, short alt bodies inline. Comments are kept, blank lines
-are preserved up to one, and user parentheses are never added or removed. A file
-with syntax errors is left alone (you get a message saying which error to fix
-first). The formatter is idempotent and never changes the parse tree; both are
+are preserved up to one (only where the source really had one), and user parentheses are never added or removed. A file
+with syntax or lexer errors is left alone (you get a message saying which error to fix
+first; printing a tree that skipped an illegal character would delete it). The formatter is idempotent and never changes the parse tree; both are
 checked over the compiler's example corpus in `test/format.test.ts`.
 
 **A type checker.** `src/checker` resolves every name to its declaration and
@@ -205,7 +205,12 @@ the tokens on top of syntax highlighting automatically.
 
 **Cross-file imports.** `import geom.*;` and `import lib.shapes;` resolve to files
 next to the importing file, under the workspace roots, or under the install's
-include directory (which is how `import std.*;` finds the standard library).
+include directory (which is how `import std.*;` finds the standard library). A
+wildcard import takes every `.pj` file under the package directory, sub-directories
+included, exactly as the compiler's `ResolveImports` does. When an import was
+found under a workspace root rather than next to the file, the compiler sandbox
+links that package root in, so compiler diagnostics and Run see the same files
+the checker did.
 Imported declarations are typed, completed, hovered and navigable; an import that
 resolves nowhere gets a warning saying where it looked. Only what a file imports
 is visible to its checker; the workspace index is used for navigation and
@@ -234,7 +239,10 @@ ambiguous fields, cases, recovery-only symbols, and qualified-name cases fail
 closed instead of risking an unrelated rename. Fuzzy workspace-symbol search,
 document outline, and folding complete the navigation surface.
 Local and parameter renames reject duplicate declarations and changes that would
-make either renamed references or existing references bind to another variable.
+make either renamed references or existing references bind to another variable;
+renaming a procedure, record, protocol or constant is refused when the new name
+is already declared in an affected file or a local in a procedure that uses it
+would capture a reference.
 
 **Examples.** `examples/` holds one short program per diagnostic (and two clean
 ones); each announces the codes it produces on its first line and
@@ -265,6 +273,14 @@ requests took 1.79–3.69 ms and returned 278 items / 55.8 KiB with
 `isIncomplete: true`. Before prefix filtering and the 200 auto-import budget,
 the same warm request took 109–123 ms and returned 30,078 items / 6.53 MiB.
 
+Every recursive construct the parser accepts is bounded: statement, block,
+expression and type nesting share one budget, and the depth of the expression
+tree itself is tracked, so a hostile file produces a syntax error instead of a
+stack overflow in a later pass. An analysis failure of any other kind is reported
+as one diagnostic rather than taking the server down. On shutdown the server
+disposes its compiler queue, kills every JVM it started (as a process group, so
+nothing a wrapper spawned survives), and removes its report directory.
+
 The server caches parsing, checking, symbols and semantic inputs per document
 version, computes effects/protocols once per version, builds the visual graph only
 on request, coalesces lint bursts into one pass, and routes real-compiler JVM work
@@ -284,13 +300,18 @@ When the editor supports dynamic file watching (Neovim and the bundled VS Code
 extension do), the server registers one `**/*.pj` watcher and the editor pushes
 changes; there is no polling or duplicate client-side watcher. A changed file
 re-checks only open documents whose direct or analyzed transitive imports include
-it. For a simpler LSP client without
-watcher support, a lookup may refresh the workspace at most once every 5 seconds;
-changed files invalidate dependent analysis and compiler diagnostics, including
-when the importing buffer has not been edited. Added or removed files also
-refresh unresolved and wildcard imports. Unchanged polls do not schedule checks;
-the fallback walk is depth/file bounded and never treats a home directory or
-filesystem root as a project.
+it. Watcher events for build output, hidden directories or anything else a root
+walk would skip are not indexed. A created file re-checks every open document only
+when one of them has a wildcard or unresolved import it could satisfy; a deleted or
+changed file reaches exactly its dependents. A changed standard-library header is
+re-read. For a simpler LSP client without watcher support, a background timer
+re-walks the roots every 5 seconds; no hover, completion or lint request ever pays
+for the directory scan itself. Changed files invalidate dependent analysis and
+compiler diagnostics, including when the importing buffer has not been edited.
+Unchanged polls do not schedule checks; the walk is depth, file and directory
+bounded, never treats a home directory or filesystem root as a project, and keeps
+import dependencies it loaded from outside the roots instead of mistaking them
+for deleted files.
 
 ## Setup
 
@@ -400,7 +421,10 @@ found and how long each compile took.
 
 ## Options
 
-Pass these as `init_options` / `initializationOptions`:
+Pass these as `init_options` / `initializationOptions`. A client that pushes
+settings instead (Neovim's `settings`, or a `processj` configuration section sent
+with `workspace/didChangeConfiguration`) is honoured too, including a changed
+install directory; only `codeLens` needs a restart because it is a capability.
 
 | option          | default | meaning                                                   |
 | --------------- | ------- | --------------------------------------------------------- |
