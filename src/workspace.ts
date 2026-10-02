@@ -56,6 +56,8 @@ export class WorkspaceIndex {
   private roots: string[] = [];
   private lastRefresh = 0;
   private pollTimer: ReturnType<typeof setInterval> | undefined;
+  /** Files an on-demand lookup re-read since the last poll; the poll must still report them as changed. */
+  private readonly changedSincePoll = new Set<string>();
   /**
    * Without editor file-watch notifications the directory walk is repeated at most
    * this often (only on lookups that need it). With notifications it runs once.
@@ -254,6 +256,7 @@ export class WorkspaceIndex {
         else occurrences.set(token.text, [token.line, token.col, token.end]);
       }
       const entry: Entry = { discovered: cached?.discovered ?? false, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size, program: parsed.program, symbols: astSymbols(parsed).symbols, occurrences };
+      if (cached) this.changedSincePoll.add(abs);
       this.replaceEntry(abs, entry);
       return entry;
     } catch {
@@ -280,7 +283,8 @@ export class WorkspaceIndex {
       if (entry.discovered) this.deleteEntry(file);
       else this.entryFor(file);
     }
-    const changed = new Set<string>();
+    const changed = new Set<string>(this.changedSincePoll);
+    this.changedSincePoll.clear();
     let structureChanged = false;
     for (const [file, entry] of this.cache) {
       if (previous.get(file) !== entry) changed.add(file);

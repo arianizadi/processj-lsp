@@ -183,13 +183,14 @@ public void other() {
 
   // A top-level rename must not be captured by a local in a procedure that uses the symbol.
   const constUri = pathToFileURL(path.join(root, 'consts.pj')).toString();
-  client.notify('textDocument/didOpen', { textDocument: { uri: constUri, languageId: 'processj', version: 1, text: 'const int COUNT = 1;\npublic int demo() { int value = 2; return COUNT + value; }\npublic int fine() { return COUNT; }\n' } });
+  client.notify('textDocument/didOpen', { textDocument: { uri: constUri, languageId: 'processj', version: 1, text: 'const int COUNT = 1;\npublic int demo() { int value = 2; return COUNT + value; }\npublic int fine() { { int total = 2; } return COUNT; }\n' } });
   await client.waitFor('textDocument/publishDiagnostics', (message) => message.params?.uri === constUri);
   const capturedRename = await client.request('textDocument/rename', { textDocument: { uri: constUri }, position: { line: 0, character: 11 }, newName: 'value' });
   assert.match(capturedRename.error?.message ?? '', /declares a variable named 'value'/, 'renaming COUNT to value would change what demo returns');
   const collidingRename = await client.request('textDocument/rename', { textDocument: { uri: constUri }, position: { line: 0, character: 11 }, newName: 'demo' });
   assert.match(collidingRename.error?.message ?? '', /already declared/, 'renaming onto another top-level declaration is refused');
-  const safeRename = await client.request('textDocument/rename', { textDocument: { uri: constUri }, position: { line: 0, character: 11 }, newName: 'TOTAL' });
+  // A same-named local whose block ends before the reference is not a capture.
+  const safeRename = await client.request('textDocument/rename', { textDocument: { uri: constUri }, position: { line: 0, character: 11 }, newName: 'total' });
   assert.equal(safeRename.error, undefined);
   assert.deepEqual(safeRename.result.changes[constUri].map((edit: any) => edit.range.start.line), [0, 1, 2]);
   const malformedRename = await client.request('textDocument/rename', {

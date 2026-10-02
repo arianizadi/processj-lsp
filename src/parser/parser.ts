@@ -1715,9 +1715,25 @@ class Parser {
       if (this.i === before) this.next();
     }
     if (!this.expect('}', `to close the 'new ${typeName.name} {' literal`)) {
-      // Consume the literal's own brace so the enclosing block does not take it as its end.
-      this.skipTo(['}', ';']);
-      this.accept('}');
+      // Consume the literal's own brace so the enclosing block does not take it
+      // as its end, but never run past the next declaration: an unfinished
+      // literal above `void g() { ... }` must leave `g` intact.
+      let depth = 0;
+      while (!this.atEof()) {
+        if (depth === 0 && this.atUnindentedDeclaration()) break;
+        const t = this.peek();
+        if (t.kind === 'punct') {
+          if (t.text === '{' || t.text === '(' || t.text === '[') depth++;
+          else if (t.text === '}' || t.text === ')' || t.text === ']') {
+            if (depth === 0) {
+              if (t.text === '}') this.next();
+              break;
+            }
+            depth--;
+          } else if (depth === 0 && t.text === ';') break;
+        }
+        this.next();
+      }
     }
     if (tag) return { kind: 'ProtocolLiteral', typeName, tag, fields, span: this.span(start) };
     return { kind: 'RecordLiteral', typeName, fields, span: this.span(start) };

@@ -1012,7 +1012,7 @@ class Checker {
           if (!isLenient(t) && !isLenient(lt) && !assignable(t, lt, this.index)) this.error(l.span, 'pj/type/switch', `Case value of type ${typeStr(lt)} does not match the switch expression (${typeStr(t)})`);
           // Dedupe on the label's spelling: exprText falls back to a constant
           // description for `-1`, `A + 1`, ..., which would make them all collide.
-          const key = (this.slice(l.span) ?? exprText(l)).replace(/\s+/g, '');
+          const key = l.kind === 'Literal' ? `${l.litKind}:${l.text}` : (this.slice(l.span) ?? exprText(l)).replace(/\s+/g, '');
           if (seenLabels.has(key)) this.error(l.span, 'pj/type/switch', `Duplicate case ${this.slice(l.span)?.trim() || exprText(l)}`);
           seenLabels.add(key);
         }
@@ -1917,11 +1917,12 @@ class Checker {
 
   private assign(e: A.AssignExpr): Type {
     const lt = this.lvalue(e.target);
-    if (e.target.kind === 'NameExpr') {
-      // A protocol variable proven to hold one case may hold any case after it is reassigned.
-      const reassigned = this.resolutions.get(e.target);
+    // A protocol variable proven to hold one case may hold any case after it is
+    // reassigned. The old value is still live while the right side is checked.
+    const reassigned = e.target.kind === 'NameExpr' ? this.resolutions.get(e.target) : undefined;
+    const forgetNarrowing = () => {
       if (reassigned) this.activeCase.delete(reassigned);
-    }
+    };
     this.noteNull(e.value);
     if (e.target.kind === 'ArrayAccess') {
       // Reading into an index is fine on the right of an assignment; only the
@@ -1934,9 +1935,11 @@ class Checker {
     }
     if (e.value.kind === 'ArrayLiteral') {
       this.arrayLiteral(e.value, lt, exprText(e.target));
+      forgetNarrowing();
       return lt;
     }
     const rt = this.expr(e.value);
+    forgetNarrowing();
     if (e.op === '=') {
       if (!this.assignableExpr(lt, rt, e.value)) this.error(e.span, 'pj/type/assign', `Cannot assign ${typeStr(rt)} to '${exprText(e.target)}' (${typeStr(lt)})${why(lt, rt)}`);
       return lt;

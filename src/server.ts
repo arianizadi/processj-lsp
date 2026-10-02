@@ -397,13 +397,17 @@ documents.onDidChangeContent((e) => {
 
 connection.onDidChangeWatchedFiles((params) => {
   let created = false;
+  let libraryChanged = false;
   const changed = new Set<string>();
   for (const change of params.changes) {
     const p = safeFileUri(change.uri);
     if (!p || !p.endsWith('.pj')) continue;
     workspace.invalidate(p);
     closedAnalysisCache.clear();
-    if (libraryFiles.has(path.resolve(p))) reloadLibraryFile(path.resolve(p));
+    if (libraryFiles.has(path.resolve(p))) {
+      reloadLibraryFile(path.resolve(p));
+      libraryChanged = true;
+    }
     // Keep the saved disk snapshot current even while the document is open.
     // Lookups overlay the editor buffer until close. The glob also reports build
     // output and hidden directories, which a root walk would never index.
@@ -415,17 +419,29 @@ connection.onDidChangeWatchedFiles((params) => {
   // all resolve or that imports a whole package. Everything else, including a
   // deletion, reaches exactly the documents that depend on the path. Refresh at
   // most once per notification: a branch switch delivers many changes at once.
-  if (created && documents.all().some((doc) => importsMayGainFiles(doc))) republishAll(true);
+  // A changed std header is rare and reaches documents through any import
+  // chain, so every open document is re-checked rather than traced.
+  if (libraryChanged || (created && documents.all().some((doc) => importsMayGainFiles(doc)))) republishAll(true);
   else for (const p of changed) republishDependents(p, undefined, true);
 });
 
-/** Could a file appearing on disk change what this document imports? */
+/** Could a file appearing on disk change what this document imports, directly or through a file it reaches? */
 function importsMayGainFiles(doc: TextDocument): boolean {
+  const ownPath = safeFileUri(doc.uri);
   const cached = checkCache.get(doc.uri);
-  if (cached) return cached.unresolvedImports || parsedFor(doc).program.imports.some((entry) => entry.wildcard);
-  const program = parsedFor(doc).program;
-  if (program.imports.some((entry) => entry.wildcard)) return true;
-  return resolveImports(program, safeFileUri(doc.uri), workspace.getRoots(), install?.includeDir).imports.some((entry) => entry.files.length === 0);
+  const gains = (program: A.Program, file: string | undefined, unresolved?: boolean): boolean => {
+    if (program.imports.some((entry) => entry.wildcard)) return true;
+    if (unresolved !== undefined) return unresolved;
+    return resolveImports(program, file, workspace.getRoots(), install?.includeDir).imports.some((entry) => entry.files.length === 0);
+  };
+  if (gains(parsedFor(doc).program, ownPath, cached?.unresolvedImports)) return true;
+  // Imported files have imports of their own (`helper` importing `workers.*`).
+  for (const dependency of cached?.deps ?? []) {
+    if (libraryFiles.has(dependency)) continue;
+    const source = analysisSourceForPath(dependency);
+    if (source && gains(source.program, dependency)) return true;
+  }
+  return false;
 }
 
 /** A standard-library header changed on disk: re-read it so hover, completion and the std index follow. */
@@ -441,7 +457,6 @@ function reloadLibraryFile(file: string): void {
   stdIndex = new DeclIndex();
   trustedNonBlockingNativeDeclarations.clear();
   for (const [headerPath, program] of libraryPrograms) registerStdHeader(headerPath, program);
-  checkCache.clear();
 }
 
 /** Re-lint every open document whose imports include `changedPath`. */
@@ -788,7 +803,7 @@ connection.languages.inlayHint.on((params: InlayHintParams): InlayHint[] => {
     start: { line: params.range.start.line, col: params.range.start.character },
     end: { line: params.range.end.line, col: params.range.end.character },
   };
-  return inlaysFor(doc).filter((hint) => comparePosition(range.start, hint.position) <= 0 && comparePosition(hint.position, range.end) <= 0).map((hint) => ({
+  return inlaysFor(doc).filter((hint) => comparePosition(range.start, hint.position) <= 0 && comparePosition(hint.position, range.end) < 0).map((hint) => ({
     position: Position.create(hint.position.line, hint.position.col),
     label: hint.label,
     kind: InlayHintKind.Type,
@@ -2448,14 +2463,12 @@ function topLevelRenameConflict(locations: Location[], newName: string): string 
     if (index.procs.has(newName) || index.records.has(newName) || index.protocols.has(newName) || index.consts.has(newName)) {
       return `'${newName}' is already declared (or imported) in ${path.basename(safeFileUri(uri) ?? uri)}`;
     }
-    const lines = new Set(locations.filter((location) => location.uri === uri).map((location) => location.range.start.line));
-    for (const v of checked.vars) {
-      if (v.name !== newName) continue;
-      const owner = program.decls.find((decl): decl is A.ProcDecl => decl.kind === 'ProcDecl' && decl.name.name === v.proc && decl.span.start.line <= v.decl.span.start.line && v.decl.span.start.line <= decl.span.end.line);
-      if (!owner) return `a variable named '${newName}' exists in ${path.basename(safeFileUri(uri) ?? uri)}`;
-      for (const line of lines) {
-        if (owner.span.start.line <= line && line <= owner.span.end.line) return `'${v.proc}' in ${path.basename(safeFileUri(uri) ?? uri)} declares a variable named '${newName}' that would capture a reference`;
-      }
+    // Only a variable in scope at a reference captures it; the same name in
+    // another block or procedure is harmless.
+    for (const location of locations) {
+      if (location.uri !== uri) continue;
+      const capturing = visibleVariables(program, checked, location.range.start).find((v) => v.name === newName);
+      if (capturing) return `'${capturing.proc}' in ${path.basename(safeFileUri(uri) ?? uri)} declares a variable named '${newName}' that would capture the reference on line ${location.range.start.line + 1}`;
     }
   }
   return undefined;
