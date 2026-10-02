@@ -42,66 +42,103 @@ export interface ConstInfo {
 }
 
 export class DeclIndex {
-  readonly procs = new Map<string, ProcSig[]>();
-  readonly records = new Map<string, RecordInfo>();
-  readonly protocols = new Map<string, ProtocolInfo>();
-  readonly consts = new Map<string, ConstInfo>();
+  private readonly _procs = new Map<string, ProcSig[]>();
+  private readonly _records = new Map<string, RecordInfo>();
+  private readonly _protocols = new Map<string, ProtocolInfo>();
+  private readonly _consts = new Map<string, ConstInfo>();
   readonly externs = new Set<string>();
+  /**
+   * Programs whose member types still have to be resolved. Names are registered
+   * as soon as a program is added, but a parameter, field, case or constant type
+   * may name a record from a program added later (the current file is added
+   * before its imports), so resolution waits until something reads the index.
+   */
+  private readonly pending: Array<{ program: A.Program; file?: string }> = [];
   private readonly recordFieldCache = new Map<string, Map<string, Type>>();
   private readonly protocolCaseCache = new Map<string, Map<string, Map<string, Type>>>();
   private readonly extendsCache = new Map<string, boolean>();
 
+  get procs(): Map<string, ProcSig[]> {
+    this.finalize();
+    return this._procs;
+  }
+
+  get records(): Map<string, RecordInfo> {
+    this.finalize();
+    return this._records;
+  }
+
+  get protocols(): Map<string, ProtocolInfo> {
+    this.finalize();
+    return this._protocols;
+  }
+
+  get consts(): Map<string, ConstInfo> {
+    this.finalize();
+    return this._consts;
+  }
+
   /** Add every declaration of a parsed program. Existing entries win over later ones (nearest scope first). */
   addProgram(p: A.Program, file?: string): void {
     this.invalidateDerived();
-    // Two passes: names first so field/param types can refer to records declared later in the file.
+    // Names first, so member types can refer to records declared later in this
+    // file or in a program that is added after it.
     for (const d of p.decls) {
-      if (d.kind === 'RecordDecl' && !this.records.has(d.name.name)) this.records.set(d.name.name, { name: d.name.name, fields: new Map(), extends: d.extends.map(identToString), decl: d, file });
-      else if (d.kind === 'ProtocolDecl' && !this.protocols.has(d.name.name)) this.protocols.set(d.name.name, { name: d.name.name, cases: new Map(), extends: d.extends.map(identToString), decl: d, file });
+      if (d.kind === 'RecordDecl' && !this._records.has(d.name.name)) this._records.set(d.name.name, { name: d.name.name, fields: new Map(), extends: d.extends.map(identToString), decl: d, file });
+      else if (d.kind === 'ProtocolDecl' && !this._protocols.has(d.name.name)) this._protocols.set(d.name.name, { name: d.name.name, cases: new Map(), extends: d.extends.map(identToString), decl: d, file });
       else if (d.kind === 'ExternDecl') this.externs.add(d.name.name);
     }
-    for (const d of p.decls) {
-      switch (d.kind) {
-        case 'RecordDecl': {
-          const info = this.records.get(d.name.name)!;
-          if (info.decl !== d) break;
-          for (const m of d.members) info.fields.set(m.name.name, this.resolve(m.type));
-          break;
-        }
-        case 'ProtocolDecl': {
-          const info = this.protocols.get(d.name.name)!;
-          if (info.decl !== d) break;
-          for (const c of d.cases ?? []) {
-            const fields = new Map<string, Type>();
-            for (const m of c.members) fields.set(m.name.name, this.resolve(m.type));
-            info.cases.set(c.name.name, fields);
+    this.pending.push({ program: p, file });
+  }
+
+  /** Resolve the member types of every program added since the last read, in the order they were added. */
+  private finalize(): void {
+    if (this.pending.length === 0) return;
+    const batch = this.pending.splice(0);
+    for (const { program: p, file } of batch) {
+      for (const d of p.decls) {
+        switch (d.kind) {
+          case 'RecordDecl': {
+            const info = this._records.get(d.name.name)!;
+            if (info.decl !== d) break;
+            for (const m of d.members) info.fields.set(m.name.name, this.resolve(m.type));
+            break;
           }
-          break;
-        }
-        case 'ProcDecl': {
-          const sig: ProcSig = {
-            name: d.name.name,
-            params: d.params.map((x) => this.resolve(x.type)),
-            paramNames: d.params.map((x) => x.name.name),
-            ret: this.resolve(d.returnType),
-            decl: d,
-            file,
-          };
-          const list = this.procs.get(d.name.name);
-          if (!list) this.procs.set(d.name.name, [sig]);
-          else if (!list.some((s) => sameSignature(s, sig))) list.push(sig);
-          break;
-        }
-        case 'ConstDecl':
-          for (const v of d.declarators) {
-            if (this.consts.has(v.name.name)) continue;
-            const base = this.resolve(d.type);
-            const type: Type = v.dims > 0 ? { k: 'array', elem: base.k === 'array' ? base.elem : base, dims: (base.k === 'array' ? base.dims : 0) + v.dims } : base;
-            this.consts.set(v.name.name, { name: v.name.name, type, decl: d, file });
+          case 'ProtocolDecl': {
+            const info = this._protocols.get(d.name.name)!;
+            if (info.decl !== d) break;
+            for (const c of d.cases ?? []) {
+              const fields = new Map<string, Type>();
+              for (const m of c.members) fields.set(m.name.name, this.resolve(m.type));
+              info.cases.set(c.name.name, fields);
+            }
+            break;
           }
-          break;
-        default:
-          break;
+          case 'ProcDecl': {
+            const sig: ProcSig = {
+              name: d.name.name,
+              params: d.params.map((x) => this.resolve(x.type)),
+              paramNames: d.params.map((x) => x.name.name),
+              ret: this.resolve(d.returnType),
+              decl: d,
+              file,
+            };
+            const list = this._procs.get(d.name.name);
+            if (!list) this._procs.set(d.name.name, [sig]);
+            else if (!list.some((s) => sameSignature(s, sig))) list.push(sig);
+            break;
+          }
+          case 'ConstDecl':
+            for (const v of d.declarators) {
+              if (this._consts.has(v.name.name)) continue;
+              const base = this.resolve(d.type);
+              const type: Type = v.dims > 0 ? { k: 'array', elem: base.k === 'array' ? base.elem : base, dims: (base.k === 'array' ? base.dims : 0) + v.dims } : base;
+              this._consts.set(v.name.name, { name: v.name.name, type, decl: d, file });
+            }
+            break;
+          default:
+            break;
+        }
       }
     }
   }
@@ -109,14 +146,18 @@ export class DeclIndex {
   /** Merge another index underneath this one (this one's definitions win). */
   addIndex(other: DeclIndex): void {
     this.invalidateDerived();
+    // This index's own pending members must still be resolved before the other
+    // index's names are visible, so they resolve now (names-only mode would be
+    // wrong: a later file does not shadow a declaration the current file saw).
+    this.finalize();
     for (const [name, list] of other.procs) {
-      const mine = this.procs.get(name);
-      if (!mine) this.procs.set(name, [...list]);
+      const mine = this._procs.get(name);
+      if (!mine) this._procs.set(name, [...list]);
       else for (const s of list) if (!mine.some((m) => sameSignature(m, s))) mine.push(s);
     }
-    for (const [n, r] of other.records) if (!this.records.has(n)) this.records.set(n, r);
-    for (const [n, p] of other.protocols) if (!this.protocols.has(n)) this.protocols.set(n, p);
-    for (const [n, c] of other.consts) if (!this.consts.has(n)) this.consts.set(n, c);
+    for (const [n, r] of other.records) if (!this._records.has(n)) this._records.set(n, r);
+    for (const [n, p] of other.protocols) if (!this._protocols.has(n)) this._protocols.set(n, p);
+    for (const [n, c] of other.consts) if (!this._consts.has(n)) this._consts.set(n, c);
     for (const e of other.externs) this.externs.add(e);
   }
 
@@ -128,14 +169,16 @@ export class DeclIndex {
   }
 
   named(name: string): Type {
-    if (this.records.has(name)) return { k: 'record', name };
-    if (this.protocols.has(name)) return { k: 'protocol', name };
+    // Names only: this runs inside finalize(), and a type is known as soon as
+    // its declaration has been added.
+    if (this._records.has(name)) return { k: 'record', name };
+    if (this._protocols.has(name)) return { k: 'protocol', name };
     if (this.externs.has(name)) return { k: 'unknown', name };
     return { k: 'unknown', name };
   }
 
   isKnownType(name: string): boolean {
-    return this.records.has(name) || this.protocols.has(name) || this.externs.has(name);
+    return this._records.has(name) || this._protocols.has(name) || this.externs.has(name);
   }
 
   /** All fields of a record including inherited ones (cycle safe). */
