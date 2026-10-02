@@ -134,10 +134,13 @@ export function parseCompilerOutput(stdout: string, stderr: string): ParsedOutpu
   }
 
   // 3. Legacy Error.java: "file:LINE: message\nError number: N", possibly glued to the next message.
-  const legacy = /([^\s:][^\n:]*?):(\d+): ([^\n]*?)\s*\n\s*(Error|Warning) number: (\d+)/g;
+  // The path may itself contain colons (`D:\src\x.pj`, a directory named
+  // `a:b`), so take everything on the line up to the first `:LINE: `; a number
+  // line glued in front of it by a printer without a trailing newline is dropped.
+  const legacy = /([^\n]+?):(\d+): ([^\n]*?)\s*\n\s*(Error|Warning) number: (\d+)/g;
   for (let m = legacy.exec(text); m; m = legacy.exec(text)) {
     diagnostics.push({
-      file: m[1],
+      file: m[1].replace(/^.*?(?:Error|Warning) number: \d+/, '').trim(),
       line: Number(m[2]) - 1,
       message: m[3].trim(),
       severity: m[4] === 'Warning' ? 'warning' : 'error',

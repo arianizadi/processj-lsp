@@ -25,12 +25,6 @@ const ASSIGN_OPS = new Set(['=', '*=', '/=', '%=', '+=', '-=', '<<=', '>>=', '>>
 const TYPE_KEYWORDS = ['chan', 'shared', ...PRIMITIVE_TYPES];
 /** Expression/statement/block nesting beyond which the parser gives up rather than overflow the stack. */
 const MAX_NESTING = 400;
-/**
- * Operands one binary chain may hold. The chain itself parses iteratively, but it
- * becomes a left-deep tree that every later walker (checker, formatter, effects)
- * recurses down, so a longer chain would overflow their stacks instead.
- */
-const MAX_OPERANDS = 400;
 const TOP_LEVEL_KEYWORDS = ['public', 'private', 'protected', 'native', 'mobile', 'const', 'record', 'protocol', 'extern', 'import', 'package', 'void', ...TYPE_KEYWORDS];
 
 const BINARY_PRECEDENCE: Record<string, number> = {
@@ -139,6 +133,13 @@ class Parser {
   readonly errors: A.ParseError[] = [];
   private lastErrorTok = -1;
   private nesting = 0;
+  /**
+   * Tree depth of the expression most recently returned. The recursion counter
+   * above bounds the parser's own stack, but a binary or member chain parses
+   * iteratively into a left-deep tree that every later walker recurses down, and
+   * parentheses let several chains stack. This bounds the tree instead.
+   */
+  private exprDepth = 1;
   private readonly declaredTypes = new Set<string>();
   private readonly eof: Token;
 
@@ -532,7 +533,7 @@ class Parser {
           let type = this.parseType();
           const pname = this.expectIdent('a parameter name');
           const dims = this.parseDims();
-          if (dims > 0) type = { kind: 'ArrayType', elem: type, dims, span: type.span };
+          if (dims > 0) type = type.kind === 'ArrayType' ? { ...type, dims: type.dims + dims } : { kind: 'ArrayType', elem: type, dims, span: type.span };
           params.push({ kind: 'Param', isConst, type, name: pname, span: this.span(pstart) });
         }
         if (this.accept(',')) continue;
@@ -623,7 +624,7 @@ class Parser {
       for (;;) {
         const fname = this.expectIdent('a field name');
         const dims = this.parseDims();
-        members.push({ kind: 'Field', type: dims > 0 ? { kind: 'ArrayType', elem: type, dims, span: type.span } : type, name: fname, span: this.span(mstart) });
+        members.push({ kind: 'Field', type: dims > 0 ? (type.kind === 'ArrayType' ? { ...type, dims: type.dims + dims } : { kind: 'ArrayType', elem: type, dims, span: type.span }) : type, name: fname, span: this.span(mstart) });
         if (this.accept(',')) continue;
         break;
       }
@@ -1331,9 +1332,12 @@ class Parser {
     const start = this.startPos();
     const cond = this.parseBinary(1);
     if (this.accept('?')) {
+      const condDepth = this.exprDepth;
       const then = this.parseExpression();
+      const thenDepth = this.exprDepth;
       this.expect(':', "in the '?:' expression");
       const els = this.nested(() => this.tooDeepExpr(start), () => this.parseTernary());
+      this.exprDepth = 1 + Math.max(condDepth, thenDepth, this.exprDepth);
       return { kind: 'TernaryExpr', cond, then, else: els, span: this.span(start) };
     }
     return cond;
@@ -1342,26 +1346,30 @@ class Parser {
   private parseBinary(minPrec: number): A.Expr {
     const start = this.startPos();
     let left = this.parseUnary();
-    let operands = 1;
+    let depth = this.exprDepth;
     for (;;) {
       const t = this.peek();
       const op = t.text;
       const prec = (t.kind === 'punct' || (t.kind === 'keyword' && op === 'is')) ? BINARY_PRECEDENCE[op] : undefined;
       if (prec === undefined || prec < minPrec) break;
-      if (++operands > MAX_OPERANDS) {
-        this.error(t, `Expression has more than ${MAX_OPERANDS} operands; split it across several statements`);
-        this.skipTo([';', ',', ')', ']', '}']);
-        return { kind: 'ErrorExpr', span: this.span(start) };
-      }
       this.next();
       if (op === 'is') {
         const typeName = this.parseTypeName("a protocol case name after 'is'");
         left = { kind: 'IsExpr', expr: left, typeName, span: this.span(start) };
-        continue;
+        depth++;
+      } else {
+        const right = this.parseBinary(prec + 1);
+        left = { kind: 'BinaryExpr', op, left, right, span: this.span(start) };
+        depth = 1 + Math.max(depth, this.exprDepth);
       }
-      const right = this.parseBinary(prec + 1);
-      left = { kind: 'BinaryExpr', op, left, right, span: this.span(start) };
+      if (depth > MAX_NESTING) {
+        this.error(t, 'Expression nested too deeply; split it across several statements');
+        this.skipTo([';', ',', ')', ']', '}']);
+        this.exprDepth = 1;
+        return { kind: 'ErrorExpr', span: this.span(start) };
+      }
     }
+    this.exprDepth = depth;
     return left;
   }
 
@@ -1384,6 +1392,7 @@ class Parser {
         } finally {
           this.nesting--;
         }
+        this.exprDepth++;
         return { kind: 'UnaryExpr', op: t.text, prefix: true, operand, span: this.span(start) };
       }
       if (t.text === '(' && this.isCastAhead()) {
@@ -1400,6 +1409,7 @@ class Parser {
         if (type.kind === 'ArrayType') this.error(typeToken, 'Array casts are not accepted by the ProcessJ grammar');
         this.expect(')', 'to close the cast');
         const expr = this.nested(() => this.tooDeepExpr(start), () => this.parseUnary());
+        this.exprDepth++;
         return { kind: 'CastExpr', type, expr, span: this.span(start) };
       }
     }
@@ -1431,13 +1441,17 @@ class Parser {
   private parsePostfix(): A.Expr {
     const start = this.startPos();
     let e = this.parsePrimary();
-    let links = 0;
+    let depth = this.exprDepth;
     for (;;) {
       // Member, index and call chains build a left-deep tree that later walkers recurse down.
-      if ((this.at('.') || this.at('[') || this.at('(')) && ++links > MAX_OPERANDS) {
-        this.error(this.peek(), `Expression chains more than ${MAX_OPERANDS} member accesses, indexes or calls; split it across several statements`);
-        this.skipTo([';', ',', ')', ']', '}']);
-        return { kind: 'ErrorExpr', span: this.span(start) };
+      if (this.at('.') || this.at('[') || this.at('(')) {
+        if (++depth > MAX_NESTING) {
+          this.error(this.peek(), 'Expression nested too deeply; split it across several statements');
+          this.skipTo([';', ',', ')', ']', '}']);
+          this.exprDepth = 1;
+          return { kind: 'ErrorExpr', span: this.span(start) };
+        }
+        this.exprDepth = depth;
       }
       if (this.at('.')) {
         const m = this.peek(1);
@@ -1515,6 +1529,7 @@ class Parser {
       }
       break;
     }
+    this.exprDepth = depth;
     return e;
   }
 
@@ -1540,6 +1555,7 @@ class Parser {
     const start = this.startPos();
     this.next(); // '{'
     const elements: A.Expr[] = [];
+    let depth = 0;
     while (!this.at('}') && !this.atEof()) {
       elements.push(this.at('{')
         ? this.nested(() => {
@@ -1549,6 +1565,7 @@ class Parser {
           return { kind: 'ArrayLiteral', elements: [], span: this.span(inner) } as A.ArrayLiteral;
         }, () => this.parseArrayLiteral())
         : this.parseExpression());
+      depth = Math.max(depth, this.exprDepth);
       if (!this.accept(',')) break;
       if (this.at('}')) {
         this.error(this.peek(), 'Trailing commas are not accepted in an array initializer');
@@ -1556,12 +1573,14 @@ class Parser {
       }
     }
     this.expect('}', 'to close the array initialiser');
+    this.exprDepth = depth + 1;
     return { kind: 'ArrayLiteral', elements, span: this.span(start) };
   }
 
   private parsePrimary(): A.Expr {
     const start = this.startPos();
     const t = this.peek();
+    this.exprDepth = 1;
     switch (t.kind) {
       case 'number': {
         this.next();
@@ -1605,6 +1624,7 @@ class Parser {
           this.next();
           const inner = this.parseExpression();
           this.expect(')', 'to close the parenthesis');
+          this.exprDepth++;
           return { kind: 'ParenExpr', expr: inner, span: this.span(start) };
         }
         break;
@@ -1694,7 +1714,11 @@ class Parser {
       }
       if (this.i === before) this.next();
     }
-    this.expect('}', `to close the 'new ${typeName.name} {' literal`);
+    if (!this.expect('}', `to close the 'new ${typeName.name} {' literal`)) {
+      // Consume the literal's own brace so the enclosing block does not take it as its end.
+      this.skipTo(['}', ';']);
+      this.accept('}');
+    }
     if (tag) return { kind: 'ProtocolLiteral', typeName, tag, fields, span: this.span(start) };
     return { kind: 'RecordLiteral', typeName, fields, span: this.span(start) };
   }

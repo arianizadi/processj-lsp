@@ -66,7 +66,7 @@ export function maskCommentsAndStrings(text: string): string {
     const c = text[i];
     const next = text[i + 1];
     if (c === '/' && next === '/') {
-      while (i < n && text[i] !== '\n') {
+      while (i < n && text[i] !== '\n' && text[i] !== '\r') {
         out += ' ';
         i++;
       }
@@ -74,7 +74,7 @@ export function maskCommentsAndStrings(text: string): string {
       out += '  ';
       i += 2;
       while (i < n && !(text[i] === '*' && text[i + 1] === '/')) {
-        out += text[i] === '\n' ? '\n' : ' ';
+        out += text[i] === '\n' || text[i] === '\r' ? text[i] : ' ';
         i++;
       }
       if (i < n) {
@@ -85,8 +85,15 @@ export function maskCommentsAndStrings(text: string): string {
       const q = c;
       out += q;
       i++;
-      while (i < n && text[i] !== q && text[i] !== '\n') {
+      while (i < n && text[i] !== q && text[i] !== '\n' && text[i] !== '\r') {
         if (text[i] === '\\' && i + 1 < n) {
+          // A backslash right before the line break (an unterminated string
+          // mid-edit): the lexer ends the string there, so this does too.
+          if (text[i + 1] === '\n' || text[i + 1] === '\r') {
+            out += ' ';
+            i++;
+            break;
+          }
           out += '  ';
           i += 2;
         } else {
@@ -165,8 +172,8 @@ function splitParams(raw: string): string[] {
 
 /** Extract top-level declarations (procs, records, protocols, constants) with their members. */
 export function extractSymbols(text: string): PJSymbol[] {
-  const lines = text.split(/\r?\n/);
-  const masked = maskCommentsAndStrings(text).split(/\r?\n/);
+  const lines = text.split(/\r\n|\r|\n/);
+  const masked = maskCommentsAndStrings(text).split(/\r\n|\r|\n/);
   const symbols: PJSymbol[] = [];
 
   for (let l = 0; l < masked.length; l++) {
@@ -268,7 +275,7 @@ export function extractSymbols(text: string): PJSymbol[] {
  */
 export function extractLocals(text: string, procs?: PJSymbol[]): PJSymbol[] {
   const masked = maskCommentsAndStrings(text);
-  const lines = masked.split(/\r?\n/);
+  const lines = masked.split(/\r\n|\r|\n/);
   const symbols = procs ?? extractSymbols(text);
   const containers = symbols.filter((s) => s.kind === 'proc');
   const typeBodies = symbols.filter((s) => s.kind === 'record' || s.kind === 'protocol');

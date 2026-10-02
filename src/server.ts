@@ -792,7 +792,7 @@ async function runCheck(uri: string, signal: AbortSignal): Promise<void> {
   const result = await compile(install, sourcePath, doc.getText(), {
     timeoutMs: settings.timeoutMs,
     signal,
-    yieldContext: { program: parsedFor(doc).program, index: analysis.index, calls: analysis.checked.calls, callProvider: analysis.yieldCallProvider },
+    yieldContext: { program: parsedFor(doc).program, index: analysis.index, calls: analysis.checked.calls, callProvider: analysis.yieldCallProvider, syntaxErrors: parsedFor(doc).errors.length },
     mirrors: analysis.importMirrors,
   });
 
@@ -1278,7 +1278,7 @@ connection.onExecuteCommand(async (params: ExecuteCommandParams, token) => {
     const built = await build(install, sourcePath, doc.getText(), {
       timeoutMs: settings.timeoutMs * 3,
       signal: controller.signal,
-      yieldContext: { program: parsedFor(doc).program, index: analysis.index, calls: analysis.checked.calls, callProvider: analysis.yieldCallProvider },
+      yieldContext: { program: parsedFor(doc).program, index: analysis.index, calls: analysis.checked.calls, callProvider: analysis.yieldCallProvider, syntaxErrors: parsedFor(doc).errors.length },
       mirrors: analysis.importMirrors,
     });
     try {

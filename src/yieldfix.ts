@@ -20,6 +20,8 @@ export interface YieldAnnotationContext {
   calls: ReadonlyMap<A.Invocation, ProcSig>;
   /** Lazily checked imported bodies, each resolved in its own import scope. */
   callProvider?: YieldCallProvider;
+  /** Syntax errors of `program`'s parse; when given, the text is not parsed again. */
+  syntaxErrors?: number;
 }
 
 /** One source edit together with its position in the augmented compiler line. */
@@ -62,9 +64,10 @@ export function augmentYieldAnnotations(text: string, context?: YieldAnnotationC
       generatedLineLengths: sourceLines.map((line) => line.length),
     },
   });
-  const parsed = parse(text);
-  if (parsed.errors.length) return identity();
-  const program = context?.program ?? parsed.program;
+  if (context?.syntaxErrors !== undefined) {
+    if (context.syntaxErrors > 0) return identity();
+  } else if (parse(text).errors.length) return identity();
+  const program = context?.program ?? parse(text).program;
   const index = context?.index ?? new DeclIndex();
   if (!context) index.addProgram(program);
   const calls = context?.calls ?? check(program, { index, text }).calls;

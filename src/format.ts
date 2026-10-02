@@ -24,7 +24,9 @@ export interface FormatResult {
 
 export function format(source: string, opts: FormatOptions = {}): FormatResult {
   const parsed = parse(source);
-  if (parsed.errors.length > 0) return { errors: parsed.errors };
+  // A character the lexer skipped is not in the tree; printing the tree would silently delete it.
+  const lexical: A.ParseError[] = parsed.lexIssues.map((issue) => ({ line: issue.line, col: issue.col, endCol: Math.max(issue.end, issue.col + 1), message: issue.message }));
+  if (lexical.length > 0 || parsed.errors.length > 0) return { errors: [...lexical, ...parsed.errors].sort((a, b) => a.line - b.line || a.col - b.col) };
   const printer = new Printer(source, parsed.comments, opts.indent ?? '    ', opts.maxWidth ?? 100);
   return { text: printer.print(parsed.program), errors: [] };
 }
@@ -35,6 +37,8 @@ class Printer {
   private ci = 0;
   /** Source line of the last thing emitted, for blank-line preservation. */
   private lastSrcLine = -1;
+  /** Lines that hold nothing but whitespace: the only gaps worth keeping. */
+  private readonly blankLines = new Set<number>();
 
   constructor(
     source: string,
@@ -42,7 +46,8 @@ class Printer {
     private readonly indentUnit: string,
     private readonly maxWidth: number,
   ) {
-    void source;
+    const lines = source.split(/\r\n|\r|\n/);
+    for (let i = 0; i < lines.length; i++) if (/^\s*$/.test(lines[i])) this.blankLines.add(i);
     this.comments = [...comments].sort((a, b) => a.line - b.line || a.col - b.col);
   }
 
@@ -63,8 +68,28 @@ class Printer {
   }
 
   /** Insert a blank line if the source had one or more blank lines before `srcLine`. */
+  /**
+   * Keep (one) blank line when the source had one between the last emitted item
+   * and this one. Line arithmetic alone would invent a gap after a header or
+   * label list that this printer spreads over more lines than the source did.
+   */
   private gapBefore(srcLine: number): void {
-    if (this.lastSrcLine >= 0 && srcLine - this.lastSrcLine > 1) this.blank();
+    if (this.lastSrcLine < 0 || srcLine - this.lastSrcLine <= 1) return;
+    for (let line = this.lastSrcLine + 1; line < srcLine; line++) {
+      if (this.blankLines.has(line)) {
+        this.blank();
+        return;
+      }
+    }
+  }
+
+  /** `const`/`mobile` prefixes and the type of a local declaration head. */
+  private localHead(d: A.LocalDecl): string {
+    return `${d.isConst ? 'const ' : ''}${d.isMobile ? 'mobile ' : ''}${typeToString(d.type)}`;
+  }
+
+  private annotations(list: A.ProcDecl['annotations']): string {
+    return list.length ? ` [${list.map((a) => `${a.name} = ${a.value}`).join(', ')}]` : '';
   }
 
   private nextComment(): CommentToken | undefined {
@@ -161,9 +186,8 @@ class Printer {
     switch (d.kind) {
       case 'ProcDecl': {
         const params = d.params.map((p) => `${p.isConst ? 'const ' : ''}${typeToString(p.type)} ${p.name.name}`).join(', ');
-        const ann = d.annotations.length ? ` [${d.annotations.map((a) => `${a.name} = ${a.value}`).join(', ')}]` : '';
         const impl = d.implements.length ? ` implements ${d.implements.map(identToString).join(', ')}` : '';
-        const head = `${this.mods(d.modifiers)}${typeToString(d.returnType)} ${d.name.name}(${params})${ann}${impl}`;
+        const head = `${this.mods(d.modifiers)}${typeToString(d.returnType)} ${d.name.name}(${params})${this.annotations(d.annotations)}${impl}`;
         if (!d.body) {
           this.line(0, `${head};`);
           return;
@@ -174,7 +198,7 @@ class Printer {
       }
       case 'RecordDecl': {
         const ext = d.extends.length ? ` extends ${d.extends.map(identToString).join(', ')}` : '';
-        this.line(0, `${this.mods(d.modifiers)}record ${d.name.name}${ext} {`);
+        this.line(0, `${this.mods(d.modifiers)}record ${d.name.name}${ext}${this.annotations(d.annotations)} {`);
         this.lastSrcLine = d.span.start.line;
         this.fields(d.members, 1, d.span.end);
         this.line(0, '}');
@@ -183,10 +207,10 @@ class Printer {
       case 'ProtocolDecl': {
         const ext = d.extends.length ? ` extends ${d.extends.map(identToString).join(', ')}` : '';
         if (!d.cases) {
-          this.line(0, `${this.mods(d.modifiers)}protocol ${d.name.name}${ext};`);
+          this.line(0, `${this.mods(d.modifiers)}protocol ${d.name.name}${ext}${this.annotations(d.annotations)};`);
           return;
         }
-        this.line(0, `${this.mods(d.modifiers)}protocol ${d.name.name}${ext} {`);
+        this.line(0, `${this.mods(d.modifiers)}protocol ${d.name.name}${ext}${this.annotations(d.annotations)} {`);
         this.lastSrcLine = d.span.start.line;
         for (const c of d.cases) {
           this.flushBefore(c.span.start, 1);
@@ -279,7 +303,7 @@ class Printer {
         this.line(level, ';');
         return;
       case 'LocalDecl':
-        this.line(level, `${s.isConst ? 'const ' : ''}${s.isMobile ? 'mobile ' : ''}${typeToString(s.type)} ${this.declarators(s.declarators, level)};`);
+        this.line(level, `${this.localHead(s)} ${this.declarators(s.declarators, level)};`);
         return;
       case 'ExprStmt':
         this.line(level, `${this.expr(s.expr, level)};`);
@@ -303,7 +327,7 @@ class Printer {
         }
         return;
       case 'ForStmt': {
-        const init = s.init === undefined ? '' : Array.isArray(s.init) ? s.init.map((e) => this.expr(e, level)).join(', ') : `${s.init.isConst ? 'const ' : ''}${typeToString(s.init.type)} ${this.declarators(s.init.declarators, level)}`;
+        const init = s.init === undefined ? '' : Array.isArray(s.init) ? s.init.map((e) => this.expr(e, level)).join(', ') : `${this.localHead(s.init)} ${this.declarators(s.init.declarators, level)}`;
         const cond = s.cond ? ` ${this.expr(s.cond, level)}` : '';
         const update = s.update.length ? ` ${s.update.map((e) => this.expr(e, level)).join(', ')}` : '';
         const enroll = s.enroll.length ? ` enroll (${s.enroll.map((e) => this.expr(e, level)).join(', ')})` : '';
@@ -322,7 +346,7 @@ class Printer {
         this.blockBody(s.body, level);
         return;
       case 'ClaimStmt': {
-        const chans = s.channels.map((c) => (c.kind === 'LocalDecl' ? `${typeToString(c.type)} ${this.declarators(c.declarators, level)}` : this.expr(c, level))).join(', ');
+        const chans = s.channels.map((c) => (c.kind === 'LocalDecl' ? `${this.localHead(c)} ${this.declarators(c.declarators, level)}` : this.expr(c, level))).join(', ');
         this.body(s.body, level, `claim (${chans})`);
         return;
       }
@@ -409,7 +433,7 @@ class Printer {
     let header = s.isPri ? 'pri alt' : 'alt';
     if (s.replicated) {
       const r = s.replicated;
-      const init = r.init === undefined ? '' : Array.isArray(r.init) ? r.init.map((e) => this.expr(e, level)).join(', ') : `${typeToString(r.init.type)} ${this.declarators(r.init.declarators, level)}`;
+      const init = r.init === undefined ? '' : Array.isArray(r.init) ? r.init.map((e) => this.expr(e, level)).join(', ') : `${this.localHead(r.init)} ${this.declarators(r.init.declarators, level)}`;
       header += ` (${init};${r.cond ? ' ' + this.expr(r.cond, level) : ''};${r.update.length ? ' ' + r.update.map((e) => this.expr(e, level)).join(', ') : ''})`;
     }
     this.line(level, `${header} {`);
