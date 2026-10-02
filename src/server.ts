@@ -658,7 +658,16 @@ connection.onRequest('processj/protocolModel', (params: { textDocument?: { uri?:
 
 /** Send the current lints plus the most recent compiler results (if still for this version). */
 function publish(doc: TextDocument): void {
-  const lints = lintDiagnostics(doc);
+  let lints: Diagnostic[];
+  try {
+    lints = lintDiagnostics(doc);
+  } catch (error) {
+    // The publisher runs from a timer, where an uncaught exception would exit
+    // the whole server. Report the failure as a diagnostic instead.
+    const detail = error instanceof Error ? error.message : String(error);
+    connection.console.error(`analysis failed for ${doc.uri}: ${error instanceof Error ? error.stack ?? detail : detail}`);
+    lints = [makeDiagnostic(doc, { line: 0, message: `processj-lsp could not analyze this file (${detail}); details are in the server log`, severity: 'warning', code: 'pj/internal', source: 'lsp' })];
+  }
   const fromCompiler = compilerDiags.get(doc.uri);
   const compiler = fromCompiler && fromCompiler.version === doc.version ? fromCompiler.diagnostics : [];
   connection.sendDiagnostics({ uri: doc.uri, version: doc.version, diagnostics: mergeDiagnostics(lints, compiler) });

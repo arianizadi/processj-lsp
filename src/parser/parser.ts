@@ -23,8 +23,14 @@ const PRIMITIVES = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', '
 const MODIFIERS = new Set(['public', 'private', 'protected', 'native', 'mobile', 'const']);
 const ASSIGN_OPS = new Set(['=', '*=', '/=', '%=', '+=', '-=', '<<=', '>>=', '>>>=', '&=', '^=', '|=']);
 const TYPE_KEYWORDS = ['chan', 'shared', ...PRIMITIVE_TYPES];
-/** Expression/block nesting beyond which the parser gives up rather than overflow the stack. */
+/** Expression/statement/block nesting beyond which the parser gives up rather than overflow the stack. */
 const MAX_NESTING = 400;
+/**
+ * Operands one binary chain may hold. The chain itself parses iteratively, but it
+ * becomes a left-deep tree that every later walker (checker, formatter, effects)
+ * recurses down, so a longer chain would overflow their stacks instead.
+ */
+const MAX_OPERANDS = 400;
 const TOP_LEVEL_KEYWORDS = ['public', 'private', 'protected', 'native', 'mobile', 'const', 'record', 'protocol', 'extern', 'import', 'package', 'void', ...TYPE_KEYWORDS];
 
 const BINARY_PRECEDENCE: Record<string, number> = {
@@ -704,6 +710,16 @@ class Parser {
   }
 
   private parseType(allowVoid = false): A.TypeNode {
+    return this.nested(() => {
+      // `chan<chan<...>>` recurses once per level; stop before the stack does.
+      const t = this.peek();
+      this.error(t, 'Type nested too deeply');
+      this.skipTo([';', ',', ')', '>', '}']);
+      return { kind: 'NamedType', name: { kind: 'Ident', name: '<missing>', span: this.spanOf(t) }, span: this.spanOf(t) } as A.TypeNode;
+    }, () => this.parseTypeInner(allowVoid));
+  }
+
+  private parseTypeInner(allowVoid: boolean): A.TypeNode {
     const start = this.startPos();
     const t = this.peek();
     let base: A.TypeNode;
@@ -807,6 +823,23 @@ class Parser {
   }
 
   private parseStatement(allowDeclaration = false): A.Stmt | undefined {
+    if (this.nesting > MAX_NESTING) {
+      // Deeper than any real program: bail out instead of overflowing the stack.
+      // Skip the rest of the statement, but leave `}` for the enclosing block.
+      this.error(this.peek(), 'Statements nested too deeply');
+      this.skipTo([';', '}']);
+      this.accept(';');
+      return undefined;
+    }
+    this.nesting++;
+    try {
+      return this.parseStatementInner(allowDeclaration);
+    } finally {
+      this.nesting--;
+    }
+  }
+
+  private parseStatementInner(allowDeclaration: boolean): A.Stmt | undefined {
     const start = this.startPos();
     const t = this.peek();
 
@@ -1254,19 +1287,25 @@ class Parser {
   // Expressions
   // -------------------------------------------------------------------------
 
-  private parseExpression(): A.Expr {
-    const start = this.startPos();
-    if (this.nesting > MAX_NESTING) {
-      // Deeper than any real program: bail out instead of overflowing the stack.
-      this.error(this.peek(), 'Expression nested too deeply');
-      return { kind: 'ErrorExpr', span: this.span(start) };
-    }
+  /** Run `parse` one nesting level deeper, or `tooDeep` when the tree is already deeper than any real program. */
+  private nested<T>(tooDeep: () => T, parse: () => T): T {
+    if (this.nesting > MAX_NESTING) return tooDeep();
     this.nesting++;
     try {
-      return this.parseExpressionInner(start);
+      return parse();
     } finally {
       this.nesting--;
     }
+  }
+
+  private tooDeepExpr(start: A.Pos): A.Expr {
+    this.error(this.peek(), 'Expression nested too deeply');
+    return { kind: 'ErrorExpr', span: this.span(start) };
+  }
+
+  private parseExpression(): A.Expr {
+    const start = this.startPos();
+    return this.nested(() => this.tooDeepExpr(start), () => this.parseExpressionInner(start));
   }
 
   private parseExpressionInner(start: A.Pos): A.Expr {
@@ -1294,7 +1333,7 @@ class Parser {
     if (this.accept('?')) {
       const then = this.parseExpression();
       this.expect(':', "in the '?:' expression");
-      const els = this.parseTernary();
+      const els = this.nested(() => this.tooDeepExpr(start), () => this.parseTernary());
       return { kind: 'TernaryExpr', cond, then, else: els, span: this.span(start) };
     }
     return cond;
@@ -1303,11 +1342,17 @@ class Parser {
   private parseBinary(minPrec: number): A.Expr {
     const start = this.startPos();
     let left = this.parseUnary();
+    let operands = 1;
     for (;;) {
       const t = this.peek();
       const op = t.text;
       const prec = (t.kind === 'punct' || (t.kind === 'keyword' && op === 'is')) ? BINARY_PRECEDENCE[op] : undefined;
       if (prec === undefined || prec < minPrec) break;
+      if (++operands > MAX_OPERANDS) {
+        this.error(t, `Expression has more than ${MAX_OPERANDS} operands; split it across several statements`);
+        this.skipTo([';', ',', ')', ']', '}']);
+        return { kind: 'ErrorExpr', span: this.span(start) };
+      }
       this.next();
       if (op === 'is') {
         const typeName = this.parseTypeName("a protocol case name after 'is'");
@@ -1326,7 +1371,19 @@ class Parser {
     if (t.kind === 'punct') {
       if (t.text === '+' || t.text === '-' || t.text === '!' || t.text === '~' || t.text === '++' || t.text === '--') {
         this.next();
-        const operand = this.parseUnary();
+        if (this.nesting > MAX_NESTING) {
+          // A run of prefix operators recurses once per operator; stop before the stack does.
+          this.error(t, 'Expression nested too deeply');
+          while (this.peek().kind === 'punct' && /^(\+|-|!|~|\+\+|--)$/.test(this.peek().text)) this.next();
+          return { kind: 'ErrorExpr', span: this.span(start) };
+        }
+        this.nesting++;
+        let operand: A.Expr;
+        try {
+          operand = this.parseUnary();
+        } finally {
+          this.nesting--;
+        }
         return { kind: 'UnaryExpr', op: t.text, prefix: true, operand, span: this.span(start) };
       }
       if (t.text === '(' && this.isCastAhead()) {
@@ -1342,7 +1399,7 @@ class Parser {
         } else type = this.parseType();
         if (type.kind === 'ArrayType') this.error(typeToken, 'Array casts are not accepted by the ProcessJ grammar');
         this.expect(')', 'to close the cast');
-        const expr = this.parseUnary();
+        const expr = this.nested(() => this.tooDeepExpr(start), () => this.parseUnary());
         return { kind: 'CastExpr', type, expr, span: this.span(start) };
       }
     }
@@ -1374,7 +1431,14 @@ class Parser {
   private parsePostfix(): A.Expr {
     const start = this.startPos();
     let e = this.parsePrimary();
+    let links = 0;
     for (;;) {
+      // Member, index and call chains build a left-deep tree that later walkers recurse down.
+      if ((this.at('.') || this.at('[') || this.at('(')) && ++links > MAX_OPERANDS) {
+        this.error(this.peek(), `Expression chains more than ${MAX_OPERANDS} member accesses, indexes or calls; split it across several statements`);
+        this.skipTo([';', ',', ')', ']', '}']);
+        return { kind: 'ErrorExpr', span: this.span(start) };
+      }
       if (this.at('.')) {
         const m = this.peek(1);
         if (m.kind === 'keyword' && (m.text === 'read' || m.text === 'write')) {
@@ -1477,7 +1541,14 @@ class Parser {
     this.next(); // '{'
     const elements: A.Expr[] = [];
     while (!this.at('}') && !this.atEof()) {
-      elements.push(this.at('{') ? this.parseArrayLiteral() : this.parseExpression());
+      elements.push(this.at('{')
+        ? this.nested(() => {
+          const inner = this.startPos();
+          this.error(this.peek(), 'Array initialiser nested too deeply');
+          this.skipTo(['}'], true);
+          return { kind: 'ArrayLiteral', elements: [], span: this.span(inner) } as A.ArrayLiteral;
+        }, () => this.parseArrayLiteral())
+        : this.parseExpression());
       if (!this.accept(',')) break;
       if (this.at('}')) {
         this.error(this.peek(), 'Trailing commas are not accepted in an array initializer');
