@@ -5,6 +5,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { test } from 'node:test';
+import { findInstall } from '../src/config';
+import { stopServer } from './server-process';
 
 interface Message {
   id?: number;
@@ -20,9 +22,10 @@ class LspClient {
   private readonly waiting = new Map<number, { resolve: (message: Message) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   private readonly notifications: Message[] = [];
   readonly child: ChildProcessWithoutNullStreams;
+  readonly sent = new Set<string>();
 
-  constructor(server: string) {
-    this.child = spawn(process.execPath, [server, '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  constructor(server: string, env?: NodeJS.ProcessEnv) {
+    this.child = spawn(process.execPath, [server, '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'], ...(env ? { env } : {}) });
     this.child.stdout.on('data', (chunk: Buffer) => this.receive(chunk));
     this.child.on('exit', (code, signal) => {
       const detail = this.child.stderr.read()?.toString().trim();
@@ -62,7 +65,14 @@ class LspClient {
     throw new Error(`timed out waiting for ${method}; stderr: ${this.child.stderr.read()?.toString() ?? ''}`);
   }
 
+  /** Shut the server down and wait for it to exit, as an editor does (it removes its sandboxes on the way out). */
+  close(): Promise<void> {
+    return stopServer(this);
+  }
+
   private send(message: unknown): void {
+    const { method } = message as Message;
+    if (method === 'shutdown' || method === 'exit') this.sent.add(method);
     const json = JSON.stringify(message);
     this.child.stdin.write(`Content-Length: ${Buffer.byteLength(json)}\r\n\r\n${json}`);
   }
@@ -107,8 +117,8 @@ test('server publishes lexer diagnostics and keeps completion/rename binding-awa
   fs.writeFileSync(path.join(addedRoot, 'extra.pj'), 'public void fromAddedRoot() { }\n');
   const server = path.join(__dirname, '..', 'src', 'server.js');
   const client = new LspClient(server);
-  t.after(() => {
-    client.child.kill('SIGKILL');
+  t.after(async () => {
+    await client.close();
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(addedRoot, { recursive: true, force: true });
   });
@@ -498,8 +508,8 @@ test('legacy clients without workspace/applyEdit are not offered inert edit comm
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-no-apply-edit-'));
   const server = path.join(__dirname, '..', 'src', 'server.js');
   const client = new LspClient(server);
-  t.after(() => {
-    client.child.kill('SIGKILL');
+  t.after(async () => {
+    await client.close();
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -541,8 +551,8 @@ test('server exposes concurrency, protocol, inlay and refactoring features throu
   fs.writeFileSync(path.join(root, 'helper', 'ops.pj'), 'package helper;\npublic void externalWork() { }\n');
   const server = path.join(__dirname, '..', 'src', 'server.js');
   const client = new LspClient(server);
-  t.after(() => {
-    client.child.kill('SIGKILL');
+  t.after(async () => {
+    await client.close();
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -865,8 +875,8 @@ test('server follows reachable imported bodies for effects, yield overloads and 
 
   const server = path.join(__dirname, '..', 'src', 'server.js');
   const client = new LspClient(server);
-  t.after(() => {
-    client.child.kill('SIGKILL');
+  t.after(async () => {
+    await client.close();
     fs.rmSync(root, { recursive: true, force: true });
   });
   await client.request('initialize', {
@@ -926,8 +936,8 @@ test('protocol transition reports never combine distinct overload bodies', async
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-protocol-overloads-'));
   const server = path.join(__dirname, '..', 'src', 'server.js');
   const client = new LspClient(server);
-  t.after(() => {
-    client.child.kill('SIGKILL');
+  t.after(async () => {
+    await client.close();
     fs.rmSync(root, { recursive: true, force: true });
   });
   await client.request('initialize', {
@@ -978,8 +988,8 @@ test('only install-loaded std output declarations are transparent to exact rende
 
   const server = path.join(__dirname, '..', 'src', 'server.js');
   const clients: LspClient[] = [];
-  t.after(() => {
-    for (const client of clients) client.child.kill('SIGKILL');
+  t.after(async () => {
+    for (const client of clients) await client.close();
     fs.rmSync(base, { recursive: true, force: true });
   });
 
@@ -1024,7 +1034,7 @@ test('only install-loaded std output declarations are transparent to exact rende
 
 test('server refuses a local rename that would capture a reference', async (t) => {
   const client = new LspClient(path.join(__dirname, '..', 'src', 'server.js'));
-  t.after(() => client.child.kill('SIGKILL'));
+  t.after(() => client.close());
   await client.request('initialize', { processId: process.pid, capabilities: {}, initializationOptions: { javaBin: '/missing-pj-test-java' } });
   client.notify('initialized', {});
   const uri = 'untitled:rename.pj';
@@ -1038,7 +1048,10 @@ test('server refuses a local rename that would capture a reference', async (t) =
 test('polling invalidates an unchanged importer after a closed dependency changes', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-lsp-poll-'));
   const client = new LspClient(path.join(__dirname, '..', 'src', 'server.js'));
-  t.after(() => { client.child.kill('SIGKILL'); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => {
+    await client.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   const library = path.join(root, 'lib.pj');
   fs.writeFileSync(library, 'public int helper() { return 1; }');
   await client.request('initialize', { processId: process.pid, rootUri: pathToFileURL(root).toString(), capabilities: {}, initializationOptions: { javaBin: '/missing-pj-test-java' } });
@@ -1056,4 +1069,39 @@ test('polling invalidates an unchanged importer after a closed dependency change
   assert.match((await client.request('textDocument/hover', params)).result.contents.value, /string helper/);
   const diagnostics = await client.waitFor('textDocument/publishDiagnostics', (message) => message.params.uri === uri && message.params.diagnostics.some((d: any) => d.code === 'pj/type/return'));
   assert.equal(diagnostics.params.version, 1, 'the importer was never edited');
+});
+
+const INSTALL = findInstall();
+
+test('a server that ends while its compiler runs leaves no sandbox behind: shut down, or stopped by a signal', { skip: 'error' in INSTALL && 'no ProcessJ install' }, async (t) => {
+  // The servers' own temporary directory, so only their sandboxes are in it.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-lsp-sandboxes-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pj-lsp-sandboxes-src-'));
+  t.after(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const sandboxes = (): string[] => fs.readdirSync(tmp).filter((name) => /^processj-lsp-/.test(name));
+  const server = path.join(__dirname, '..', 'src', 'server.js');
+  const compiling = async (name: string): Promise<LspClient> => {
+    const client = new LspClient(server, { ...process.env, TMPDIR: tmp });
+    t.after(() => client.close());
+    await client.request('initialize', { processId: process.pid, rootUri: pathToFileURL(root).toString(), capabilities: {} });
+    client.notify('initialized', {});
+    const uri = pathToFileURL(path.join(root, name)).toString();
+    client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: 'public void main(string[] args) {\n    int x = 1;\n}\n' } });
+    // Opening a file starts the compiler at once, in a sandbox of its own.
+    for (const deadline = Date.now() + 10_000; !sandboxes().length && Date.now() < deadline;) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(sandboxes().length, 'the compiler run started');
+    return client;
+  };
+
+  await (await compiling('shutdown.pj')).close();
+  assert.deepEqual(sandboxes(), [], 'shut down the LSP way');
+
+  const signalled = await compiling('signal.pj');
+  const gone = new Promise((resolve) => signalled.child.once('exit', resolve));
+  signalled.child.kill('SIGTERM');
+  await gone;
+  assert.deepEqual(sandboxes(), [], 'stopped by SIGTERM');
 });

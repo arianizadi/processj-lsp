@@ -12,9 +12,32 @@ export interface Settings {
   runTimeoutMs: number;
   /** Turn the built-in static analysis on or off. */
   lint: boolean;
-  /** Offer inline Run, Build, effect, graph, and protocol code lenses. */
+  /** Offer inline Run, Build, effect, graph, protocol and FDR code lenses. */
   codeLens: boolean;
+  /** Serve the graph viewer on a loopback-only local web server that follows edits; when off, the viewer is written to a file. */
+  liveViewer: boolean;
+  /** FDR's `refines` (or FDR's install directory); found on PATH and in the usual places when unset. */
+  fdrPath?: string;
+  /** Kill an FDR check after this long. */
+  fdrTimeoutMs: number;
+  /** Kill an FDR check once refines uses more memory than this (MB); 0: half of this machine's memory, at most 8 GB. */
+  fdrMemoryMb: number;
+  /**
+   * refines' BFS workers: with 1 a deadlock or runtime-error counterexample is the same on every run (a
+   * termination or determinism one can still differ: those searches are not this one); 0 uses every core
+   * (faster on big models).
+   */
+  fdrWorkers: number;
+  /**
+   * After Check with FDR, open the graph viewer on the result: when a check
+   * fails (`onFailure`), after every check (`always`), or never (the text
+   * report opens instead, as it also does when the graph is not shown).
+   */
+  fdrShowGraph: FdrShowGraph;
 }
+
+export type FdrShowGraph = 'onFailure' | 'always' | 'never';
+const FDR_SHOW_GRAPH: readonly FdrShowGraph[] = ['onFailure', 'always', 'never'];
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   installDir: undefined,
@@ -25,6 +48,12 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   runTimeoutMs: 30_000,
   lint: true,
   codeLens: true,
+  liveViewer: true,
+  fdrPath: undefined,
+  fdrTimeoutMs: 120_000,
+  fdrMemoryMb: 0,
+  fdrWorkers: 1,
+  fdrShowGraph: 'onFailure',
 });
 
 export function normalizeSettings(value: unknown): Settings {
@@ -38,7 +67,17 @@ export function normalizeSettings(value: unknown): Settings {
     runTimeoutMs: boundedInteger(raw.runTimeoutMs, DEFAULT_SETTINGS.runTimeoutMs, 100, 3_600_000),
     lint: boolean(raw.lint, DEFAULT_SETTINGS.lint),
     codeLens: boolean(raw.codeLens, DEFAULT_SETTINGS.codeLens),
+    liveViewer: boolean(raw.liveViewer, DEFAULT_SETTINGS.liveViewer),
+    fdrPath: nonEmptyString(raw.fdrPath),
+    fdrTimeoutMs: boundedInteger(raw.fdrTimeoutMs, DEFAULT_SETTINGS.fdrTimeoutMs, 1_000, 3_600_000),
+    fdrMemoryMb: boundedInteger(raw.fdrMemoryMb, DEFAULT_SETTINGS.fdrMemoryMb, 0, 1_048_576),
+    fdrWorkers: boundedInteger(raw.fdrWorkers, DEFAULT_SETTINGS.fdrWorkers, 0, 1_024),
+    fdrShowGraph: oneOf(raw.fdrShowGraph, FDR_SHOW_GRAPH, DEFAULT_SETTINGS.fdrShowGraph),
   };
+}
+
+function oneOf<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return typeof value === 'string' && (allowed as readonly string[]).includes(value) ? value as T : fallback;
 }
 
 function nonEmptyString(value: unknown): string | undefined {

@@ -30,6 +30,15 @@ missing `;`, remove `proc`, add `v = ` before a bare read guard. The compiler's 
 "Syntax error" line is suppressed when the parser has a better message for the
 same problem.
 
+The parser is tested against the compiler's own. The compiler's `-showTree` flag
+prints the tree its CUP parser built, before any checking, and
+`scripts/parse-diff.js` compares that tree with ours item by item and reports any
+file that only one side rejects. `node scripts/parse-diff.js <files or dirs>` runs
+it on real programs (the compiler's tests and every example and fixture here
+agree), and `--fuzz=N --seed=S` adds seeded generated programs that stress
+precedence, casts, member chains, channel operations and every statement and
+declaration form, plus one-token near misses that both parsers must reject.
+
 **A formatter.** `textDocument/formatting` prints the parse tree back in a
 canonical layout: 4-space indent, braces on the header line, spaces around
 operators, `chan<int>` without inner spaces, one field per line in records,
@@ -96,17 +105,17 @@ why:
 | `pj/channel-self-deadlock` | both ends of a channel used by the same sequential process: the first use blocks forever |
 | `pj/par-deadlock`          | straight-line par branches for which every legal channel-pairing order gets stuck (crossed order, missing peer): bounded rendezvous proof. Any call to a procedure with a body makes its branch opaque, since the callee may diverge, so the proof is deliberately narrower than the branches it can see |
 | `pj/par-for-body`          | a `par for` body with several statements: each one becomes its own process, so they run in parallel rather than in sequence and a local declared in one is not visible to the others. Wrapping the body in an inner block makes each iteration one process |
-| `pj/timeout-deadline`      | `t.timeout(1000)` with a constant: the argument is the absolute millisecond to wake up, not a delay, so it returns immediately. Quick fix rewrites it to `t.read() + 1000`, except inside an `alt` guard, where that spelling does not compile and the deadline has to be a variable |
+| `pj/timeout-deadline`      | `t.timeout(1000)` with a constant: the argument is the absolute millisecond to wake up, not a delay, so it returns immediately. Quick fix rewrites it to `t.read() + 1000`, in an `alt` guard too (this compiler builds a timer read there) |
 | `pj/starving-loop`         | an infinite loop with no communication, sync, timeout, alt or par: the cooperative scheduler never runs anyone else |
 | `pj/pri-alt-skip`          | `skip` before other guards in a `pri alt`: those guards can never be chosen |
 | `pj/barrier-not-enrolled`  | `sync()` on a local barrier nothing enrolled on: returns immediately              |
 | `pj/assign-in-condition`   | `if (b = true)`: assignment where a comparison was meant                            |
 | `pj/unreachable`           | code after `return`, `break`, `continue` or `stop` in the same block               |
 | `pj/trivial-par`, `pj/trivial-alt` | a `par` with one branch, an `alt` with one guard: nothing concurrent happens   |
-| `pj/multiple-alts`         | a second `alt` in the same generated process cannot be built (its guard array is declared twice); one alt per par branch is fine |
+| `pj/multiple-alts`         | a second replicated `alt` (`alt (int i = 0; ...)`) in the same generated process cannot be built (its guard lists are declared twice); any number of plain alts, with one replicated alt among them, builds, and so does one replicated alt per par branch |
 | `pj/read-placement`        | a channel read inside `?:` or inside a write's value; it must be its own statement (quick fix hoists it) |
 | `pj/call-as-condition`     | a bare call as the whole `if`/`while` condition; compare its result (quick fix adds `== true`) |
-| `pj/compiler-limit`        | a feature this ProcessJ build cannot compile, at the point of use: arrays of channels, variables holding a channel end, `claim`, `chan<string>`, nested record literals, record/protocol literals anywhere but a declaration initialiser, protocol parameters, `is`, assigning `null`, `break`/`continue` anywhere inside a par branch, a loop with `break` inside a switch case, records/protocols that refer to themselves through fields, reading through a `shared chan<T>.read` parameter, a value-returning procedure that can suspend, `!` as a whole condition, a read inside an `alt` timeout guard, and a second `par for` in one process. The program is fine; it just will not build with this compiler |
+| `pj/compiler-limit`        | a feature this ProcessJ build cannot compile, at the point of use: arrays of channels, variables holding a channel end, `claim`, `chan<string>`, nested record literals, record/protocol literals anywhere but a declaration initialiser, protocol parameters, `is`, assigning `null`, `break`/`continue` anywhere inside a par branch, a loop with `break` inside a switch case, records/protocols that refer to themselves through fields, reading through a `shared chan<T>.read` parameter, a value-returning procedure that can suspend, `!` as a whole condition, a channel read inside an `alt` timeout guard (a timer read there, `t.timeout(t.read() + 100)`, builds and runs), and a second `par for` in one process. The program is fine; it just will not build with this compiler |
 | `pj/needs-yield-annotation` | a procedure that suspends through calls or a `par for` scheduler boundary that the compiler's own yield walkers overlook (the compiler does mark ordinary communication in the body, a channel-end, barrier or timer parameter, `suspend`, or `main`); quick fix adds `[yield=true]` right after the parameter list. The server also adds it in its private copy before every compiler run, so Run works regardless |
 | `pj/shadows-parameter`     | a local with the same name as a parameter (silently accepted)                      |
 | `pj/unused`                | unused locals and parameters                                                        |
@@ -140,11 +149,369 @@ exact deadlock only if every explored legal schedule is stuck; exceeding the
 bounded state budget produces no claim. Missing peers and genuine circular
 waits are classified separately.
 
-VS Code renders that model with **ProcessJ: Show Concurrency Graph**. The view is
-filterable, keyboard accessible, source-linked, theme-aware, and can copy its
-stable JSON representation. Other clients get a Mermaid/Markdown report from
-the **Concurrency graph** code lens. The underlying portable request is
-`processj/concurrencyGraph`.
+This topology stays available as the `processj/concurrencyGraph` request. What
+the editors show is the process network built from it, below.
+
+**The process network, and where it gets stuck.** `src/graph` draws the program
+the way CSP and occam users draw one by hand: a process is a box, a channel is an
+arrow from the process that writes it to the process that reads it (labelled
+`name : type`), a `par` is a container of its branches, a `par for` is one box
+standing for ×N processes (the count when the bound is a constant, a `const`, or
+a local assigned a literal just before; N otherwise), and a barrier is a node
+joined by dashed links to the processes enrolled on it. A branch that calls a
+procedure with a `par` of its own is drawn as that procedure's network, its
+channel parameters bound to the caller's channels, so in `commstime.pj` the
+arrows read `delta -a-> consume`, `delta -b-> succ -c-> prefix -d-> delta`, with
+delta's two branches inside its box writing `a` and `b`. A callee without a
+`par` stays one box; what it reads and writes comes from its transitive
+parameter uses. Expansion stops at four levels, at a recursive call (drawn once,
+marked recursive), and when a view would exceed about a hundred processes; a
+collapsed call's own network is one view-switch away.
+
+There is one view for the whole program (rooted at `main`) and one per
+procedure, with its channel and barrier parameters as boundary ports, in
+parameter order (a port's arrow carries the type; the port names the
+parameter). Several writers or readers of one channel meet in a junction dot;
+when every process in a box uses a channel the same way, one arrow leaves the
+box's border instead of one per process. A process drawn as a container (it runs
+a `par`) whose own code also communicates, before, between or after its pars,
+gets a small `own code` box inside it for those operations, so delta's read of
+`d` arrives at delta's own code and an arrow on a border always means every
+process inside. A side with no partner drawn ends in a `no writer` / `no reader`
+stub, red when the checker proved it. Branches are named after their owner when
+numbers repeat: `branch 1 of delta`, `branch 2 of branch 1`, `branch 1 of par at
+line 7`. Counts are of processes, not boxes: a `par for` box counts each
+iteration.
+
+Arrows use the repository's certainty vocabulary. Solid is exact: it runs
+whenever its process gets there (a loop whose first test is a known `true`
+counts). Dashed is conditional: under an `if`, a loop or `par for` that may not
+run (a count of 0, or an unknown first test), a `switch`, an `alt` guard, the
+right of `&&`, after a statement that may leave its block early (`if (k > 3)
+return;`, a `break` or `continue` under a condition), after a loop that only a
+`break` ends (`while (true)`), and everything inside a callee that is called
+under such a condition. Dotted is unknown: through an unresolved or bodiless
+call. Inline branches show their code (`c.write(1)`, `then d.read()`); a `par
+for` body with several statements is drawn as one process per statement,
+because that is what the code generator makes of it. An end kept in a local
+(`chan<int>.write w = c.write;`, which the compiler rejects) is drawn as that
+channel's end.
+
+Barrier links follow the runtime, which counts enrolled processes rather than
+recording them: the process that declares a barrier is enrolled from the start,
+and a `par enroll` enrolls each of its branches (a branch that runs a `par` of
+its own counts once, as the container). A process that syncs without being
+enrolled (no `par enroll`, or a nested `par` that does not enroll its branches)
+gets an amber dotted `not enrolled` link and a note in the barrier's details: its
+syncs do not wait for the enrolled ones as the code suggests, and with nothing
+enrolled each returns at once. Through a barrier parameter, the caller decides,
+so a procedure's own view marks nothing.
+
+Every box carries the spawn-site path of `src/verification.ts`, every arrow its
+channel's declarator and owner, and every operation its statement span. That is
+how verification results land on the drawing: the checker's own proofs, and
+FDR's counterexamples (below).
+
+*The verification overlay.* Results arrive as `VerificationReport`s. The
+checker's report is built from what it has proved, and says so: every
+straight-line par deadlock (`pj/par-deadlock`) becomes a failed deadlock check
+listing each branch, the operation it waits on, why its partner never comes
+(finished, waiting on something else, or missing) and every circular wait among
+the branches; its summary blames only the waits nothing can meet any more
+(`nothing can still read 'c'; branch 2 waits on branch 3`), and a finished
+branch is named as the partner only when it did the other side of that channel.
+Every `pj/channel-no-writer`, `-no-reader` and `-self-deadlock` becomes a "this
+read (or write) waits forever" check, shown as `waits forever`: it proves one
+operation stuck, not the whole program. Static analysis has no trace, and never
+reports deadlock freedom: no result is not a proof. A model checker publishes
+its report through `publishVerification(uri, report)` (`src/graph/live.ts`): the
+report is copied (a producer may keep adding to its own object and publish it
+again), its `uri` must be the document's, and results are dropped when the
+document closes. When both exist, FDR's comes first. The words on screen are the
+producer's: a partner's `detail` is shown as given, and nothing it did not say
+is added (no "its only reader"). In the viewer:
+
+- the **verdict strip** has a chip per check (`✕ Deadlock freedom  deadlock
+  after 18 steps  FDR · 28 states · 190 ms`), red for errors, amber for
+  warnings, green when it holds; a procedure FDR checked on its own is named
+  on its chip (`succ on its own`), a run that never ends while something waits
+  for good reads `partial deadlock` (red, although termination itself is
+  informational), and a value outside the modelled integers `out of the
+  modelled integers`; **Terminates** says how the run fails to end: `runs
+  forever` only for a run that repeats, else `gets stuck after 2 steps` or
+  `runtime error after 4 steps`; a nondeterminism counts the steps the outside
+  sees (`nondeterministic at the start`); a check that holds with something it
+  does not cover is amber and says what (`holds, only in runs within 0..3`,
+  `holds, the compiled program may differ`), and a click shows its note; a
+  result whose run relies on what the model abstracts has a dashed amber ring,
+  and when it is shown a banner says so and the panel opens with **What this
+  run relies on**, the caveats in full; a chip opens its result on the view it is about (a
+  procedure checked on its own opens on its own view); the page opens on the
+  first error or warning, never on a result that only informs (a program
+  meant to run forever does not terminate: its chip shows the run), and a
+  failure published while the page is open opens itself, or pulses its chip
+  when another result is on screen;
+- at the end state, a process whose wait can never be met (its partner
+  finished, is missing or is not ready) or that is part of a circular wait is
+  the **root cause**: red outline, pulsing halo, red badge (`write a`, `alt: read
+  x | read y`), a red arrow with a red arrowhead and a **stop marker** at the
+  waiting end, and the reason beside it (`consume has terminated`, `no
+  unfinished branch can still read 'c'`); a process only **waiting behind**
+  another stuck one is amber, without the pulse, its badge and marker without
+  words (the reason is the marker's tooltip), and a dashed `waits for` link
+  joins it to the process it waits on when no arrow does; clicking a reason
+  replays to the last step its partner took; a **finished** process fades with
+  a check mark; a **circular wait** is a red band along the arrows that join
+  its processes (a loop of its own where no arrow joins two of them, through a
+  barrier or a shared side), with a callout naming it (`circular wait: branch 1
+  → branch 2 → branch 1`; a long circle names calls by their first argument,
+  `philosopher(0, …)`, or only counts its processes, and one process in a circle
+  with each of several others is one callout); a **divergence** draws the arrows
+  of its repeating steps in purple with `repeats forever: …`; a runtime error
+  puts its message by the process in red (amber, led by the range, when it is
+  a value leaving the modelled integers); a nondeterminism's internal choice
+  is a blue badge on the process that makes it (`the choice (step 2)`); a
+  reason names the process that never comes when there is one (`branch 3 never
+  syncs on b`); in a run that repeats forever (the termination check), a
+  process left waiting whose partner could still answer it is amber, not red:
+  the run starves it, and the words say `left waiting`; `stuck` is kept for a
+  process that can never go on (its partner finished or is missing, its par
+  waits for such a branch, or it is in a circular wait);
+- several instances on one box (the iterations of a `par for`, the processes of
+  a collapsed call) are told once with a count (`3 of 4 stuck · write c`, `1 of 4
+  done`, a reason `×3 · main waits for its par for to finish`), and a box is
+  faded only when every instance it stands for has finished; the story groups
+  them too (`worker(1), worker(2) and worker(3) are stuck at line 9 …`); a
+  circle whose processes are all on one box is told on it (`3 circular waits
+  among the iterations of par for …`);
+- a result computed for an older version of the buffer is drawn faded and
+  dashed, without motion, under a `Stale` banner;
+- the **timeline** has a tick per step (internal τ steps dimmer, the steps of a
+  divergence loop marked and replayed, a step the model's abstraction decides
+  underlined in amber, its caveat in the step's text) and one more for the end
+  state, named as the chip says (`stuck`, `loops`, `error`, `stops`), so the
+  last step can be seen before the end; play, pause, step, start, end and
+  speed; a value bubble travels along the arrow from writer to reader (from a
+  port when the caller writes), the participants flash, and each process shows
+  the line it last executed; the step's account is cut at two lines (a click
+  shows it all);
+- the **sequence chart** tab draws the counterexample as a message sequence
+  chart, a lifeline per process (named so that two `branch 1` differ), its
+  heads kept in view as it scrolls, `channel.value` arrows, barrier bars,
+  internal steps as a dot with what they do (`starts branch 1 and branch 2`),
+  `done` marks, a lifeline cut after the last step of a process that ended
+  without one of its own (`ends`), each stuck process's wait as a dashed arrow
+  toward the partner that never comes, and at the end a red cross where a
+  process is stuck for good, an amber pause where a run that repeats forever
+  only leaves it waiting, each label cut to its lane, following the timeline;
+- the **code** pane highlights the current step's statements and, at the end,
+  puts each line a process can never go on from in red with its explanation
+  beside it, a line where one waits behind another (or is only left waiting)
+  in amber, a line where the run relies on what the model abstracts dashed in
+  amber (`assumed at step 2: the real program takes the skip guard only while
+  in1 has no writer ready`), and a nondeterminism's choice in blue, showing
+  first the line of a process stuck for good; clicking a line finds its
+  process, clicking a process scrolls to its line;
+- the **state machine** tab (below) shows the selected process's states;
+- the side panel tells the story in sentences, the cause first: a runtime
+  error or a loop, a wait nobody can answer (`branch 1 of delta is stuck at
+  line 25 writing a: consume, the only reader of a (line 35), has already
+  terminated`), a circle (`A circular wait: …`) and then who is in it, the
+  processes stuck behind those, what keeps running, and last, a sentence each,
+  the pars waiting for their branches and what has finished; a nondeterminism
+  or a refused event starts with the producer's summary; processes are named
+  as the producer names them (`a (line 9)`, `branch 1 of crossed(r1.write)`),
+  and the same state is told once for all who are in it. It lists every
+  process, channel or step the result names that this view does not draw, and
+  shows the assumptions the producer made; a timeout, an error or a skipped
+  check says that there is no counterexample to show.
+
+*FDR on the graph.* After Check with FDR the server publishes what FDR found
+about the document's current text as one report: every target's latest check of
+this version (the program, and each procedure checked on its own), each check's
+id prefixed with its target (`program/deadlock-free`, `proc:succ:11/no-runtime-errors`),
+so checking a procedure never hides the program's result or the other way
+round. Assumptions every target shares are listed once, the others under their
+target (`succ on its own: ...`). An edit takes the report back (the results
+describe text that is gone), and so does a change to a file its model was
+translated from (an import, edited in the editor or on disk); closing the
+document drops it. A check whose file changes while FDR runs is not shown as
+current at all: no lens, diagnostic or graph; its message says the result is
+about the text before the edit, and its report says so at its top and is not
+opened. When a check fails
+(a defect, a partial deadlock or a runtime error; `fdrShowGraph: onFailure`, the
+default) the graph opens on that check: a page already open for the document is
+refreshed and moved to it (no second tab, and a message says so; a page in a
+background tab or behind another window shows it when you switch to it, and
+the message says that), otherwise a new page opens (live, or the file when the
+client cannot open URLs or the live viewer is off), and VS Code opens or
+reveals its panel. `always` shows the graph after every check, `never` never;
+the text report (`.pjreport`) is always written, and opened whenever the graph
+is not. Afterwards the procedure's lens shows the verdict (`FDR: deadlock (4
+steps)`, `FDR: no deadlock, 28 states`, with what a proof does not cover:
+`FDR: no deadlock, 11 states; the compiled program may differ`) and opens the
+graph on the check it names; a verdict with nothing to show (`FDR: timed out ·
+check again`, `FDR: not modelled · check again`) runs the check again, and an
+edit brings back the lens that runs the check. Every `fdr/*`
+diagnostic about a check has a code action, **Show in graph**, that opens the
+graph on that check with the process it is about selected and its state
+machine open (in a narrow window the details drawer stays shut), and hovering
+a stuck statement says what FDR found there in a sentence or two, with the
+caveats of the run and the last steps the process took (`How it gets here (4
+steps in all): 2. philosopher(1, …) writes true on p1f1 (line 27); …`). The
+hover is about the process whose own statement is under the cursor: a par
+waiting for its branches is told on the par's first line, not on every
+statement of its branches, and a statement nobody is stuck at has none. Real
+reports count steps from 0 and the page labels them from 1. All of this is in
+`test/graph-fdr-lsp.test.ts`, with refines replayed from recordings, and in
+`test/fdr-graph.test.ts`, where recorded counterexamples of
+`examples/par_deadlock.pj`, `examples/dining_philosophers.pj`, commstime's
+`succ` and `par for` bodies of several statements must land on drawn boxes and
+arrows with nothing left unplaced.
+
+*A process's state machine.* Double-click a process (or **State machine** in its
+details) for its communication state machine, read off the CSP model
+(`src/csp/machine.ts`): one state per definition the translator generates for
+the code that process runs (the procedure's own thread, or a par branch or par
+for body, which run as processes of their own), so every state is a name FDR's
+`--divide` answer can give; a box shows what the process does next there
+(`write right`, `alt: read left | read right`, `wait for branch 2`), its line,
+and the definition's name. The transitions are the references the generated
+CSPm makes from one definition to the next, recorded as the bodies are
+generated: what happens on the way (a guard, `[l < 1000000]`, `call
+philosopher`, a runtime error), dashed when a condition the model leaves to FDR
+decides it (it may never be taken); a transition that only repeats what its
+state does is drawn without words. Points a process passes without waiting (an
+entry, a loop head, a place two paths meet) are dashed boxes; `returns` and
+`STOP` are the ends. A call is one transition of the caller (click its label
+for the callee's machine). With an FDR result on screen the machine is the one
+of the model FDR checked, and the states the process went through are numbered
+in order, the way it came is marked, and at the timeline's cursor the state it
+is in is outlined (at the end, the state it is stuck in, in red, with what it
+waits for). A process inside a call is on that call's arrow, not at the state
+the call returns to: the arrow is outlined (in red at the end), with where the
+process is in the callee (`in send: waits to write 2 on out (c)`), and a click
+on the call shows the callee's machine with the same run, the callee's state
+FDR names marked. A branch that ran and was collected by its par reads
+`finished, and collected by its par`. Without a result the machine comes from a
+translation of the view's program or procedure; a program with more than 400
+processes is not translated just for this (it would hold up the server): a
+procedure's own machine then comes from a model of that procedure on its own,
+which it says, and a branch's machine waits for Check with FDR. The machine
+opens fitted to the dock while that keeps its words readable, else at its own
+size scrolled to where the run is; **Fit** and **Actual size** choose. A `par
+for` box picks its iteration from a list. **Export SVG** saves the machine as
+on screen, with the run as a caption.
+
+*Opening it.* From Neovim, `:ProcessJGraph` opens the viewer in your browser
+(through `vim.ui.open`); `:ProcessJGraph markdown`, `svg` or `excalidraw` give
+the other forms, and `:ProcessJGraphExport [all|svg|excalidraw|html|json]
+[directory]` writes files (a relative directory is taken from Neovim's `:pwd`).
+From Emacs, `C-c C-g` (`processj-show-graph`, with a prefix argument to choose
+the form) and `C-c C-e` (`processj-export-graph`) do the same through eglot or
+lsp-mode. In VS Code, **ProcessJ: Show Concurrency Graph** (or the
+**Concurrency graph** lens) opens the viewer in a panel that refreshes on save
+and when new results arrive, and **ProcessJ: Export Concurrency Graph** writes
+files; the panel's own exports go through a save dialog. The panel learns of
+new results from a `processj/verificationChanged {uri}` notification, which the
+server sends only to a client that passes `verificationNotifications: true` in
+its initialization options; a client that passes `graphPanel: true` gets
+`processj/showGraph {uri, focus}` instead of a browser page whenever the graph
+should open on a result (`focus`: `{ check, process? }`). The command
+`processj.showConcurrencyReport` takes such a focus as its third argument
+(`[uri, 'viewer', focus]`), and `processj/processNetwork` takes `focus` (the
+page opens on it) and `machine` (one state machine: `{ target, ref, check?,
+process? }`).
+
+*The live view.* For editors without a webview, the server serves the viewer
+itself: `node:http` on `127.0.0.1` and a random port, every path under an
+unguessable token, requests with any other `Host` refused, no CORS headers, and
+only content it generated. It starts on first use, closes with the server (or
+as soon as `liveViewer` is turned off), and the page follows the buffer: it
+refreshes over Server-Sent Events after edits and when a result is published,
+keeping pan, zoom and selection; an update can carry a focus, which the page
+then shows (the URL's `?check=...&process=...` does the same when it opens). A
+browser keeps at most six connections to one
+server and every open graph page shares this one, so a page lets go of its
+event stream while it is hidden (another tab, a minimised or covered window),
+checks in every 30 seconds instead (`ping`; a page that closes says so,
+`gone`), and catches up when it is shown again, with any result it was asked to
+show meanwhile; running `:ProcessJGraph` again opens another tab. A page whose
+document is closed in the editor says so (a banner, a grey dot), keeps showing
+how it was, and follows the file again when it is reopened. A
+state machine is laid out when the page asks for it (`machine?target=...&ref=...`). A
+source link asks the server to reveal the location in the editor
+(`window/showDocument` with a selection), only for files the page was given
+(including files a view laid out later links to). When the client cannot open
+URLs, or with `liveViewer: false`, the viewer is written as a self-contained
+HTML file in the report directory and opened as a file (its path is logged);
+such a file carries the state machines it can show (those of the processes in
+FDR's results and of the views it opens on, up to forty). A
+file with no procedure with a body yet opens on a page that says so and
+follows the buffer until there is one.
+
+*The viewer.* Drag, or scroll on a trackpad, to pan; pinch or turn a mouse wheel
+to zoom about the pointer. Keys: `+` `-` zoom, `0` fits, `1` is actual size, `/`
+searches (it highlights the matches and zooms to them; Enter steps through them),
+arrows pan, Tab and Enter move between boxes, space plays the timeline, `[` `]`
+step it, Home and End jump to its ends, and Escape closes the details drawer,
+then clears the selection, then the result. Hovering a box dims everything it
+does not touch, the result's marks included; clicking one shows its kind,
+source, call, parameters, the channels it uses with their partners and lines,
+and its effects. The toolbar switches views and toggles channel labels, element
+types and conditional arrows; a minimap appears when part of the network is off
+screen. Below 90 % zoom the result's badges and reasons grow so they stay
+readable. In a narrow window (a VS Code panel beside the editor) the details
+panel becomes a drawer (**Details**), and the timeline dock can be resized by
+its top edge or folded away. Opening a result frames the stuck processes with
+what explains them (the arrows they wait on, their partners, stubs and ports),
+or the whole view when that is readable. Exports: SVG of the current view at the
+timeline's cursor, with the title, the verdict, the account and a legend; PNG at
+2×; an Excalidraw scene; JSON; the sequence chart as SVG; and the state machine
+shown as SVG. The page is one
+file with inline CSS and script, makes no request except to its own live
+server, follows the system or VS Code theme, honours reduced motion, and runs
+only scripts carrying its nonce.
+
+*Formats.* `<stem>.graph.svg` is a standalone light-themed SVG (no CSS custom
+properties, so any SVG tool reads it) of the most important failure's view and
+end state, with the plain-words account (and every caveat of the run) as a
+caption and a legend of what it draws: a "where it deadlocks" figure for a
+paper. `.graph.excalidraw` is the
+same drawing as an Excalidraw scene: arrows bound to the shapes they join, each
+container grouped with its contents so it drags as one, the verdict and the
+caveats in its title, and the result's notes where the SVG puts them (Excalidraw centres each
+channel's name on its arrow, so a name can sit elsewhere than in the SVG).
+`.graph.html` is the viewer; `.graph.json` holds the
+model, its layouts and the results, written compactly (it is large on a big
+program) and only when asked for by name: `all` writes the SVG, the scene and
+the page. `:ProcessJGraph excalidraw` writes the scene next to the source too,
+since it is for editing. Exports go next to the source file (a relative
+directory is relative to its folder; an unsaved buffer needs an absolute one)
+and never replace a file that processj-lsp did not write (each format carries a
+generator marker); with nothing to draw yet, the pictures are skipped and the
+page is still written. The Markdown report describes the network in words
+(processes, a table of channels from writers to readers, barriers with who is
+not enrolled, effects, results) with a Mermaid flowchart (unknown arrows dotted
+and faint). The `processj/processNetwork` request returns the viewer's data (and
+page) for other clients.
+
+*Layout.* The Eclipse Layout Kernel's layered algorithm, through
+[elkjs](https://github.com/kieler/elkjs) (EPL-2.0 or GPL-3.0-or-later), run in the
+server process from its bundled build: left to right, nested pars laid out with
+their parents so arrows between containers route well, orthogonal routing,
+channel names as inline edge labels. Labels use a monospace stack, so their
+width is known without a browser; they never overflow their box (a long one is
+shortened with an ellipsis). Cycles are broken in source order before layout (so
+a crossed pair reads branch 1, then branch 2), and boxes keep their source order
+within a column (ports in parameter order); on the example corpus this
+costs one arrow crossing in all. The same view always gets the same coordinates.
+Views are built when they are needed: the program view, the views a result is
+about, and the first procedures in source order up to the page's budget of 40
+(a saved HTML file carries up to 200); any other one when it is opened. The
+20,000-line program of the performance test has 1,293 views, all built in about
+half a second; after an edit, an open page's refresh builds and lays out 40 of
+them in about 0.2 s.
 
 **Procedure effect summaries.** Each procedure gets direct and transitive
 conservative “may” effects: channel read/write, possible suspension, `par`,
@@ -188,12 +555,24 @@ requests are still rejected before an action is made. Refused actions are shown
 with their reason when the client advertises disabled-action support.
 
 **Run from the editor.** Code lenses above `main` offer **▶ Run** and
-**Build** (Neovim also has `:ProcessJRun` and `:ProcessJBuild`; its analysis reports are directly available as
-`:ProcessJGraph`, `:ProcessJEffects` and `:ProcessJProtocols`). Run performs the whole `pjc` pipeline
+**Build** (Neovim also has `:ProcessJRun` and `:ProcessJBuild`; the graph viewer opens with `:ProcessJGraph` and the analysis reports with
+`:ProcessJEffects` and `:ProcessJProtocols`). Run performs the whole `pjc` pipeline
 (ProcessJc, `javac --release 8`, the two ASM rewrites, `java`) in a temp
 directory, judged by exit codes rather than by grepping output, then opens a
 report with the program's output. A program that never finishes is killed after
 30 s and flagged as a probable deadlock.
+
+**Convert to CSP and check with FDR.** A whole program (from `main`) or a single
+procedure is translated into CSPm for the [FDR](https://cocotec.io/fdr/)
+refinement checker, which checks deadlock freedom, runtime errors and
+termination over every interleaving. FDR's answer comes back in ProcessJ terms:
+each stuck statement gets a diagnostic saying why it can never complete ("this
+write waits forever: consume, the only reader of a (line 35), has already
+terminated"), also when the rest of the program keeps running ("this write
+waits forever while ticker and sink keep running: nothing in the program reads
+c"), the code lens above the checked procedure shows the verdict, and a report
+tells the counterexample step by step, with where every process ended up and
+any circular wait. See [Convert to CSP and check with FDR](#convert-to-csp-and-check-with-fdr).
 
 **Semantic highlighting.** The server sends semantic tokens for every identifier,
 classified from the parse tree and the checker's resolutions: procedure names,
@@ -249,6 +628,345 @@ ones); each announces the codes it produces on its first line and
 `test/examples.test.ts` checks that. They double as a tour of what the server
 catches.
 
+## Convert to CSP and check with FDR
+
+`src/csp` translates ProcessJ into CSPm for [FDR4](https://cocotec.io/fdr/) and
+reads FDR's answers back in ProcessJ terms.
+
+| | Neovim | VS Code | Emacs |
+| --- | --- | --- | --- |
+| convert to CSP | `:ProcessJCsp` or `:ProcessJCsp delta` | **ProcessJ: Convert to CSP** (pick the program or a procedure) | `M-x processj-convert-to-csp` |
+| check with FDR | `:ProcessJFdr` or `:ProcessJFdr delta`, or the **FDR: check** lens | **ProcessJ: Check with FDR**, or the lens | `M-x processj-check-with-fdr` |
+| stop a running check | `:ProcessJFdrCancel` | **Cancel** on the check's notification, or **ProcessJ: Cancel FDR Check** | `M-x processj-cancel-fdr` |
+
+The server commands are `processj.convertToCsp` and `processj.checkWithFdr`,
+with arguments `[uri, procedure?, line?]`: the whole program (from `main`) when
+no procedure is named, otherwise that procedure on its own (`line`, the
+0-based line of its name, picks an overload). `main` named on its own is the
+whole program. A file with syntax errors is refused. Neovim and Emacs complete
+procedure names after the command (from the server's document symbols).
+`processj.cancelFdr` (`[uri?]`) stops the check running for a document, or every
+check without an argument.
+
+**Convert to CSP** writes `<file>.csp` (or `<file>.<procedure>.csp`) next to the
+source, so it can be opened in FDR's own window or handed in, and opens it. The
+file is meant to be read: a header lists the integer range, every abstraction
+and every warning; each definition is preceded by the statement it stands for.
+A file of that name that processj-lsp did not generate (it does not start with
+`-- Generated by processj-lsp from`) is never overwritten: the model then goes
+to the server's private report directory, and a message says so. Neovim's
+built-in `csp` filetype highlights the file.
+
+**Check with FDR** converts (and so also regenerates the `.csp` next to the
+source), runs FDR's `refines --divide` on a private copy of the model, and then:
+
+- puts a diagnostic (source `fdr`) on every stuck statement: `fdr/deadlock`
+  (Error) on each write, read, alt guard or barrier sync that waits forever,
+  saying which process could have answered it and why it cannot, with related
+  locations for the other processes of a circular wait and the last steps the
+  stuck process took; `fdr/partial-deadlock` (Error) on an operation that waits
+  forever while other processes keep running (a server loop, say), found in the
+  run the termination check reports; `fdr/runtime-error` (Error) at the
+  statement of a runtime error; `fdr/range` (Warning) where a value leaves the
+  modelled integers (the model's limit, not an error of the program: the run
+  is not followed past it); `fdr/divergence` (Warning) on a loop that runs
+  forever without communicating; `fdr/nondeterminism` (Information) on the
+  checked procedure; `fdr/assertion` on `main` when the program does not
+  terminate (Information, only when nothing else failed) and on the `//@csp`
+  comment of one of your own assertions that fails (Error); `fdr/spec-error`
+  (Error) at the line of your own CSPm that FDR rejects; and `fdr/not-modelled`
+  (Warning) where a construct the model cannot express is. A procedure checked
+  on its own says so (`FDR (delta on its own): ...`), and the same message from
+  two checks is shown once. A stuck statement in an imported file is shown at
+  the branch or call of this document that leads to it, with the imported
+  statement as related information. Each one about a check has the code action
+  **Show in graph**, and hovering a stuck statement explains it (see *FDR on
+  the graph* under [What you get](#what-you-get)). They are dropped as soon as
+  the buffer changes;
+- replaces the lens above the procedure with the verdict (`FDR: deadlock (6
+  steps)`, `FDR: partial deadlock (2 steps)`, `FDR: no deadlock, 1,204
+  states`), which opens the graph on that result; the lenses (above `main`
+  **FDR: check program**, above other `void` procedures **FDR: check**) appear
+  only when `refines` is installed, and `codeLens: false` hides them like the
+  others;
+- publishes the results to the graph and, when a check fails, opens the graph
+  on it (`fdrShowGraph`, described under the graph above), refreshing a page
+  already open for the document instead of opening another;
+- writes a report (`.pjreport`) with a table of the checks (verdict, states,
+  transitions, time) and, for each counterexample, where every process ended
+  up, the circular waits and every step, and opens it when the graph is not
+  shown; the same report as JSON (`src/verification.ts`) is written next to
+  it;
+- reports progress while FDR runs, one step per assertion, and stops `refines`
+  (its whole process group) when the check is cancelled, when a newer check of
+  the same file starts, after `fdrTimeoutMs`, once it uses more memory than
+  `fdrMemoryMb` (a big model can take tens of gigabytes within seconds; the
+  memory is not watched on Windows), or when the server shuts down. VS Code shows the check as a notification with a
+  **Cancel** button (the lens too); Neovim and Emacs have the cancel commands
+  above.
+
+With `fdrWorkers` at its default of one, `refines` finds the same deadlock and
+runtime-error counterexample every time a program is checked, so a check run
+again tells the same story about them. The setting does not govern the
+divergence search behind **Terminates** (`SKIP [FD= MAIN \ Events`) or the
+determinism check: their counterexamples can differ from one check to the next
+(five checks of `examples/dining_philosophers_fixed.pj` gave runs of 6, 9 and
+14 steps that repeat forever, each a different set of processes looping). `0` uses every core, which is faster on big models.
+
+The command returns `{ reportFile, jsonFile, cspFile, report }`, and the
+request `processj/fdrReport` (`{ textDocument: { uri }, procedure?, line? }`)
+returns the latest report of one target for the current text of a document
+(`line` picks an overload); the graph shows every target's at once. The
+notification `processj/fdrReportChanged` (`{ uri, target? }`) says that a report
+was stored (`target`: `{ kind: 'program' }` or `{ kind: 'procedure', name, line }`)
+or that a document's reports were dropped after an edit (no `target`), so an
+open viewer can ask again. Programs use the same functions without an
+editor: `checkWithFdr()` and the pure `explain()` in `src/csp/index.ts`, and
+`node scripts/pj2csp.js file.pj [--proc name] --check [--json]` prints the
+report in a terminal (`--out file.csp` keeps the model; it exits with 1 when a
+check fails and with 2 when anything was not checked). `node
+scripts/fdr-validate.js [dirs or files]` checks the whole corpus with FDR, builds
+and runs every program with the real compiler, and compares the two (see
+[Validated against the real runtime](#validated-against-the-real-runtime)).
+
+**Finding FDR.** The `fdrPath` option when it is set (the `refines` executable,
+a command name looked up on PATH, or FDR's install directory; it is then the
+only place tried), otherwise `$FDR_REFINES`, `$FDR_HOME`, `refines` on PATH,
+`/Applications/FDR4.app/Contents/MacOS/refines`,
+`~/Applications/FDR4.app/Contents/MacOS/refines`, `/opt/fdr/bin/refines`,
+`/usr/local/fdr/bin/refines` and, on Windows, `C:\Program Files\FDR4\bin\refines.exe`.
+When none is found, Check with FDR says where to get FDR and how to set
+`fdrPath`, no FDR lens is shown, and Convert to CSP still works.
+`:checkhealth processj-lsp` reports which `refines` Neovim's server will use.
+
+**What is checked.** For a program (`MAIN`):
+
+| check | assertion | holds when |
+| --- | --- | --- |
+| Deadlock freedom | `PJ_NOERR(MAIN) :[deadlock free [F]]` | the program never reaches a state where nothing can happen before it has finished. `PJ_NOERR` turns termination and a runtime error into an endless `pj_done`, so neither counts as a deadlock |
+| No runtime errors | `PJ_SAFE [T= MAIN` | no run raises a modelled error (`pj_error`): division by zero, an array index outside the array, a field read through `null`, an alt whose preconditions are all false, or an integer outside the modelled range. The last is the model's limit, not an error of the program: it is reported as a warning (`FDR: integers out of range`), and the other checks then cover only the runs that stay inside the range, which their verdicts say |
+| Terminates (informational) | `SKIP [FD= MAIN \ Events` | every run finishes: it never gets stuck and never runs forever. A server fails this by design; when the run FDR reports leaves a process waiting forever beside the ones that keep running (a write nothing will ever read), that process is shown as blocked and its operation gets an `fdr/partial-deadlock` diagnostic |
+
+For a procedure checked on its own (the process named after it), every channel
+parameter gets a channel of its own that FDR's environment (standing for any
+caller) may use freely, every barrier parameter a barrier nobody else is
+enrolled on, and the data parameters are the first event (`pj_call.3`), so each
+check covers every value of the modelled range and a counterexample starts
+with the values it needs; a value-returning procedure ends with its result
+(`pj_result.10`). Its checks are deadlock freedom and no runtime errors as
+above, divergence freedom (`(P \ PJ_LOCAL) :[divergence free]`: it never loops
+forever without communicating with its caller) and determinism
+(`(P \ PJ_LOCAL) :[deterministic [F]]`, informational: after the same events
+its caller sees, it always accepts and refuses the same things; an alt's choice
+or an abstract value can make it nondeterministic). `PJ_LOCAL` holds the
+procedure's own channels and barriers: what its branches say to each other is
+not communication with the caller, so branches that talk to each other forever
+are a divergence. They stay visible in the process itself, so a specification
+can name them. A procedure that runs forever is deadlock-free as long as it
+keeps talking.
+
+**The model, construct by construct.**
+
+| ProcessJ | in the model | faithful? |
+| --- | --- | --- |
+| `c.write(e)`, `x = c.read()` | `c!e`, `c?x`: synchronous rendezvous; reads nested in expressions are lifted in Java's evaluation order, so `x > 5 && d.read() > 0` reads `d` only when `x > 5` | exact for the language; this ProcessJ build performs every read of an expression before evaluating it, `&&` and `\|\|` included, which is named where it matters (`compiler/short-circuit-read`, `test/differential/short_circuit_read.pj` hangs) |
+| `x = c.read({ B })` | the reader runs `B` and then sends `c__ack`; the writer waits for it | exact |
+| a channel with no possible partner anywhere | the operation blocks forever (it is synchronised with `STOP`), as at runtime | exact |
+| `par { B1 ... Bn }` | every branch is a process of a fixed network, started together by one hidden fork event and collected by hidden join events; a `par` in a loop reuses its processes. No process of the network ends in `SKIP`: the program ends when the root (`main`, or the checked procedure) ends (`[\| {pj_end} \|> SKIP` around the network; a network of one process just ends), which keeps FDR from paying 2^n for n processes that end | exact |
+| `par for (int i = a; i < b; i++)` | one process per iteration value. With bounds computed at run time there is a process for every modelled integer; those outside the bounds of a run take part in its fork and join only, and the explanation leaves them out. An iteration whose value is outside the modelled integers is a range error | the language; this ProcessJ build runs each statement of the body as its own process (`pj/par-for-body`) |
+| channels and barriers declared in a `par for` body | one per iteration: iterations never synchronise on each other's, and the explanation keeps their partners, circles and barrier counts inside one iteration | exact |
+| shared channel ends | several writers (or readers) interleave and meet the other side one at a time; when one process both writes and reads a channel others use too, a small server (`PJ_MED`) hands each value to one reader | the language (locked ends); `pj/shared-unlocked-end` is named when this build does not lock an end |
+| `barrier b`, `par enroll (b)`, `b.sync()` | a counter per barrier (`PJ_BAR`) that follows the runtime's `PJBarrier`: declaring enrolls one process, `par enroll` hands the parent's enrollment to its branches, a branch that ends resigns, a sync completes when the last enrolled process arrives | exact, including that a resignation never completes a barrier: processes already waiting when the last other branch ends stay blocked (verified on the runtime) |
+| `alt`, `pri alt` | a choice between the ready guards; `(cond) && g` is `cond & g`; `skip` and timeout guards are hidden events that may be taken at any moment; replicated alts are `[] i : S @` | an over-approximation: the runtime takes the first ready guard in source order, the model any ready one (every runtime choice is a model choice). A `skip` written first with no precondition is exact. All preconditions false is a runtime error, as in the runtime; a replicated alt's preconditions that use its index are evaluated per index, which this build does not do (`compiler/replicated-alt-precondition`: it evaluates them once, before the index loop) |
+| timers | `t.read()` is an abstract value, `t.timeout(x)` a wait of any length | abstract: time is not modelled (`pj/timeout-deadline` is named) |
+| `byte`, `short`, `char`, `int`, `long` | one range `Int_t`; a value stored or sent outside it is a range error. A value that never decides anything (below) is saturated instead | abstract range, never a silent wrap; `/`, `%`, shifts and casts follow Java |
+| `boolean` | `Bool` | exact |
+| records, protocols | one datatype per family linked by `extends`; a protocol case is a constructor | values: a change through one variable is not seen through another referring to the same record. Where that can matter it is named (`model/aliasing`): a field or element stored through a variable that may share its object (assigned from another variable, a field, an element or a read, put into another array or record, or sent on a channel), and a call to a procedure that changes its record or array parameter (itself or through a procedure it hands it to) |
+| arrays | sequences with a checked index | values, as records |
+| `string`, `float`, `double` | one abstract value; a decision that depends on one is an internal choice (`\|~\|`) | abstract |
+| loops, `break`, `continue`, labels, `switch` (with fallthrough), `return` | recursion and continuations; a loop that can go round without any event gets a hidden tick; `break blk` out of a labelled block or `if` leaves that statement | exact; this ProcessJ build cannot compile a `break` out of a labelled statement that is not a loop (`compiler/labelled-break`) |
+| procedures | one definition per place a process can stop, named `<procedure>__<line>`, with the live variables as parameters; a value-returning procedure is a computation that hands its result on | exact |
+| `println`, `print` | nothing | — |
+| `longRandom()` and friends | any value of `Int_t` | abstract |
+| `stop` | `STOP` | the language; this compiler ignores `stop`, which the model's warnings say |
+
+The integer range covers the program's integer literals (`-1` included) and one
+past each, at most 64 values (literals that do not fit are dropped with a
+warning); a `//@csp int lo..hi` comment sets it. A literal in arithmetic on an
+abstract value (`t.read() + 100`) does not count: the result is abstract too.
+
+An integer that never decides anything is not range-checked: when no
+condition, loop, `switch`, alt precondition, array index or size, divisor or
+`par for` bound depends on it, and neither a checked procedure's caller nor
+one of your `//@csp` specifications can see it (it is only passed on, kept in
+variables or printed), its exact value cannot change any verdict. Such values stay exact
+while they fit and otherwise become one extra value, `PJ_SAT` (shown as "a
+value outside lo..hi"); anything computed from it stays `PJ_SAT`. The analysis
+follows values through assignments, channels (every channel a value can reach
+through calls counts as one), call arguments and returns; records, protocols
+and arrays always stay exact. A pipeline that squares and adds up what it
+passes on, or a server counting forever (`sharedchan.pj`), then checks without
+a range error; a loop counter still needs its range (`commstime.pj` counts to
+1000000). The model's header and the report's assumptions list the saturated
+variables and channels.
+
+Where a lint says the compiled program differs from the language
+(`pj/par-for-body`, `pj/shared-unlocked-end`, `pj/shared-channel-end`,
+`pj/timeout-deadline`, `pj/parallel-usage`, `pj/compiler-limit`, ...), the
+model follows the language and the lint is listed in the model's header and
+the report's assumptions. The translator also names the miscompilations no
+lint reports, each verified on the installed compiler: a `break` or
+`continue` after a nested `for`, `par for` or `do` loop in the same loop body
+of a procedure compiled as a process (`main`, or any that can suspend), which
+this build turns into a jump to the inner loop's exit (`compiler/loop-labels`;
+`test/differential/main_break_after_for.pj` and four more hang); a par
+branch whose sequential loop calls procedures that suspend, which can end the
+par early (`compiler/par-loop-calls`, `par_loop_of_calls.pj`); a channel read
+in the right operand of `&&` or `||`, which this build performs even when the
+left operand decides the result (`compiler/short-circuit-read`,
+`short_circuit_read.pj` hangs); a replicated alt's precondition that uses its
+index, evaluated once for every index (`compiler/replicated-alt-precondition`,
+`replicated_alt_precondition.pj` stops with "One of the boolean pre-guards must
+be true!"); `stop` (`compiler/stop-ignored`); and a `break` out of a labelled
+block (`compiler/labelled-break`). When one of these is in the program, a
+passing verdict adds "the compiled program may differ" with the place (in
+short on its lens and chip, and the message is a warning:
+`FDR: no deadlock, 11 states; the compiled program may differ`), and a
+counterexample lists it among its caveats. Where the program may share an
+array or record between references (`model/aliasing`, above), a passing
+verdict adds "the program may differ where it shares an array or record", and
+a counterexample lists it among its caveats. A passing verdict that covers only
+the runs inside the modelled integers (another check found a value leaving
+them) says that too (`holds, only in runs within 0..3`).
+
+**How a counterexample is explained.** The model is built for `--divide`:
+every process instance of the program (the root, every `par` branch, every
+`par for` iteration) is one leaf of the network, and every state a leaf can
+stop in is a named definition, so FDR's answer says for each process which
+statement it is at and what it still offers. `src/csp/explain.ts` turns that
+into a `VerificationReport`:
+
+- each **step** of the trace says which processes took part, in which role
+  (writer, reader, barrier sync), at which statement, with the value in
+  ProcessJ terms (`3`, `true`, `Point { x = 1, y = 2 }`, `move { dx = 1, dy = 0 }`),
+  and in words: "prefix writes 0 on d (line 4); delta reads it (line 23)".
+  Starting and collecting `par` branches, alt guard choices and loop ticks are
+  steps too, marked internal, and so is the acknowledgement the model adds after
+  a plain read of a channel that is also read with an extended rendezvous: it
+  only completes the write the read took ("branch 1's write on c completes:
+  branch 2 has taken the value"); steps on channels nobody outside sees are marked
+  not visible (in the termination check too, whose `\ Events` hides every
+  event only to ask whether the program ends). The iterations of a `par for`
+  whose bounds a run computes are only the ones inside those bounds;
+- each **process** ends terminated, not started, blocked, stopped by a runtime
+  error, or (for a divergence) looping; in a run that repeats forever, a
+  process that takes no part in the repetition and stopped at an operation is
+  blocked there too (a partial deadlock). A blocked process waits on exactly the
+  events FDR says it offers: a write (with its value), a read, the enabled
+  guards of an alt (a guard whose precondition is false is not waiting; with two
+  guards on one channel, the one whose precondition holds is the one taken), a
+  barrier (with how many of its enrolled processes are waiting), or its `par`'s
+  branches. For each wait the processes that could complete it are named (the
+  other users of that channel instance, the other processes enrolled on that
+  barrier instance, every branch a `par` still waits for, the one that can never
+  finish first; a channel or barrier declared in a `par for` body is one per
+  iteration) with why they cannot: terminated (and when), blocked elsewhere (on
+  what), not started, passed their last use of the channel ("never reads c
+  again: its read is behind it"; at a barrier, an enrolled process that never
+  syncs on it again keeps it from completing), or nobody at all. Whether a
+  process can still get to an operation is decided from where it stopped, over
+  every path of its code and the procedures it calls (an over-approximation,
+  so "never again" is certain); a process inside a part
+  compressed with `//@csp compress` is said to be so. The variables live at the
+  stuck statement are shown (`l = 4`);
+- waits that go round in a circle are listed as **circular waits**; a process
+  that has passed its last use of a channel is no link in one, and neither is
+  a partner in a run that repeats forever that waits on the same channel the
+  other way (the two could meet; FDR's run, which needs no fairness, just
+  never lets them), so such a run reports a partial deadlock only where
+  something really waits for good;
+- each process carries FDR's own names for the **states** it went through, in
+  order (`philosopher__27(p0f0, p0f1)` from step 2): the definitions of its
+  state machine;
+- the **summary** picks the most telling account: a wait nobody can ever
+  answer, then a circular wait, then the first stuck process. A user's
+  `:[deadlock free]` that fails only because the program terminates says that
+  FDR counts termination as a deadlock (`PJ_NOERR(MAIN)`, the generated check,
+  tells the two apart) and is informational;
+- **caveats** name what the run relies on that the model abstracts: an alt
+  taking a skip guard while a guard written before it could be ready (the
+  runtime takes the first ready guard), a timeout guard taken before its
+  deadline, an abstract value deciding a branch; and every place where the
+  compiled program differs from the language (a lint or a miscompilation
+  above). Such a counterexample may happen only under some schedules or
+  values, or not in the compiled program; its diagnostics say so. The step a
+  caveat is about carries it in short (`the real program takes the skip guard
+  only while in1 has no writer ready`), for the timeline and the code pane.
+
+Processes and channels carry the identities of `src/verification.ts` (spawn
+paths from the root; declaration plus owner instance), which the graph viewer
+computes from the source independently; `test/csp-identity.ts` checks the
+translator's against that rule on commstime, santa, `par for` and nested pars.
+In sentences a process is called by the procedure it runs (`consume`), by the
+argument that tells calls apart (`reindeer(1, …)`), or `branch 2 of delta`;
+each process of the report carries that name (`name`), so the graph, the
+sequence chart and the hover tell two `branch 1` apart.
+
+**Limitations.** A program with more than 2,000 processes is not translated
+(the model would be too large for FDR): its checks are each reported as not
+checked, the lens reads `FDR: not modelled`, and the file written for it says
+why, marked as generated, so the next translation replaces it. Not modelled,
+so the program is not checked at all (each check
+is reported as not checked, never as passed): mobile procedures, `suspend`,
+`claim`, arrays of channels (`replicated_alt.pj`), variables holding a channel
+end, recursion through `par`, records or protocols that contain themselves,
+arrays passed into a `par` branch or sent over a channel (`arr.pj`,
+`mandelbrot.pj`, `bug_lookalikes.pj`, `read_positions_that_work.pj`: the model
+passes values to a branch in its start event, and a sequence of integers has too
+many values for FDR to enumerate), and `par for` loops whose bounds are neither
+constants nor `i < n` with a step of one. Big networks can take FDR a long time:
+`fullAdder.pj` has dozens of one-shot gates whose steps interleave freely, so
+neither the whole program nor the adders built from its gates finish in two
+minutes (`xorGate` alone checks deadlock freedom, divergence and runtime errors
+in under a second, 124,022 states, but not determinism); with `//@csp compress`
+each adder procedure checks in about a second, but each compressed part is then
+one process in counterexamples, without per-statement detail, and the whole
+program still does not finish. A loop counter that leaves the inferred range is reported
+where it does (`commstime.pj` counts to 1000000; in `fortest.pj` `j` reaches 15
+while the literals give 0..11), with the rest of the verdicts covering the runs
+before it. The alt over-approximation can report a deadlock that this runtime's
+scheduler happens to avoid (`test/differential/alt_skip_no_writer.pj`). A
+partial deadlock is found in the one run the termination check reports, so a
+process that gets stuck only later, or in another run, is not shown. A stuck
+statement in an imported file is reported at the branch or call of this
+document that leads to it, naming the file and line.
+
+**Your own specifications.** A block comment starting `/*@csp` is copied into
+the model unchanged and a `//@csp assert ...` comment becomes an assertion;
+both are checked and reported like the generated ones. An `assert` inside a
+CSPm comment of the block (`-- ...` or `{- ... -}`) is not one, and FDR's
+results are matched to the assertions by their text, so one FDR skips or one
+an included file adds never gives another its answer. An `include "spec.csp"`
+in a block is found next to the `.pj` file, wherever the model FDR runs is
+written. An error FDR finds in your CSPm is reported at its line of the `.pj`
+file (`fdr/spec-error`). `assert not ...` is explained the other way round: it
+holds when the property after `not` fails, and the counterexample FDR found for
+that property comes with it. Specifications can refer to `MAIN`
+(the program) or the checked procedure's name, to `main`'s channels by their
+ProcessJ names (`a.3`; other procedures' channels are hidden), to a checked
+procedure's own channels and `PJ_LOCAL` (the set of them), and to `main`'s
+barriers (`b.1.pj_sync`). Generated names start with `pj_` or `PJ` or contain
+`__`; ProcessJ names that would clash are renamed (`length` becomes `length_`).
+`//@csp assert sum :[has trace]: <pj_call.4, pj_result.10>` tests a function;
+`//@csp compress` compresses every sub-network (`sbisim(diamond(...))`). FDR
+counts successful termination as a deadlock, so `//@csp assert MAIN :[deadlock
+free [F]]` fails on a program that ends; write `PJ_NOERR(MAIN)` instead, as the
+generated check does. FDR
+reads `assert not` as a negated assertion even at the start of a name, so a
+procedure called `notGate` is written `assert (notGate) :[deadlock free]` (the
+generated assertions do this themselves). A channel your specification names
+keeps exact values, as does everything that flows into it.
+
 ## Performance
 
 Everything except the compiler run is synchronous on the keystroke path, so it
@@ -279,7 +997,11 @@ tree itself is tracked, so a hostile file produces a syntax error instead of a
 stack overflow in a later pass. An analysis failure of any other kind is reported
 as one diagnostic rather than taking the server down. On shutdown the server
 disposes its compiler queue, kills every JVM it started (as a process group, so
-nothing a wrapper spawned survives), and removes its report directory.
+nothing a wrapper spawned survives), and removes its report directory and every
+compiler sandbox still on disk; a server that exits without a shutdown (its
+input closed, SIGTERM, SIGINT, SIGHUP) does the same on its way out. After each
+compiler run its sandbox is removed in the background, so typing never waits
+for it.
 
 The server caches parsing, checking, symbols and semantic inputs per document
 version, computes effects/protocols once per version, builds the visual graph only
@@ -327,6 +1049,10 @@ for deleted files.
   file `pjc` reads), `export PROCESSJ_HOME=/path/to/ProcessJ`, or
   `init_options.installDir`. Without one, everything except compiler
   diagnostics and Run still works.
+- **FDR4** (optional) for Check with FDR: install it from
+  [cocotec.io/fdr](https://cocotec.io/fdr/); the server finds `refines` in the
+  usual places or through `fdrPath` (see
+  [Finding FDR](#convert-to-csp-and-check-with-fdr)).
 
 ### 2. One command per editor
 
@@ -387,13 +1113,17 @@ language id `processj` (extension `.pj`) and pass the options below as
 
 With AstroNvim the usual mappings apply: `K` hover, `gd` definition, `gr`
 references, `<Leader>lf` format, `<Leader>la` code action (quick fixes),
-`<Leader>lr` rename, `<Leader>ll` run a code lens (▶ Run, Build). The
-`:ProcessJGraph`, `:ProcessJEffects` and `:ProcessJProtocols` commands open the
-complete analysis reports without locating a lens first. Reports use the dedicated
+`<Leader>lr` rename, `<Leader>ll` run a code lens (▶ Run, Build, FDR: check). The
+`:ProcessJEffects` and `:ProcessJProtocols` commands open the complete analysis
+reports without locating a lens first, `:ProcessJGraph` opens the graph viewer in
+your browser (`:ProcessJGraph markdown` gives it as a report),
+`:ProcessJGraphExport` writes it next to the file, and `:ProcessJCsp [procedure]`
+and `:ProcessJFdr [procedure]` convert to CSP and check with FDR. Reports use the dedicated
 `processjreport` filetype: they retain lightweight Markdown highlighting without
 activating editor Markdown Tree-sitter integrations.
 
 In VS Code the play button in the editor title and the code lens above `main` run the current file. Run, Build,
+Convert to CSP, Check with FDR (both ask for the whole program or one procedure),
 Restart Language Server, and Show Language Server Output are also available under **ProcessJ** in the
 Command Palette. The language-status menu reports Starting, Ready, or Stopped and opens the server log.
 All ProcessJ settings apply automatically; use `processj.trace.server = verbose` when protocol-level logs
@@ -407,7 +1137,15 @@ npm run build
 npm test          # parser corpus, formatter, checker, semantic tokens, imports, examples, perf budgets
 npm run smoke     # end-to-end against a real ProcessJ install, including a full program run
 npm run bench     # timings for generated 1k / 10k / 50k-line files
+node scripts/fdr-validate.js   # every corpus program through FDR and the real runtime, compared
 ```
+
+Without FDR, `npm test` explains refines output recorded in `test/fixtures/fdr`
+and skips the tests that run refines. Each recording names a hash of the model
+it was made for, so after a change to what the translator generates the tests
+say which to record again: `PJ_RECORD_FDR=1 npm test` (with FDR installed)
+records them afresh, with one search worker so the counterexamples are the
+ones a check finds every time.
 
 `:LspLog` in Neovim shows the server log, including which install directory it
 found and how long each compile took.
@@ -428,7 +1166,13 @@ install directory; only `codeLens` needs a restart because it is a capability.
 | `runTimeoutMs`  | `30000` | kill a program started from Run after this long           |
 | `checkOnChange` | `false` | `true` to also run the real compiler on every edit         |
 | `lint`          | `true`  | `false` to turn the static analysis off                   |
-| `codeLens`      | `true`  | `false` to hide all inline Run, Build, analysis, and graph lenses |
+| `codeLens`      | `true`  | `false` to hide all inline Run, Build, analysis, graph and FDR lenses |
+| `liveViewer`    | `true`  | `false` to write the graph viewer to a file instead of serving it on a loopback-only page that follows edits |
+| `fdrPath`       | found   | FDR's `refines` (or FDR's install directory) for Check with FDR |
+| `fdrTimeoutMs`  | `120000` | stop an FDR check after this long                        |
+| `fdrMemoryMb`   | `0`     | stop an FDR check once `refines` uses more memory than this (MB; not on Windows); `0` is half of the machine's memory, at most 8 GB |
+| `fdrWorkers`    | `1`     | `refines`' search workers: `1` finds the same deadlock and runtime-error counterexamples on every check (a termination or determinism counterexample can still vary); `0` uses every core, faster on big models |
+| `fdrShowGraph`  | `onFailure` | after Check with FDR, open the graph on the result: `onFailure` (a defect, a partial deadlock or a runtime error), `always`, or `never` (the text report opens instead, as it does whenever the graph is not shown) |
 
 ## How diagnostics work
 
@@ -468,7 +1212,20 @@ src/checker/reachable.ts bounded call-driven imported-body analysis and dependen
 src/checker/protocols.ts protocol inheritance, coverage, collisions and observed message flow
 src/checker/controlflow.ts executable-prefix statement walking (a return or break ends its block)
 src/checker/rendezvous.ts bounded state-space search for a legal straight-line rendezvous schedule
-src/concurrency.ts  stable source-mapped process/channel graph and portable Markdown renderer
+src/concurrency.ts  stable source-mapped concurrency topology (the processj/concurrencyGraph request)
+src/verification.ts the VerificationReport contract shared by the checker, FDR and the graph viewer
+src/graph/network.ts process network views: elaboration from a root, channel binding, spawn-site identity
+src/graph/static-verification.ts the checker's proven deadlocks and channel hazards as a VerificationReport
+src/graph/overlay.ts placement of verification results on a view, and their plain-words story
+src/graph/layout.ts ELK (elkjs) layered layout, text metrics, cycle breaking in source order
+src/graph/render-svg.ts standalone SVG of a view and its end-state overlay
+src/graph/render-msc.ts message sequence chart of a counterexample
+src/graph/render-excalidraw.ts Excalidraw scene with bound arrows and labels
+src/graph/render-markdown.ts the network described in words, with a Mermaid flowchart
+src/graph/render-html.ts, payload.ts, client/viewer.ts the self-contained viewer page and its data
+src/graph/render-machine.ts a process's state machine laid out and drawn, with its trail placed
+src/graph/live.ts   verification store (publishVerification) and the loopback live viewer server
+src/graph/session.ts per-document network, static report, layout cache and export formats
 src/inlays.ts       compact channel-role and topology hints
 src/refactors.ts    conservative, validated concurrency refactoring plans
 src/semantic.ts     semantic tokens from the parse tree and the checker's resolutions
@@ -479,6 +1236,13 @@ src/analysis.ts     lexer-level diagnostics (escape sequences, non-ASCII, empty 
 src/tokens.ts       tokenizer that also reports the lexer limits and keeps comments
 src/compiler.ts     runs ProcessJc in an isolated temp home, cancellable
 src/pipeline.ts     full build + run pipeline (ProcessJc, javac, ASM passes, java)
+src/csp/            ProcessJ to CSPm for FDR and back: lowering (lower.ts), integers that never decide anything
+                    (relevance.ts), miscompilations no lint reports (miscompile.ts), what a process may still do
+                    (reach.ts), definitions (gen.ts), the process network (network.ts), the file and source map
+                    (translate.ts), refines (fdr.ts), FDR's answers as a VerificationReport (explain.ts),
+                    diagnostics and the text report (report.ts), check.ts, each procedure's state machine
+                    (machine.ts)
+src/verification.ts verification results shared with the graph viewer: process and channel identities, checks, counterexamples
 src/diagnostics.ts  parses compiler output into structured diagnostics
 src/symbols.ts      regex-based extractor, used to top up symbols while a file has syntax errors
 src/library.ts      indexes include/JVM/**/*.pj for std completion and definitions
@@ -488,14 +1252,20 @@ src/settings.ts     defaults and validation for untrusted initialization options
 src/keywords.ts     keyword list and hover docs
 test/               node:test unit tests; test/fixtures holds the compiler's example corpus and std headers
 test/differential/  programs whose real compiler and runtime outcome is recorded in their header
-examples/           one program per diagnostic, self-describing and tested
+test/fixtures/verification/ an FDR-style report of a multi-step deadlock, for the viewer's timeline
+test/fixtures/fdr/  refines output recorded for the explanation and graph tests (`PJ_RECORD_FDR=1 npm test` re-records);
+                    test/fdr-recordings.ts reads them, and replays them as a stand-in refines for the server tests
+examples/           one program per diagnostic, self-describing and tested; dining_philosophers.pj is for FDR
 scripts/smoke.js    talks LSP over stdio to a real server, ends with a real program run
 scripts/bench.js    complete in-memory analysis timings on generated large files
 scripts/validate.js builds and runs every program, comparing the checker's verdict against reality
+scripts/parse-diff.js compares the parser's trees with the compiler's -showTree output, on files or generated programs
+scripts/pj2csp.js   translates a file to CSPm and, with --check, runs FDR on it and explains the answers
+scripts/fdr-validate.js checks a corpus with FDR, runs it with the real compiler and compares the two
 scripts/editors.js  `npm run setup` / `npm run remove`: install or uninstall the Neovim, VS Code and Emacs integrations
 lua/, plugin/, ftdetect/, syntax/, ftplugin/   the Neovim plugin
 editor/nvim/        ready-made lazy.nvim/AstroNvim spec and a plugin-manager-free config
-editor/emacs/       processj-mode.el: major mode plus eglot/lsp-mode wiring
+editor/emacs/       processj-mode.el: major mode, eglot/lsp-mode wiring, graph commands
 vscode/             VS Code extension: `npm run install-extension` builds the server, bundles it, packages and installs
 ```
 
@@ -536,3 +1306,139 @@ Apache License 2.0 (see `LICENSE`). The example programs under
 | `yield_through_calls.pj` | other | finishes | private-buffer yield repair works |
 
 `other` rows are programs with type errors, races, compatibility warnings, or known compiler miscompilations: some the compiler rejects, some it builds and they hang or misbehave at runtime, which is the point of the checker. The latest run had 6 confirmed predictions, 0 missing-rule/mismatch investigations, and 0 possible false positives. `compiler limit (imports)` means the program is fine but this compiler build cannot link a user library.
+
+### FDR against the real runtime
+
+`node scripts/fdr-validate.js` (after `npm run build`) takes every program of
+`test/fixtures/processj`, `test/differential` and `examples`, translates it from
+`main`, checks FDR's default assertions, builds and runs it with the real
+compiler (4 s timeout) and compares the two; `--no-run` compares with the
+recorded `// outcome:` headers instead, and `--markdown` prints this table. In
+the "FDR says" column, `deadlock (L12, L17)` gives the lines of the stuck
+operations, `runs forever` is a program without deadlock that never ends (a
+server), and `integers out of range` is the model's limit. A row's result is
+
+- **CONFIRMED** when FDR's verdict is what the program does: a deadlock and it
+  hangs, no deadlock and termination and it finishes, running forever without
+  deadlock and it is still running at the timeout, a runtime error and it
+  fails. A program that prints an exception and then hangs has failed (a
+  process stopped with an error and the others wait for it), which is no
+  deadlock;
+- **language** when the model follows the language and the translation names
+  where the compiled program differs: `pj/shared-unlocked-end` and
+  `pj/shared-channel-end` (no lock is taken, so the compiled program hangs
+  where the language has no deadlock), `pj/par-for-body`,
+  `compiler/loop-labels`, `compiler/par-loop-calls`, `compiler/stop-ignored`,
+  `compiler/short-circuit-read`, `compiler/replicated-alt-precondition`. Also
+  when the program hangs or fails as FDR says, but the report itself says the
+  compiled program may differ from the model (one of these, or
+  `compiler/labelled-break`, `pj/starving-loop`, `pj/multiple-alts`,
+  `pj/compiler-limit`): it may hang or fail for that reason instead, so the
+  run confirms nothing;
+- **abstraction** when the counterexample takes an alt's skip or timeout guard
+  while a guard written before it could be ready, as its caveat says, and this
+  run's scheduler did not, or when the program shares an array or record
+  between references (`model/aliasing`);
+- **range limit** when a loop counter leaves the inferred integers (the other
+  verdicts hold for the runs before that);
+- **not built** when the compiler rejects the program, so FDR's verdict is about
+  the language only; **not modelled**, **does not parse** (the old `proc`
+  syntax), **no main**, **too big** (FDR did not finish in 60 s);
+- **MISMATCH** otherwise, which fails the script.
+
+Latest run (FDR 4.2.7, one search worker, 137 programs, about four minutes): 65
+confirmed, 19 language, 4 abstraction, 2 range limit, 23 not built, 13 not
+modelled, 1 too big, 6 do not parse, 4 without `main`, and no mismatch.
+Programs that are clean and agree are listed together per directory:
+
+| program | FDR says | real program | result |
+| --- | --- | --- | --- |
+| `test/fixtures/processj/NetworkProc.pj` | no deadlock, runs forever | finishes | abstraction |
+| `test/fixtures/processj/alttest.pj` | deadlock (L6) | finishes | abstraction |
+| `test/fixtures/processj/arr.pj` | not modelled: channel 'c' carries int[], which the model cannot enumerate | finishes | not modelled |
+| `test/fixtures/processj/commstime.pj` | no deadlock, integers out of range (L16) | finishes | range limit |
+| `test/fixtures/processj/fibonacci.pj` | deadlock (L4) | finishes | language |
+| `test/fixtures/processj/fortest.pj` | no deadlock, integers out of range (L11) | finishes | range limit |
+| `test/fixtures/processj/fullAdder.pj` | no answer in time | does not build (javac fails) | too big |
+| `test/fixtures/processj/integrate.pj` | no deadlock, runs forever | does not build (ProcessJc fails) | not built |
+| `test/fixtures/processj/mandelbrot.pj` | not modelled: a par branch receives a int[][] value from its parent, which the model cannot enumerate | finishes | not modelled |
+| `test/fixtures/processj/mandelbrot2.pj` | not modelled: a par branch receives a int[][] value from its parent, which the model cannot enumerate | still running after 4 s (finishes after 18 s) | not modelled |
+| `test/fixtures/processj/santa.pj` | no deadlock, runs forever | hangs | CONFIRMED |
+| `test/fixtures/processj/santapar.pj` | no deadlock, runs forever | hangs | CONFIRMED |
+| `test/fixtures/processj/sharedchan.pj` | no deadlock, runs forever | does not build (ProcessJc crashed) | not built |
+| `test/fixtures/processj/sharedread.pj` | no deadlock, runs forever | does not build (ProcessJc crashed) | not built |
+| `test/fixtures/processj/sharedwrite.pj` | no deadlock, runs forever | hangs | CONFIRMED |
+| `test/fixtures/processj/simple.pj` | deadlock (L20) | hangs | CONFIRMED |
+| `test/differential/alt_skip_no_writer.pj` | deadlock (L16) | finishes | abstraction |
+| `test/differential/alt_timeout_guard.pj` | deadlock (L10) | finishes | abstraction |
+| `test/differential/break_after_nested_do.pj` | no deadlock, terminates | hangs after java.lang.NullPointerException | language |
+| `test/differential/break_after_nested_for.pj` | deadlock (L14) | hangs after java.lang.NullPointerException | language |
+| `test/differential/break_after_par_for.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/channel_array.pj` | not modelled: arrays of channels are not modelled | does not build (javac fails) | not modelled |
+| `test/differential/claim_shared.pj` | not modelled: 'claim' is not modelled | does not build (ProcessJc crashed) | not modelled |
+| `test/differential/continue_after_nested_for.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/end_in_variable.pj` | not modelled: a variable holding a channel end is not modelled (and does not compile with this ProcessJ build) | does not build (javac fails) | not modelled |
+| `test/differential/for_in_for_break.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/main_break_after_for.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/par_ends_early_gc.pj` | deadlock (L8) | hangs | CONFIRMED |
+| `test/differential/par_loop_of_calls.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/read_as_index_target.pj` | not modelled: a par branch receives a int[] value from its parent, which the model cannot enumerate | does not build (javac fails) | not modelled |
+| `test/differential/read_positions_that_work.pj` | not modelled: a par branch receives a int[] value from its parent, which the model cannot enumerate | finishes | not modelled |
+| `test/differential/replicated_alt.pj` | not modelled: arrays of channels are not modelled | finishes | not modelled |
+| `test/differential/replicated_alt_precondition.pj` | no deadlock, terminates | fails (exit 1: RuntimeError: One of the boolean pre-guards must be true!) | language |
+| `test/differential/shared_inline_writers.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/shared_par_for_writers.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/shared_readers_first.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/shared_unshared_param.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/short_circuit_read.pj` | no deadlock, terminates | hangs | language |
+| `test/differential/stop_ignored.pj` | deadlock (L4) | finishes | language |
+| `test/differential/string_semicolon_and_narrow_literals.pj` | not modelled: 'suspend' (mobile processes) is not modelled | finishes | not modelled |
+| `examples/bug_lookalikes.pj` | not modelled: a par branch receives a int[] value from its parent, which the model cannot enumerate | finishes | not modelled |
+| `examples/channel_direction.pj` | deadlock (L12, L7, L13) | hangs | CONFIRMED |
+| `examples/channel_types.pj` | deadlock (L14) | does not build (ProcessJc crashed) | not built |
+| `examples/compiler_limits.pj` | not modelled: records that contain themselves (Node) are not modelled | does not build (ProcessJc crashed) | not modelled |
+| `examples/deadlock_read.pj` | deadlock (L8) | hangs | CONFIRMED |
+| `examples/dining_philosophers.pj` | deadlock (L28, L18) | hangs | CONFIRMED |
+| `examples/dining_philosophers_fixed.pj` | no deadlock, runs forever | hangs | CONFIRMED |
+| `examples/par_deadlock.pj` | deadlock (L12, L17) | hangs | CONFIRMED |
+| `examples/par_for_shared.pj` | deadlock (L13) | hangs | language |
+| `examples/pri_alt_skip.pj` | deadlock (L4) | hangs | CONFIRMED |
+| `examples/protocol_fields.pj` | not modelled: 'halt' is not a case of Msg | does not build (ProcessJc crashed) | not modelled |
+| `examples/self_deadlock.pj` | deadlock (L10) | hangs | CONFIRMED |
+| `examples/shared_channel.pj` | no deadlock, terminates | hangs | language |
+| `examples/shared_unlocked_end.pj` | no deadlock, terminates | hangs | language |
+| `examples/starving_loop.pj` | no deadlock, runs forever | hangs | language |
+| test/fixtures/processj/: `Demo.pj`, `barrierEx.pj`, `binexpr.pj`, `bytecode.pj`, `protocolSwitch.pj`, `simplepj.pj` | - | - | does not parse |
+| test/fixtures/processj/: `Demo2.pj`, `Demo_matt.pj`, `Hello.pj`, `Matt.pj`, `SwitchDemo.pj`, `array.pj`, `bartest.pj`, `car.pj`, `channelWR.pj`, `enrolledtest.pj`, `iftest.pj`, `parExp.pj`, `protocols.pj`, `readEx.pj`, `recordchan.pj`, `santatest.pj`, `timer.pj`, `verySimple.pj` | no deadlock, terminates | finishes | CONFIRMED |
+| test/fixtures/processj/: `localDecl.pj`, `silly.pj`, `test22.pj` | - | - | no main |
+| test/differential/: `alt_per_par_branch.pj`, `barrier_enroll.pj`, `both_ends_to_proc.pj`, `break_after_for_nonyield.pj`, `break_after_nested_while.pj`, `break_after_par.pj`, `break_before_nested_for.pj`, `break_in_inner_for.pj`, `break_in_plain_while.pj`, `breaks_that_work.pj`, `const_from_channel_read.pj`, `const_from_variable_in_main.pj`, `extended_rendezvous.pj`, `forwarded_end.pj`, `loop_reader.pj`, `nested_par.pj`, `null_compare.pj`, `par_for_body_statements.pj`, `par_for_shared_even.pj`, `par_loop_in_own_proc.pj`, `pri_alt_precondition.pj`, `proc_only_calls.pj`, `sequential_pars.pj`, `shared_writers_locked.pj`, `switch_break_after_for.pj`, `timeout_is_a_deadline.pj`, `timer_arith.pj`, `two_alts_one_process.pj`, `while_true_with_break.pj` | no deadlock, terminates | finishes | CONFIRMED |
+| test/differential/: `alt_timeout_channel_read.pj`, `break_in_par.pj`, `chan_of_string.pj`, `const_from_variable_in_method.pj`, `negated_condition.pj`, `nonvoid_yielding.pj`, `null_assign.pj`, `par_for_twice.pj`, `read_as_array_size.pj`, `read_then_field.pj`, `record_literal_assigned.pj`, `shared_read_param.pj`, `switch_loop_break.pj`, `two_replicated_alts.pj`, `types_mix.pj` | no deadlock, terminates | does not build | not built |
+| test/differential/: `array_long_index.pj` | - | - | no main |
+| examples/: `clean_pipeline.pj`, `const_from_variable.pj`, `par_for_body.pj`, `parallel_usage.pj`, `timer_deadline.pj`, `yield_through_calls.pj` | no deadlock, terminates | finishes | CONFIRMED |
+| examples/: `overloads.pj`, `read_placement.pj`, `typos.pj`, `use_import.pj` | no deadlock, terminates | does not build | not built |
+
+Every verdict that differs from the run says why in its report. FDR finds a
+deadlock in five programs that really finish: three where an alt takes its
+skip or timeout guard while a guard written before it could be ready
+(`alttest.pj`, `alt_skip_no_writer.pj`, `alt_timeout_guard.pj`; `NetworkProc.pj`
+can run forever the same way), `stop_ignored.pj` (this build ignores `stop`)
+and `fibonacci.pj` (this build runs its `par for` body statement by statement,
+so the write and the read of an iteration no longer wait for each other).
+Thirteen programs hang while FDR finds no deadlock: the four `test/differential`
+programs recorded as `deadlocks` and two examples because this build takes no
+lock for a shared channel end used inline or through a plain parameter, five
+`runs-wrong` programs because a `break` or `continue` after a nested `for`,
+`par for` or `do` jumps to the inner loop's exit, `par_loop_of_calls.pj`
+because a par branch looping over suspending calls ends its par early, and
+`short_circuit_read.pj` because this build reads `d` in `x > 5 && d.read() > 0`
+although `x` is 0. `replicated_alt_precondition.pj` stops with a runtime error
+where the language takes the alt's index 2, because this build evaluates the
+precondition `i == 2` once, with `i = 0`. Three programs hang as FDR says and
+are not confirmed all the same: `break_after_nested_for.pj` hangs because its
+consumer stops with a NullPointerException (the `break` after the nested `for`
+jumps to the inner loop's exit, `compiler/loop-labels`), not in FDR's deadlock,
+in which the consumer has ended and the producer waits to write; for
+`par_for_shared.pj` (`pj/par-for-body`, `pj/shared-channel-end`) and
+`starving_loop.pj` (`pj/starving-loop`: the scheduler freezes every process,
+where the model has one loop running forever) the report says the compiled
+program differs from the model, so the hang may have another cause.

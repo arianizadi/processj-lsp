@@ -6,7 +6,7 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { run } from './checker.test';
+import { run } from './checker-helpers';
 
 const MAIN = (body: string, extra = '') => `import std.*;\n${extra}\npublic void main(string[] args) {\n${body}\n}\n`;
 
@@ -82,21 +82,26 @@ test('a record or protocol literal is only compilable as a declaration initialis
   assert.match(hits[0][1], /only be compiled as the initialiser of a declaration/);
 });
 
-test('per-process limits: a second alt or par for in one process, but not one per par branch', () => {
-  const twoAlts = of('import std.*;\npublic void f(chan<int>.read a, chan<int>.read b) {\n    int x;\n    alt { x = a.read() : { } }\n    alt { x = b.read() : { } }\n}\npublic void main(string[] args) { }\n', 'pj/multiple-alts');
-  assert.deepEqual(twoAlts.map(([line]) => line), [4]);
-  assert.match(twoAlts[0][1], /second alt in the same process/);
+test('per-process limits: a second replicated alt or par for in one process, but not one per par branch', () => {
+  // Built and run with this compiler (branch alt_timer_update): plain alts one after another, nested,
+  // with preconditions and timeout guards, and one replicated alt among them, all build and run; a
+  // second replicated alt in one process fails javac (`repAltBooleanGuards is already defined`).
+  const plain = run('import std.*;\npublic void f(chan<int>.read a, chan<int>.read b) {\n    int x;\n    alt { x = a.read() : { } }\n    alt { x = b.read() : { } }\n    alt (int i = 0; i < 2; i++) { x = a.read() : { } }\n}\npublic void main(string[] args) { }\n');
+  assert.deepEqual(plain.diagnostics.filter((d) => d.code === 'pj/multiple-alts'), [], 'plain alts and one replicated alt build');
+  const twoReplicated = of('import std.*;\npublic void f(chan<int>.read a) {\n    int x;\n    alt (int i = 0; i < 2; i++) { x = a.read() : { } }\n    alt { x = a.read() : { } }\n    alt (int j = 0; j < 2; j++) { x = a.read() : { } }\n}\npublic void main(string[] args) { }\n', 'pj/multiple-alts');
+  assert.deepEqual(twoReplicated.map(([line]) => line), [5]);
+  assert.match(twoReplicated[0][1], /^A second replicated alt in the same process cannot be compiled by this ProcessJ build/);
 
-  // One alt per par branch is one alt per generated class, which the compiler accepts.
-  const perBranch = run('import std.*;\npublic void f(chan<int>.read a, chan<int>.read b) {\n    int x;\n    par {\n        alt { x = a.read() : { } }\n        alt { x = b.read() : { } }\n    }\n}\npublic void main(string[] args) { }\n');
+  // One replicated alt per par branch is one per generated class, which the compiler accepts.
+  const perBranch = run('import std.*;\npublic void f(chan<int>.read a, chan<int>.read b) {\n    int x;\n    par {\n        alt (int i = 0; i < 2; i++) { x = a.read() : { } }\n        alt (int j = 0; j < 2; j++) { x = b.read() : { } }\n    }\n}\npublic void main(string[] args) { }\n');
   assert.deepEqual(perBranch.diagnostics.filter((d) => d.code === 'pj/multiple-alts'), []);
 
   const twoParFors = of(MAIN('    par for (int i = 0; i < 2; i++) println("a" + i);\n    par for (int j = 0; j < 2; j++) println("b" + j);'), 'pj/compiler-limit');
   assert.deepEqual(twoParFors.map(([line]) => line), [4]);
   assert.match(twoParFors[0][1], /second 'par for' in the same process/);
 
-  const threeAlts = of('void f(chan<int>.read c) { int x; alt { x = c.read() : { } } alt { x = c.read() : { } } alt { x = c.read() : { } } }', 'pj/multiple-alts');
-  assert.equal(threeAlts.length, 2, 'every occurrence after the first is rejected');
+  const threeReplicated = of('void f(chan<int>.read c) { int x; alt (int i = 0; i < 1; i++) { x = c.read() : { } } alt (int j = 0; j < 1; j++) { x = c.read() : { } } alt (int k = 0; k < 1; k++) { x = c.read() : { } } }', 'pj/multiple-alts');
+  assert.equal(threeReplicated.length, 2, 'every occurrence after the first is rejected');
   const threeParFors = of('void f() { par for (int i = 0; i < 1; i++) skip; par for (int j = 0; j < 1; j++) skip; par for (int k = 0; k < 1; k++) skip; }', 'pj/compiler-limit');
   assert.equal(threeParFors.filter(([, message]) => /second 'par for'/.test(message)).length, 2, 'every occurrence after the first is rejected');
 });
@@ -114,17 +119,19 @@ test('a par for body with several statements runs each of them as its own proces
   assert.deepEqual(single.diagnostics.filter((d) => d.code === 'pj/par-for-body'), []);
 });
 
-test('an alt timeout guard takes a plain deadline: a read inside it is a compiler limit', () => {
-  const src = MAIN('    chan<int> c;\n    timer t;\n    int x;\n    long deadline = t.read() + 1000;\n    par {\n        c.write(1);\n        alt {\n            x = c.read() : { println("read " + x); }\n            t.timeout(t.read() + 1000) : { println("late"); }\n        }\n    }\n    alt {\n        x = c.read() : { }\n        t.timeout(deadline) : { }\n    }');
+test('an alt timeout guard: a timer read in its deadline builds, a channel read there is a compiler limit', () => {
+  // Built and run with this compiler (branch alt_timer_update, since commit 179847f): a timer read in
+  // a guard's deadline is waited for (the first alt prints `read 1`; with no writer it prints `late`
+  // once the deadline has passed); with `d.read()` in the deadline javac rejects the generated Java.
+  const src = MAIN('    chan<int> c;\n    chan<long> d;\n    timer t;\n    int x;\n    long deadline = t.read() + 1000;\n    par {\n        c.write(1);\n        alt {\n            x = c.read() : { println("read " + x); }\n            t.timeout(t.read() + 1000) : { println("late"); }\n        }\n    }\n    alt {\n        x = c.read() : { }\n        t.timeout(t.read() + d.read()) : { }\n    }\n    alt {\n        x = c.read() : { }\n        t.timeout(deadline) : { }\n    }');
   const r = run(src);
   const limits = r.diagnostics.filter((d) => d.code === 'pj/compiler-limit' && /alt timeout guard/.test(d.message));
-  assert.deepEqual(limits.map((d) => d.line), [11]);
-  assert.match(limits[0].message, /compute the deadline into a variable before the alt/);
+  assert.deepEqual(limits.map((d) => [d.line, d.startCol]), [[17, 29]], 'only the channel read, not the timer reads');
+  assert.match(limits[0].message, /^A channel read inside an alt timeout guard cannot be compiled by this ProcessJ build; read the value into a variable before the alt/);
 
-  // The constant-delay advice inside an alt cannot be the inline rewrite, which
-  // would itself fail to compile there.
+  // A constant delay inside an alt gets the same inline fix as anywhere else: the result builds there too.
   const inAlt = run(MAIN('    chan<int> c;\n    timer t;\n    int x;\n    par {\n        c.write(1);\n        alt {\n            x = c.read() : { }\n            t.timeout(1000) : { }\n        }\n    }'));
   const deadline = inAlt.diagnostics.find((d) => d.code === 'pj/timeout-deadline');
-  assert.equal(deadline?.fix, undefined);
-  assert.match(deadline?.message ?? '', /Set 'long deadline = t\.read\(\) \+ 1000;' before the alt/);
+  assert.deepEqual(deadline?.fix, { kind: 'edit', title: "Wait from now: 't.read() + ...'", line: 10, col: 22, endCol: 22, text: 't.read() + ' });
+  assert.match(deadline?.message ?? '', /Write 't\.read\(\) \+ 1000' to wait that many milliseconds from now/);
 });

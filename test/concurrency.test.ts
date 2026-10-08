@@ -4,6 +4,8 @@ import { analyzeProcedureEffects } from '../src/checker/effects';
 import { check } from '../src/checker/checker';
 import { DeclIndex } from '../src/checker/index';
 import { buildConcurrencyGraph, formatConcurrencyMarkdown } from '../src/concurrency';
+import { buildNetwork } from '../src/graph/network';
+import { staticVerificationReport } from '../src/graph/static-verification';
 import { channelInlays } from '../src/inlays';
 import { parse } from '../src/parser/parser';
 
@@ -42,12 +44,13 @@ test('the concurrency graph connects procedures, branches, calls and channels wi
   assert.ok(Object.values(graph.procedureEffects).flat().some((effect) => effect.label === 'writes channel #1'));
   assert.doesNotThrow(() => JSON.stringify(graph));
 
-  const report = formatConcurrencyMarkdown('graph.pj', graph);
+  const network = buildNetwork(parsed.program, checked, { uri: 'file:///graph.pj', text: source, effects: effects.summaries, index });
+  const report = formatConcurrencyMarkdown('graph.pj', network);
   assert.match(report, /flowchart LR/);
   assert.match(report, /Procedure effects/);
-  assert.match(report, /produce/);
-  assert.match(report, /-->\|"produce\(chan‹int›\.write\)"\|/, 'Mermaid-sensitive call punctuation is contained in a quoted edge label');
-  assert.doesNotMatch(report, /-->\|produce\(/);
+  assert.match(report, /\| `values` \| int \| produce\(values\) \| println\(…\) \|/, 'the channel table names the writer and the reader');
+  assert.match(report, /\["produce\(values\)"\]/, 'Mermaid-sensitive call punctuation is contained in a quoted node label');
+  assert.match(report, /-->\|"values : int"\|/, 'channel labels are quoted');
 });
 
 test('unreachable operations are absent from the exact execution graph', () => {
@@ -88,7 +91,10 @@ test('deadlock diagnostics and graph facts retain every causal wait location', (
   const graph = buildConcurrencyGraph(parsed.program, checked, index, { uri: 'file:///deadlock.pj', effects: effects.summaries });
   assert.equal(graph.deadlocks.length, 1);
   assert.equal(graph.deadlocks[0].waits.length, 2);
-  assert.match(formatConcurrencyMarkdown('deadlock.pj', graph), /Circular wait/);
+  const network = buildNetwork(parsed.program, checked, { uri: 'file:///deadlock.pj', text: source, effects: effects.summaries, index });
+  const markdown = formatConcurrencyMarkdown('deadlock.pj', network, [staticVerificationReport(parsed.program, checked, { uri: 'file:///deadlock.pj', model: network })]);
+  assert.match(markdown, /circular wait/);
+  assert.match(markdown, /branch 1 is stuck at line 5 writing left/);
 });
 
 test('concurrency graph distinguishes multiple missing peers from a circular wait', () => {
@@ -109,9 +115,10 @@ test('concurrency graph distinguishes multiple missing peers from a circular wai
 
   const graph = buildConcurrencyGraph(parsed.program, checked, index, { uri: 'file:///missing-peers.pj', effects: effects.summaries });
   assert.equal(graph.deadlocks[0]?.cause, 'missing-peer');
-  const report = formatConcurrencyMarkdown('missing-peers.pj', graph);
-  assert.match(report, /Missing peer/);
-  assert.doesNotMatch(report, /Circular wait/);
+  const network = buildNetwork(parsed.program, checked, { uri: 'file:///missing-peers.pj', text: source, effects: effects.summaries, index });
+  const report = formatConcurrencyMarkdown('missing-peers.pj', network, [staticVerificationReport(parsed.program, checked, { uri: 'file:///missing-peers.pj', model: network })]);
+  assert.match(report, /nothing can still read/);
+  assert.doesNotMatch(report, /circular wait/i);
 });
 
 test('channel inlays summarize direction, topology, transitive use and hazards once per declaration', () => {

@@ -7,7 +7,7 @@
  * found, and (for misspelled keywords) what was probably meant.
  */
 import { KEYWORDS, PRIMITIVE_TYPES } from '../keywords';
-import { tokenize, type CommentToken, type LexIssue, type Token } from '../tokens';
+import { matchingClose, tokenize, type CommentToken, type LexIssue, type Token } from '../tokens';
 import type * as A from './ast';
 import { identToString, qualifierToString } from './ast';
 
@@ -23,6 +23,8 @@ const PRIMITIVES = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', '
 const MODIFIERS = new Set(['public', 'private', 'protected', 'native', 'mobile', 'const']);
 const ASSIGN_OPS = new Set(['=', '*=', '/=', '%=', '+=', '-=', '<<=', '>>=', '>>>=', '&=', '^=', '|=']);
 const TYPE_KEYWORDS = ['chan', 'shared', ...PRIMITIVE_TYPES];
+/** The pragmas library/Library.java knows, and whether each takes a string value. */
+const PRAGMA_TAKES_VALUE: Record<string, boolean> = { LIBRARY: false, LANGUAGE: true, NATIVE: false, NATIVELIB: true, FILE: true };
 /** Expression/statement/block nesting beyond which the parser gives up rather than overflow the stack. */
 const MAX_NESTING = 400;
 const TOP_LEVEL_KEYWORDS = ['public', 'private', 'protected', 'native', 'mobile', 'const', 'record', 'protocol', 'extern', 'import', 'package', 'void', ...TYPE_KEYWORDS];
@@ -141,6 +143,16 @@ class Parser {
    */
   private exprDepth = 1;
   private readonly declaredTypes = new Set<string>();
+  /** The `>` pieces split off a `>>` token, which was reported once already. */
+  private readonly splitPieces = new WeakSet<Token>();
+  /** Pragma names seen so far, upper-cased as the compiler compares them. */
+  private readonly pragmaNames = new Set<string>();
+  /**
+   * Where the current expression statement (or alt guard) starts. A channel
+   * write, `.sync()` or `.timeout(...)` is a statement form in the compiler's
+   * grammar, valid only as the whole of one.
+   */
+  private statementStart: A.Pos | undefined;
   private readonly eof: Token;
 
   constructor(
@@ -323,12 +335,23 @@ class Parser {
     }
   }
 
-  /** In a type, `>>` must be read as two `>` tokens (`chan<chan<int>>`). */
+  /**
+   * `chan<chan<int>>` closes two types with one `>>` token. The compiler's lexer
+   * reads that as a shift operator and rejects the type, so report it, then
+   * split the token into `>` pieces to keep parsing the type as meant.
+   */
   private splitGtGt(): void {
     const t = this.peek();
     if (t.kind === 'punct' && (t.text === '>>' || t.text === '>>>' || t.text === '>>=' || t.text === '>>>=')) {
+      if (!this.splitPieces.has(t)) {
+        const closers = t.text.replace('=', '');
+        const spaced = closers.split('').join(' ');
+        const fix = t.text.endsWith('=') ? undefined : this.replaceFix(t, spaced, `Change to '${spaced}'`);
+        this.error(t, `The ProcessJ lexer reads '${closers}' as a shift operator, so nested channel types must close with '${spaced}'`, fix);
+      }
       const first: Token = { ...t, text: '>', end: t.col + 1 };
       const rest: Token = { ...t, text: t.text.slice(1), col: t.col + 1 };
+      this.splitPieces.add(rest);
       this.toks.splice(this.i, 1, first, rest);
     }
   }
@@ -387,11 +410,30 @@ class Parser {
       }
       this.next();
     }
+    const nameTok = this.peek();
     const name = this.expectIdent('a pragma name');
     let value: string | undefined;
     if (this.peek().kind === 'string') value = this.next().text;
     this.expect(';', 'after the pragma');
+    this.checkPragma(nameTok, name.name, value !== undefined);
     return { kind: 'Pragma', name, value, span: this.span(start) };
+  }
+
+  /**
+   * The compiler decodes pragmas (library/Library.java) before anything else and
+   * stops at an unknown name, a wrong number of values, or a repeated name.
+   */
+  private checkPragma(tok: Token, name: string, hasValue: boolean): void {
+    if (name === '<missing>') return;
+    const upper = name.toUpperCase();
+    if (!(upper in PRAGMA_TAKES_VALUE)) {
+      this.error(tok, `Unknown pragma '${name}'; the compiler accepts only ${Object.keys(PRAGMA_TAKES_VALUE).join(', ')}`);
+    } else if (PRAGMA_TAKES_VALUE[upper] !== hasValue) {
+      this.error(tok, PRAGMA_TAKES_VALUE[upper] ? `Pragma '${name}' needs a string value: '#pragma ${name} "...";'` : `Pragma '${name}' takes no value`);
+    } else if (this.pragmaNames.has(upper)) {
+      this.error(tok, `Pragma '${name}' is repeated; the compiler accepts each pragma once`);
+    }
+    this.pragmaNames.add(upper);
   }
 
   private parseDottedName(): A.Ident[] {
@@ -744,6 +786,9 @@ class Parser {
     const dims = this.parseDims();
     if (base.kind === 'NamedType' && base.name.qualifier?.length && dims === 0) {
       this.error(t, `A package-qualified named type must be an array in this compiler grammar; '${identToString(base.name)}[]' is valid, but '${identToString(base.name)}' is not`);
+    } else if (base.kind === 'NamedType' && base.name.qualifier?.length === 1 && dims > 0) {
+      // CUP's `primary :: IDENTIFIER dims`: a bare name is not a primary, a dotted one is.
+      this.error(t, `The compiler grammar accepts a package-qualified array type only with a dotted package such as 'a.b::T[]'; for '${identToString(base.name)}[]' import the package and write '${base.name.name}[]'`);
     }
     if (dims > 0) return { kind: 'ArrayType', elem: base, dims, span: this.span(start) };
     return base;
@@ -936,6 +981,8 @@ class Parser {
       this.next();
       this.next();
       const stmt = this.parseStatement() ?? { kind: 'EmptyStmt' as const, span: this.span(start) };
+      // The compiler sets the label on the statement it parsed, and `;` parses to null.
+      if (stmt.kind === 'EmptyStmt') this.error(t, `Label '${t.text}' must be followed by a statement; the compiler fails on a label before an empty statement`);
       return { kind: 'LabeledStmt', label: this.ident(t), stmt, span: this.span(start) };
     }
 
@@ -973,7 +1020,7 @@ class Parser {
     const startTok = this.peek();
     const errorsBefore = this.errors.length;
     const lastErrorBefore = this.lastErrorTok;
-    const expr = this.parseExpression();
+    const expr = this.parseStatementExpression(start);
     if (expr.kind === 'ErrorExpr') {
       this.skipTo([';', '}'], false);
       this.accept(';');
@@ -1007,6 +1054,17 @@ class Parser {
       if (!this.at('}') && this.peek().line === this.endPos().line) this.skipTo([';', '}'], false), this.accept(';');
     }
     return { kind: 'ExprStmt', expr, span: this.span(start) };
+  }
+
+  /** An expression that is a whole statement or alt guard, where statement-only operations may appear. */
+  private parseStatementExpression(start: A.Pos): A.Expr {
+    const outer = this.statementStart;
+    this.statementStart = start;
+    try {
+      return this.parseExpression();
+    } finally {
+      this.statementStart = outer;
+    }
   }
 
   private parseLocalDecl(): A.LocalDecl {
@@ -1060,7 +1118,15 @@ class Parser {
     const cond = this.parseCondition('if');
     const then = this.parseSubStatement('if');
     let els: A.Stmt | undefined;
-    if (this.accept('else')) els = this.parseSubStatement('else');
+    if (this.at('else')) {
+      const label = trailingLabel(then);
+      if (label) {
+        const at = label.label.span;
+        this.error({ kind: 'ident', text: label.label.name, line: at.start.line, col: at.start.col, end: at.end.col }, `A labeled statement cannot end the branch before 'else' in the compiler grammar; put the 'if' branch in braces`);
+      }
+      this.next();
+      els = this.parseSubStatement('else');
+    }
     return { kind: 'IfStmt', cond, then, else: els, span: this.span(start) };
   }
 
@@ -1070,7 +1136,10 @@ class Parser {
     const barriers: A.Expr[] = [];
     let barrierParens = false;
     if (this.accept('enroll')) {
-      if (this.accept('(')) {
+      // CUP's barriers are a plain expression list, so `(b).x, c` is fine; only
+      // a parenthesised list right before the block gets the one-barrier check.
+      if (this.at('(') && this.toks[matchingClose(this.toks, this.i) + 1]?.text === '{') {
+        this.next();
         barrierParens = true;
         barriers.push(this.parseExpression());
         while (this.at(',')) {
@@ -1162,14 +1231,26 @@ class Parser {
     const channels: Array<A.Expr | A.LocalDecl> = [];
     if (this.expect('(', "after 'claim'")) {
       for (;;) {
+        // CUP's `channel`: IDENTIFIER | chan_expression | channel_type IDENTIFIER = primary_no_new_array_or_mobile.
         if (this.at('chan') || this.at('shared')) {
           const cstart = this.startPos();
           const type = this.parseChanType();
           const name = this.expectIdent('a name for the claimed channel');
           this.expect('=', 'in the claim declaration');
+          const initTok = this.peek();
           const init = this.parseExpression();
+          if (!['Literal', 'RecordLiteral', 'ProtocolLiteral', 'ParenExpr', 'RecordAccess', 'Invocation', 'ArrayAccess', 'ErrorExpr'].includes(init.kind)) {
+            this.error(initTok, `The compiler grammar accepts only a field, call, element or parenthesised value after '=' in a claim declaration${init.kind === 'NameExpr' ? `; write '(${sourceOf(init)})'` : ''}`);
+          }
           channels.push({ kind: 'LocalDecl', isConst: false, isMobile: false, type, declarators: [{ kind: 'Declarator', name, dims: 0, init, span: this.span(cstart) }], span: this.span(cstart) });
-        } else channels.push(this.parseExpression());
+        } else {
+          const channelTok = this.peek();
+          const channel = this.parseExpression();
+          if (!((channel.kind === 'NameExpr' && !channel.qualifier?.length) || channel.kind === 'ChanEnd' || channel.kind === 'ErrorExpr')) {
+            this.error(channelTok, "A claim takes channel names and channel ends such as 'c' or 'r.out.write', or a declaration such as 'chan<int>.write w = r.out'");
+          }
+          channels.push(channel);
+        }
         if (this.accept(',')) continue;
         break;
       }
@@ -1251,6 +1332,16 @@ class Parser {
     return { kind: 'AltStmt', isPri, replicated, cases, span: this.span(start) };
   }
 
+  /**
+   * `(cond) && guard`, as opposed to a timeout guard on a parenthesised primary
+   * such as `(t).timeout(d)`: only a member, index or `::` continues the latter.
+   */
+  private atPrecondition(): boolean {
+    if (!this.at('(')) return false;
+    const after = this.toks[matchingClose(this.toks, this.i) + 1];
+    return !(after?.kind === 'punct' && (after.text === '.' || after.text === '[' || after.text === '::'));
+  }
+
   private parseAltCase(): A.AltCase {
     const start = this.startPos();
     if (this.at('alt') || this.at('pri')) {
@@ -1258,7 +1349,7 @@ class Parser {
       return { kind: 'AltCase', nested, span: this.span(start) };
     }
     let precondition: A.Expr | undefined;
-    if (this.at('(')) {
+    if (this.atPrecondition()) {
       this.next();
       precondition = this.parseExpression();
       this.expect(')', 'to close the alt precondition');
@@ -1270,7 +1361,7 @@ class Parser {
       guard = { kind: 'SkipGuard', span: this.span(gstart) };
     } else {
       const gtok = this.peek();
-      const e = this.parseExpression();
+      const e = this.parseStatementExpression(gstart);
       if (e.kind === 'AssignExpr' && e.op === '=' && e.value.kind === 'ChanRead') guard = { kind: 'ReadGuard', target: e.target, read: e.value, span: this.span(gstart) };
       else if (e.kind === 'Timeout') guard = { kind: 'TimeoutGuard', timeout: e, span: this.span(gstart) };
       else if (e.kind === 'ChanRead') this.error(gtok, `An alt guard must store the value: write 'v = ${sourceOf(e.target)}.read()'`, { title: "Store the value in 'v'", line: gtok.line, col: gtok.col, endCol: gtok.col, text: 'v = ' });
@@ -1347,16 +1438,22 @@ class Parser {
     const start = this.startPos();
     let left = this.parseUnary();
     let depth = this.exprDepth;
+    // A right operand absorbs every tighter operator, except after `is`, whose
+    // right side is a type name: `a is T` is a relational_expression in CUP, so
+    // only relational or looser operators may follow it.
+    let ceiling = Infinity;
     for (;;) {
       const t = this.peek();
       const op = t.text;
       const prec = (t.kind === 'punct' || (t.kind === 'keyword' && op === 'is')) ? BINARY_PRECEDENCE[op] : undefined;
       if (prec === undefined || prec < minPrec) break;
+      if (prec > ceiling) this.error(t, `'${op}' binds tighter than 'is', so it cannot apply to an 'is' test; put the test in parentheses: '(x is T) ${op} ...'`);
       this.next();
       if (op === 'is') {
         const typeName = this.parseTypeName("a protocol case name after 'is'");
         left = { kind: 'IsExpr', expr: left, typeName, span: this.span(start) };
         depth++;
+        ceiling = prec;
       } else {
         const right = this.parseBinary(prec + 1);
         left = { kind: 'BinaryExpr', op, left, right, span: this.span(start) };
@@ -1395,8 +1492,9 @@ class Parser {
         this.exprDepth++;
         return { kind: 'UnaryExpr', op: t.text, prefix: true, operand, span: this.span(start) };
       }
-      if (t.text === '(' && this.isCastAhead()) {
-        this.next();
+      const parens = t.text === '(' ? this.castParens() : 0;
+      if (parens > 0) {
+        for (let p = 0; p < parens; p++) this.next();
         const typeToken = this.peek();
         let type: A.TypeNode;
         // CUP parses a named cast through `expression`, so this is one of the
@@ -1407,7 +1505,7 @@ class Parser {
           type = { kind: 'NamedType', name, span: this.span(typeStart) };
         } else type = this.parseType();
         if (type.kind === 'ArrayType') this.error(typeToken, 'Array casts are not accepted by the ProcessJ grammar');
-        this.expect(')', 'to close the cast');
+        for (let p = 0; p < parens; p++) this.expect(')', 'to close the cast');
         const expr = this.nested(() => this.tooDeepExpr(start), () => this.parseUnary());
         this.exprDepth++;
         return { kind: 'CastExpr', type, expr, span: this.span(start) };
@@ -1416,33 +1514,44 @@ class Parser {
     return this.parsePostfix();
   }
 
-  /** `(int) x` is always a cast; `(Name) x` is a cast only when followed by an operand that cannot continue an expression. */
-  private isCastAhead(): boolean {
+  /**
+   * How many `(` open a cast here, or 0 when this is not one. `(int) x` is
+   * always a cast; `(Name) x` only when followed by an operand that cannot
+   * continue an expression. CUP casts to a name inside any number of
+   * parentheses (it checks that `( expression )` is a name), so `((Name)) x` too.
+   */
+  private castParens(): number {
     const t1 = this.peek(1);
     if (t1.kind === 'keyword' && PRIMITIVES.has(t1.text)) {
       // (int) x  or  (int[]) x
       let k = 2;
       while (this.peek(k).text === '[' && this.peek(k + 1).text === ']') k += 2;
-      return this.peek(k).text === ')';
+      return this.peek(k).text === ')' ? 1 : 0;
     }
-    if (t1.kind === 'ident') {
-      const nameLength = this.qualifiedNameLength(1);
-      const close = 1 + nameLength;
-      if (nameLength > 0 && this.peek(close).text === ')') {
-        const operand = this.peek(close + 1);
-        if (operand.kind === 'ident' || operand.kind === 'number' || operand.kind === 'string' || operand.kind === 'char') return true;
-        if (operand.kind === 'keyword') return operand.text === 'new' || operand.text === 'true' || operand.text === 'false' || operand.text === 'null' || operand.text === 'fork';
-        if (operand.kind === 'punct') return operand.text === '(' || operand.text === '!' || operand.text === '~';
-      }
-    }
-    return false;
+    // Bounded like every other nesting, so a long run of `(` stays linear.
+    let opens = 1;
+    while (opens <= MAX_NESTING && this.at('(', opens)) opens++;
+    const nameLength = this.qualifiedNameLength(opens);
+    if (nameLength === 0) return 0;
+    let k = opens + nameLength;
+    for (let p = 0; p < opens; p++, k++) if (!this.at(')', k)) return 0;
+    const operand = this.peek(k);
+    if (operand.kind === 'ident' || operand.kind === 'number' || operand.kind === 'string' || operand.kind === 'char') return opens;
+    if (operand.kind === 'keyword') return ['new', 'true', 'false', 'null', 'fork'].includes(operand.text) ? opens : 0;
+    if (operand.kind === 'punct') return operand.text === '(' || operand.text === '!' || operand.text === '~' ? opens : 0;
+    return 0;
   }
 
   private parsePostfix(): A.Expr {
     const start = this.startPos();
+    const startTok = this.peek();
     let e = this.parsePrimary();
     let depth = this.exprDepth;
     for (;;) {
+      // CUP applies '.', '[' and '::' to a primary; 'x++' is not one.
+      if (e.kind === 'UnaryExpr' && !e.prefix && (this.at('.') || this.at('[') || (this.at('::') && this.atIdent(1)))) {
+        this.error(this.peek(), `'${e.op}' ends the expression; wrap it in parentheses to apply '${this.peek().text}' to the result`);
+      }
       // Member, index and call chains build a left-deep tree that later walkers recurse down.
       if (this.at('.') || this.at('[') || this.at('(')) {
         if (++depth > MAX_NESTING) {
@@ -1470,6 +1579,7 @@ class Parser {
             const value = this.parseExpression();
             this.expect(')', "to close '.write('");
             e = { kind: 'ChanWrite', target: e, value, span: this.span(start) };
+            this.checkStatementForm(start, startTok, "A channel write '.write(...)'");
           } else e = { kind: 'ChanEnd', target: e, end: 'write', span: this.span(start) };
           continue;
         }
@@ -1479,6 +1589,7 @@ class Parser {
           this.expect('(', "after 'sync'");
           this.expect(')', "after 'sync('");
           e = { kind: 'Sync', target: e, span: this.span(start) };
+          this.checkStatementForm(start, startTok, "A barrier '.sync()'");
           continue;
         }
         if (m.kind === 'keyword' && m.text === 'timeout') {
@@ -1488,6 +1599,7 @@ class Parser {
           const delay = this.parseExpression();
           this.expect(')', "to close 'timeout('");
           e = { kind: 'Timeout', target: e, delay, span: this.span(start) };
+          this.checkStatementForm(start, startTok, "A timer '.timeout(...)'");
           continue;
         }
         if (m.kind === 'ident') {
@@ -1505,6 +1617,8 @@ class Parser {
         continue;
       }
       if (this.at('[')) {
+        const unindexable = unindexableTarget(e);
+        if (unindexable) this.error(this.peek(), `The compiler grammar cannot index ${unindexable} directly; wrap it in parentheses first: '(...)[i]'`);
         this.next();
         const index = this.parseExpression();
         this.expect(']', 'to close the array index');
@@ -1531,6 +1645,19 @@ class Parser {
     }
     this.exprDepth = depth;
     return e;
+  }
+
+  /**
+   * CUP has channel writes, `.sync()` and `.timeout(...)` only as statements
+   * (`primary . write ( expression ) ;`) and timeouts as alt guards, never as
+   * expressions: the operation must start the statement and end it.
+   */
+  private checkStatementForm(start: A.Pos, startTok: Token, what: string): void {
+    const t = this.peek();
+    const continues = (t.kind === 'punct' && (ASSIGN_OPS.has(t.text) || t.text in BINARY_PRECEDENCE || ['.', '[', '++', '--', '::', '?'].includes(t.text))) || (t.kind === 'keyword' && t.text === 'is');
+    const s = this.statementStart;
+    if (!continues && s && s.line === start.line && s.col === start.col) return;
+    this.error(startTok, `${what} is a statement of its own; it cannot be used as a value or inside an expression`);
   }
 
   private parseArgs(): A.Expr[] {
@@ -1585,6 +1712,8 @@ class Parser {
       case 'number': {
         this.next();
         const litKind = numericLiteralKind(t.text);
+        const tooLarge = integerOverflow(t.text, litKind);
+        if (tooLarge) this.error(t, tooLarge);
         return { kind: 'Literal', litKind, text: t.text, span: this.spanOf(t) };
       }
       case 'string':
@@ -1614,7 +1743,10 @@ class Parser {
             return this.parseNew();
           case 'fork': {
             this.next();
+            const open = this.peek();
             const args = this.parseArgs();
+            // CUP: `FORK LPAREN argument_list RPAREN`, with no empty form.
+            if (args.length === 0 && open.text === '(') this.error(open, "'fork' needs at least one argument");
             return { kind: 'Invocation', name: this.ident(t), args, span: this.span(start) };
           }
         }
@@ -1771,10 +1903,70 @@ function numericLiteralKind(raw: string): A.Literal['litKind'] {
   return 'int';
 }
 
+/**
+ * The compiler builds every int and long literal with Integer.decode or
+ * Long.decode and stops at one that does not fit: unlike Java it rejects
+ * 0xFFFFFFFF, and 2147483648 even after a minus sign.
+ */
+function integerOverflow(raw: string, kind: A.Literal['litKind']): string | undefined {
+  if (kind !== 'int' && kind !== 'long') return undefined;
+  const digits = kind === 'long' ? raw.slice(0, -1) : raw;
+  let value: bigint;
+  try {
+    value = /^0[0-7]+$/.test(digits) ? BigInt(`0o${digits.slice(1)}`) : BigInt(digits);
+  } catch {
+    return undefined; // malformed: the lexer reports it
+  }
+  if (kind === 'int' && value > 2147483647n) return `'${raw}' is too large for an int: the compiler accepts at most 2147483647 (0x7fffffff); add 'L' for a long`;
+  if (kind === 'long' && value > 9223372036854775807n) return `'${raw}' is too large for a long: the compiler accepts at most 9223372036854775807`;
+  return undefined;
+}
+
 function containsVoid(t: A.TypeNode): boolean {
   if (t.kind === 'PrimitiveType') return t.name === 'void';
   if (t.kind === 'ArrayType' || t.kind === 'ChanType') return containsVoid(t.elem);
   return false;
+}
+
+/**
+ * The branch before `else` must be CUP's `statement_no_short_if`, which has no
+ * labeled statement; nor may a loop, claim or else branch at its end hold one.
+ */
+function trailingLabel(s: A.Stmt): A.LabeledStmt | undefined {
+  switch (s.kind) {
+    case 'LabeledStmt':
+      return s;
+    case 'IfStmt':
+      return s.else ? trailingLabel(s.else) : undefined;
+    case 'WhileStmt':
+    case 'ForStmt':
+    case 'ClaimStmt':
+      return trailingLabel(s.body);
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * CUP indexes only a name or a `primary_no_new_array_or_mobile` (a literal, a
+ * parenthesised expression, a field, a call or an element). Describe any other
+ * target, which needs parentheses before `[...]`.
+ */
+function unindexableTarget(e: A.Expr): string | undefined {
+  switch (e.kind) {
+    case 'ChanRead':
+      return 'the result of a channel read';
+    case 'ChanEnd':
+      return 'a channel end';
+    case 'NewArray':
+      return 'a new array';
+    case 'NewMobile':
+      return "a 'new mobile' expression";
+    case 'NameExpr':
+      return e.qualifier?.length ? 'a package-qualified name' : undefined;
+    default:
+      return undefined;
+  }
 }
 
 /** Flatten the expression form CUP accepts as a package path before `::`. */

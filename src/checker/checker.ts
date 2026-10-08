@@ -87,6 +87,8 @@ export interface ChannelFact {
   escaped: boolean;
   branchCount: number;
   hazard?: 'no-writer' | 'no-reader' | 'self-deadlock';
+  /** The channel name of the operation the hazard is reported at (the blocking read or write). */
+  hazardAt?: A.Span;
 }
 
 export interface DeadlockWait {
@@ -209,7 +211,7 @@ class Checker {
    * procedure. It emits one class for a procedure body, one for each par branch
    * and one for each statement of a par for body.
    */
-  private processAlts = 0;
+  private processReplicatedAlts = 0;
   private processParFors = 0;
   /** >0 while inside a par block's branches. */
   private parDepth = 0;
@@ -564,7 +566,7 @@ class Checker {
     this.endOperations = [];
     this.endOperationBySite = new Map();
     this.activeCase = new Map();
-    this.processAlts = 0;
+    this.processReplicatedAlts = 0;
     this.processParFors = 0;
     this.enrolled = new Set();
     this.syncs = [];
@@ -634,6 +636,7 @@ class Checker {
         escaped: use.bare || use.operations.some((op) => !op.direct),
         branchCount: new Set(use.operations.map((op) => op.branch).filter((id): id is number => id !== undefined)).size,
         hazard,
+        hazardAt: hazard === 'no-writer' ? use.reads : hazard === 'no-reader' ? use.writes : hazard === 'self-deadlock' ? use.first : undefined,
       });
     }
     for (const { v, span } of this.syncs) {
@@ -1057,11 +1060,14 @@ class Checker {
     return v ? [v, e.typeName.name] : undefined;
   }
 
-  private altStmt(s: A.AltStmt, nested = false): void {
-    // The compiler merges a nested non-replicated alt into its parent, so only
-    // top-level and replicated alts count towards the one-alt limit.
-    if (!nested || s.replicated) this.processAlts++;
-    if (this.processAlts >= 2) this.error({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + (s.isPri ? 7 : 3) } }, 'pj/multiple-alts', `A second alt in the same process cannot be compiled by this ProcessJ build (its generated guard array is declared twice); move this one into its own procedure or into a separate par branch`);
+  private altStmt(s: A.AltStmt): void {
+    // A replicated alt declares its guard lists in the generated process's
+    // run(), so a second one in the same process fails javac. Plain alts, nested
+    // or one after another, build and run with this compiler (since its commits
+    // 1173e1c and 179847f), with one replicated alt among them. Verified by
+    // building and running each.
+    if (s.replicated) this.processReplicatedAlts++;
+    if (s.replicated && this.processReplicatedAlts >= 2) this.error({ start: s.span.start, end: { line: s.span.start.line, col: s.span.start.col + (s.isPri ? 7 : 3) } }, 'pj/multiple-alts', `A second replicated alt in the same process cannot be compiled by this ProcessJ build (its generated guard lists are declared twice); move this one into its own procedure or into a separate par branch`);
     this.insideAlt++;
     this.push();
     if (s.replicated) {
@@ -1082,7 +1088,7 @@ class Checker {
     }
     for (const c of s.cases) {
       if (c.nested) {
-        this.altStmt(c.nested, true);
+        this.altStmt(c.nested);
         continue;
       }
       this.push();
@@ -1384,17 +1390,18 @@ class Checker {
 
   /**
    * Run `body` as its own generated process class, so the per-class compiler
-   * limits (one alt, one par for) are counted separately from the enclosing one.
+   * limits (one replicated alt, one par for) are counted separately from the
+   * enclosing one.
    */
   private inProcess<T>(body: () => T): T {
-    const alts = this.processAlts;
+    const alts = this.processReplicatedAlts;
     const parFors = this.processParFors;
-    this.processAlts = 0;
+    this.processReplicatedAlts = 0;
     this.processParFors = 0;
     try {
       return body();
     } finally {
-      this.processAlts = alts;
+      this.processReplicatedAlts = alts;
       this.processParFors = parFors;
     }
   }
@@ -1772,23 +1779,21 @@ class Checker {
     // timer expires, so `t.timeout(300)` is a deadline 300 ms after the epoch:
     // it has already passed and the timeout returns at once. Verified by running
     // both spellings: 1 ms elapsed against 306 ms for `t.timeout(t.read() + 300)`.
-    // An alt guard is generated inline, so a read inside its deadline expression
-    // produces invalid Java. A deadline computed into a local first is fine.
-    const guardRead = inAlt ? findRead(e.delay) : undefined;
+    // An alt guard's deadline is generated inline. A timer read there builds and
+    // runs (since ProcessJ commit 179847f, "Fix: Timer reads in channel guards");
+    // a channel read is generated as its blocking code in the middle of the
+    // expression, which javac rejects. Both verified by building and running.
+    const guardRead = inAlt ? findRead(e.delay, (read) => !isPrim(this.types.get(read.target) ?? T.unknown, 'timer')) : undefined;
     if (guardRead) {
-      this.report(guardRead.span, 'warning', 'pj/compiler-limit', "A read inside an alt timeout guard cannot be compiled by this ProcessJ build; compute the deadline into a variable before the alt and use that variable as the guard");
+      this.report(guardRead.span, 'warning', 'pj/compiler-limit', 'A channel read inside an alt timeout guard cannot be compiled by this ProcessJ build; read the value into a variable before the alt and use that variable in the guard');
     }
     if (isPrim(t, 'timer') && this.isConstantDelay(e.delay)) {
       const timer = this.slice(e.target.span);
       const delay = this.slice(e.delay.span);
-      // The same rewrite would not compile as an alt guard, so there it is
-      // described rather than offered.
-      const fix: FixHint | undefined = !inAlt && timer && e.delay.span.start.line === e.delay.span.end.line
+      const fix: FixHint | undefined = timer && e.delay.span.start.line === e.delay.span.end.line
         ? { kind: 'edit', title: `Wait from now: '${timer}.read() + ...'`, line: e.delay.span.start.line, col: e.delay.span.start.col, endCol: e.delay.span.start.col, text: `${timer}.read() + ` }
         : undefined;
-      const remedy = inAlt
-        ? `Set 'long deadline = ${timer ?? 'timer'}.read() + ${delay ?? 'delay'};' before the alt and use 'deadline' here.`
-        : `Write '${timer ?? 'timer'}.read() + ${delay ?? 'delay'}' to wait that many milliseconds from now.`;
+      const remedy = `Write '${timer ?? 'timer'}.read() + ${delay ?? 'delay'}' to wait that many milliseconds from now.`;
       this.report(e.delay.span, 'warning', 'pj/timeout-deadline', `'.timeout()' takes the absolute time to wake up, not how long to wait, so this returns immediately. ${remedy}`, fix);
     }
     return T.void;
@@ -2270,42 +2275,42 @@ function isLiteralInit(e: A.Expr): boolean {
   }
 }
 
-/** The first channel read inside an expression, if any. */
-function findRead(e: A.Expr): A.ChanRead | undefined {
+/** The first channel read inside an expression (that `accept` accepts), if any. */
+function findRead(e: A.Expr, accept: (read: A.ChanRead) => boolean = () => true): A.ChanRead | undefined {
   switch (e.kind) {
     case 'ChanRead':
-      return e;
+      return accept(e) ? e : findRead(e.target, accept);
     case 'ParenExpr':
     case 'CastExpr':
-      return findRead(e.expr);
+      return findRead(e.expr, accept);
     case 'BinaryExpr':
-      return findRead(e.left) ?? findRead(e.right);
+      return findRead(e.left, accept) ?? findRead(e.right, accept);
     case 'UnaryExpr':
-      return findRead(e.operand);
+      return findRead(e.operand, accept);
     case 'AssignExpr':
-      return findRead(e.value);
+      return findRead(e.value, accept);
     case 'TernaryExpr':
-      return findRead(e.cond) ?? findRead(e.then) ?? findRead(e.else);
+      return findRead(e.cond, accept) ?? findRead(e.then, accept) ?? findRead(e.else, accept);
     case 'Invocation':
       for (const a of e.args) {
-        const r = findRead(a);
+        const r = findRead(a, accept);
         if (r) return r;
       }
       return undefined;
     case 'RecordAccess':
-      return findRead(e.target);
+      return findRead(e.target, accept);
     case 'ArrayAccess':
-      return findRead(e.target) ?? findRead(e.index);
+      return findRead(e.target, accept) ?? findRead(e.index, accept);
     case 'RecordLiteral':
     case 'ProtocolLiteral':
       for (const f of e.fields) {
-        const r = findRead(f.value);
+        const r = findRead(f.value, accept);
         if (r) return r;
       }
       return undefined;
     case 'ArrayLiteral':
       for (const x of e.elements) {
-        const r = findRead(x);
+        const r = findRead(x, accept);
         if (r) return r;
       }
       return undefined;

@@ -21,6 +21,10 @@ export interface ExecOptions {
   signal?: AbortSignal;
   /** Stop collecting output past this many characters (program runs can be chatty). */
   maxOutput?: number;
+  /** Called with each chunk of standard output as it arrives (decoded). */
+  onStdout?: (chunk: string) => void;
+  /** Called once the process has started, with its pid (on POSIX also its process group). */
+  onSpawn?: (pid: number) => void;
 }
 
 /** Children still running, so a server shutdown can take its JVMs with it. */
@@ -47,9 +51,59 @@ function killTree(child: ChildProcess): void {
 export function killAllChildren(): void {
   for (const child of liveChildren) killTree(child);
 }
+
+/**
+ * Private temporary directories still on disk (compiler sandboxes, FDR's
+ * working copies): in use, or with their removal still running. A sandbox is
+ * removed in the background once its compiler run is over (the keystroke path
+ * never waits for it), so a process that exits meanwhile removes what is left
+ * at once, before it goes.
+ */
+const privateDirs = new Set<string>();
+
+/** A new private directory in the system's temporary directory (`prefix` and a random suffix), removed at exit at the latest. */
+export function makePrivateDir(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  privateDirs.add(dir);
+  return dir;
+}
+
+/** Remove a directory made by makePrivateDir: in the background, or at once with `now`. */
+export function removePrivateDir(dir: string, now = false): void {
+  if (now) {
+    removeNow(dir);
+    privateDirs.delete(dir);
+    return;
+  }
+  // Until the removal has finished, an exit removes the directory itself.
+  fs.rm(dir, { recursive: true, force: true }, (error) => {
+    if (!error) privateDirs.delete(dir);
+  });
+}
+
+/** Remove every private directory still on disk, synchronously. Called when the server shuts down and when the process exits. */
+export function removeAllPrivateDirs(): void {
+  for (const dir of privateDirs) removeNow(dir);
+  privateDirs.clear();
+}
+
+function removeNow(dir: string): void {
+  try {
+    // A JVM killed a moment ago may still be writing into it: retry a directory that is not empty yet.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 2, retryDelay: 20 });
+  } catch {
+    /* best effort */
+  }
+}
+
 // `exit` also fires for process.exit(), which is how the LSP library ends the
-// server; killing is synchronous, so nothing survives a shutdown or a crash.
-process.on('exit', killAllChildren);
+// server (after `exit`, or when its input closes); killing and removing are
+// synchronous, so neither a JVM nor a private directory survives a shutdown,
+// a signal or a crash. (SIGKILL ends a process before any of this can run.)
+process.on('exit', () => {
+  killAllChildren();
+  removeAllPrivateDirs();
+});
 // Children live in their own process group, so a signal aimed at the server's
 // group (Ctrl-C in a terminal, an editor killing its subprocesses) no longer
 // reaches them by itself; take them along, then exit as the default would.
@@ -80,11 +134,13 @@ export function exec(cmd: string, args: string[], opts: ExecOptions): Promise<Ex
     // together with anything it spawned.
     const child = spawn(cmd, args, { cwd: opts.cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
     liveChildren.add(child);
+    if (child.pid) opts.onSpawn?.(child.pid);
     // Decode as a stream: a multi-byte character split across two chunks must not become U+FFFD.
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (d: string) => {
       if (stdout.length < maxOutput) stdout += d;
+      opts.onStdout?.(d);
     });
     child.stderr.on('data', (d: string) => {
       if (stderr.length < maxOutput) stderr += d;
@@ -155,7 +211,7 @@ export interface ImportMirror {
 }
 
 export function makeSandbox(install: Install, sourcePath: string, text: string, yieldContext?: YieldAnnotationContext, mirrors: readonly ImportMirror[] = []): Sandbox {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-'));
+  const root = makePrivateDir('processj-lsp-');
   const home = path.join(root, '.pjlsp-home');
   const work = path.join(home, 'work');
   fs.mkdirSync(work, { recursive: true });
@@ -210,7 +266,7 @@ export function makeSandbox(install: Install, sourcePath: string, text: string, 
     fileName,
     sourcePath: canonicalSourcePath,
     yieldSourceMap: augmented.sourceMap,
-    cleanup: () => fs.rm(root, { recursive: true, force: true }, () => {}),
+    cleanup: () => removePrivateDir(root),
   };
 }
 

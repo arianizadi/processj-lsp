@@ -89,7 +89,7 @@ test('AST shapes: channel types, nested generics, casts, literals, extended rend
   const src = [
     'record R { int a; }',
     'protocol P { tag : { int x; } none : { } }',
-    'public void f(shared chan<chan<int>>.read in, chan<int>.write out) {',
+    'public void f(shared chan<chan<int> >.read in, chan<int>.write out) {',
     '    int v = (int) 3.5;',
     '    long w = (long) v;',
     '    R r = new R { a = 1 };',

@@ -192,7 +192,7 @@ export function typeStr(t: Type): string {
     case 'array':
       return typeStr(t.elem) + '[]'.repeat(t.dims);
     case 'chan':
-      return `${t.shared ? 'shared ' : ''}${t.shared && t.sharedSide && !t.end ? t.sharedSide + ' ' : ''}chan<${typeStr(t.elem)}>${t.end ? '.' + t.end : ''}`;
+      return `${t.shared ? 'shared ' : ''}${t.shared && t.sharedSide && !t.end ? t.sharedSide + ' ' : ''}${chanTypeText(typeStr(t.elem))}${t.end ? '.' + t.end : ''}`;
     case 'null':
       return 'null';
     case 'unknown':
@@ -200,6 +200,11 @@ export function typeStr(t: Type): string {
     case 'error':
       return '<error>';
   }
+}
+
+/** `chan<T>` as source text: the compiler's lexer reads `>>` as a shift, so a nested type closes with `> >`. */
+export function chanTypeText(elem: string): string {
+  return `chan<${elem}${elem.endsWith('>') ? ' ' : ''}>`;
 }
 
 /** Convert a syntactic type to a semantic one; `resolveNamed` decides what an identifier type means. */

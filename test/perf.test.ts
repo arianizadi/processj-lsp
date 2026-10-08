@@ -8,6 +8,9 @@ import { DeclIndex } from '../src/checker/index';
 import { analyzeProtocols, effectiveProtocolCases } from '../src/checker/protocols';
 import { analyzeReachableCalls, type ReachableUnit } from '../src/checker/reachable';
 import { buildConcurrencyGraph } from '../src/concurrency';
+import { VerificationStore } from '../src/graph/live';
+import { buildNetwork } from '../src/graph/network';
+import { GraphSession } from '../src/graph/session';
 import { channelInlays } from '../src/inlays';
 import { semanticTokens } from '../src/semantic';
 import { format } from '../src/format';
@@ -55,6 +58,34 @@ test('a 20,000-line file parses, lints, and formats fast enough for keystroke la
   assert.ok(hints.ms < 750, `channel inlays took ${hints.ms} ms`);
   assert.ok(t.ms < 1000, `semantic tokens took ${t.ms} ms`);
   assert.ok(f.ms < 3000, `format took ${f.ms} ms`);
+});
+
+test('the process network of a 20,000-line file builds in time, and a viewer refresh builds only what it shows', async () => {
+  const src = bigProgram(20_000);
+  const parsed = parse(src);
+  const index = new DeclIndex();
+  index.addProgram(parsed.program, 'big.pj');
+  const checked = check(parsed.program, { index, importsStd: true, unresolvedImports: true });
+  const effects = analyzeProcedureEffects([{ program: parsed.program, checked, file: 'big.pj' }]);
+  const uri = 'file:///big.pj';
+  // Every view, as an export of the whole model does it.
+  const all = time(() => buildNetwork(parsed.program, checked, { uri, text: src, effects: effects.summaries, index }));
+  // What an open viewer does on each edit: a new version's payload.
+  const session = new GraphSession(new VerificationStore());
+  const document = { uri, version: 1, title: 'big.pj', text: src, program: parsed.program, checked, index, effects: effects.summaries };
+  const t0 = process.hrtime.bigint();
+  const payload = await session.payload(document);
+  const first = Number(process.hrtime.bigint() - t0) / 1e6;
+  const t1 = process.hrtime.bigint();
+  const refreshed = await session.payload({ ...document, version: 2 });
+  const second = Number(process.hrtime.bigint() - t1) / 1e6;
+  const laidOut = payload.views.filter((view) => !view.pending).length;
+  console.log(`  network: ${all.value.views.length} views built in ${all.ms.toFixed(0)} ms; viewer payload ${first.toFixed(0)} ms, after an edit ${second.toFixed(0)} ms, ${laidOut} of ${payload.views.length} views laid out`);
+  assert.equal(payload.views.length, all.value.views.length, 'every view is listed');
+  assert.ok(laidOut <= 40, `${laidOut} views laid out up front`);
+  assert.equal(refreshed.views.length, payload.views.length);
+  assert.ok(all.ms < 4000, `building every view took ${all.ms} ms`);
+  assert.ok(second < 3000, `a payload after an edit took ${second} ms`);
 });
 
 test('parse time grows linearly, not quadratically', () => {

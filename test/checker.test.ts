@@ -4,42 +4,11 @@ import * as path from 'node:path';
 import { test } from 'node:test';
 import { check } from '../src/checker/checker';
 import { DeclIndex } from '../src/checker/index';
+import { T, typeStr, type Type } from '../src/checker/types';
 import { parse } from '../src/parser/parser';
+import { run, STD, TRUSTED_STD_OUTPUT_DECLARATIONS } from './checker-helpers';
 
 const FIXTURES = path.join(__dirname, '..', '..', 'test', 'fixtures', 'processj');
-const INCLUDE = path.join(__dirname, '..', '..', 'test', 'fixtures', 'include');
-
-function stdIndex(): DeclIndex {
-  const idx = new DeclIndex();
-  for (const dir of ['std', 'image']) {
-    const full = path.join(INCLUDE, dir);
-    for (const f of fs.readdirSync(full).filter((x) => x.endsWith('.pj')).sort()) {
-      idx.addProgram(parse(fs.readFileSync(path.join(full, f), 'utf8')).program, path.join(full, f));
-    }
-  }
-  return idx;
-}
-const STD = stdIndex();
-const TRUSTED_STD_OUTPUT_DECLARATIONS = new Set(
-  ['print', 'println'].flatMap((name) => STD.procs.get(name) ?? []).map((signature) => signature.decl),
-);
-
-export function run(src: string, opts: { std?: boolean } = {}) {
-  const parsed = parse(src);
-  assert.deepEqual(parsed.errors, [], 'test program must parse');
-  const index = new DeclIndex();
-  index.addProgram(parsed.program, 'test.pj');
-  const importsStd = /import\s+std\b/.test(src);
-  if (opts.std !== false && importsStd) index.addIndex(STD);
-  const result = check(parsed.program, {
-    index,
-    stdIndex: STD,
-    importsStd,
-    text: src,
-    trustedNonBlockingNativeDeclarations: TRUSTED_STD_OUTPUT_DECLARATIONS,
-  });
-  return { ...result, codes: result.diagnostics.filter((d) => d.severity !== 'info').map((d) => d.code), notes: result.diagnostics.filter((d) => d.severity === 'info').map((d) => `${d.line + 1}:${d.code}`), messages: result.diagnostics.filter((d) => d.severity !== 'info').map((d) => `${d.line + 1}: ${d.message}`), errors: result.diagnostics.filter((d) => d.severity === 'error') };
-}
 
 const MAIN = (body: string, extra = '') => `import std.*;\n${extra}\npublic void main(string[] args) {\n${body}\n}\n`;
 
@@ -506,7 +475,7 @@ test('unused and shadowed variables, constants; nothing about compiler internals
   const r = run(MAIN('    timer t;\n    int index = 0;\n    int dead;\n    int args = 1;\n    const int k = args;\n    alt {\n        v = c.read() : { }\n        t.timeout(100) : { }\n    }\n    alt { v = c.read() : { } }\n    t.timeout(5);\n    println(index + k);', 'public void f(chan<int>.read c, int v) { }').replace('public void main(string[] args) {', 'public void main(string[] args) {\n    chan<int>.read c; int v;'));
   const codes = new Set(r.codes);
   for (const c of ['pj/unused', 'pj/shadows-parameter', 'pj/type/const-init']) assert.ok(codes.has(c), `${c} in ${[...codes].join(', ')}`);
-  assert.ok(codes.has('pj/multiple-alts'), 'a second alt in one procedure cannot be built');
+  assert.ok(!codes.has('pj/multiple-alts'), 'two plain alts in one procedure build with this compiler');
   assert.ok(r.messages.some((m) => /'dead' is never used/.test(m)));
 });
 
@@ -666,4 +635,25 @@ test('array access requires the compiler-supported int index type', () => {
     const result = run(`public int get(int[] values, int index, long wide, short small) { return values[${index}]; }`);
     assert.deepEqual(result.errors, [], index);
   }
+});
+
+test('channel types print the way the compiler lexes them, so refactors insert code it accepts', () => {
+  const inner: Type = { k: 'chan', elem: T.int, shared: false };
+  const cases: Array<[Type, string]> = [
+    [{ k: 'chan', elem: inner, shared: false, end: 'read' }, 'chan<chan<int> >.read'],
+    [{ k: 'chan', elem: { k: 'chan', elem: inner, shared: false }, shared: false, end: 'write' }, 'chan<chan<chan<int> > >.write'],
+    [{ k: 'chan', elem: T.int, shared: true, end: 'write' }, 'shared chan<int>.write'],
+    [{ k: 'chan', elem: T.long, shared: true, sharedSide: 'read' }, 'shared read chan<long>'],
+  ];
+  for (const [type, text] of cases) {
+    assert.equal(typeStr(type), text);
+    // The compiler reads '>>' as a shift, so the parser rejects the unspaced form; the printed form must parse.
+    assert.deepEqual(parse(`void f(${text} x) { }`).errors, [], text);
+  }
+});
+
+test('no test file imports another: its tests would run again in the importing file (the helpers live in checker-helpers.ts)', () => {
+  const dir = path.join(__dirname, '..', '..', 'test');
+  const importing = fs.readdirSync(dir).filter((f) => f.endsWith('.ts') && /from '\.\/[\w-]+\.test'/.test(fs.readFileSync(path.join(dir, f), 'utf8')));
+  assert.deepEqual(importing, []);
 });

@@ -62,6 +62,43 @@ local function find_install(options)
   return nil, candidates
 end
 
+--- FDR's refines, looked for where the server looks (src/csp/fdr.ts).
+local function find_refines(options)
+  local candidates = {}
+  local function add(candidate)
+    if candidate and candidate ~= "" then candidates[#candidates + 1] = vim.fn.expand(candidate) end
+  end
+  if options.fdrPath and options.fdrPath ~= "" then
+    -- The only place the server tries when fdrPath is set; a bare command name is looked up on PATH.
+    local explicit = vim.fn.expand(options.fdrPath)
+    if not explicit:find("/", 1, true) then
+      local on_path = vim.fn.exepath(explicit)
+      if on_path ~= "" then add(on_path) end
+    end
+    add(explicit)
+    add(explicit .. "/bin/refines")
+    add(explicit .. "/Contents/MacOS/refines")
+    add(explicit .. "/refines")
+  else
+    add(vim.env.FDR_REFINES)
+    if vim.env.FDR_HOME and vim.env.FDR_HOME ~= "" then
+      add(vim.env.FDR_HOME .. "/bin/refines")
+      add(vim.env.FDR_HOME .. "/Contents/MacOS/refines")
+    end
+    local on_path = vim.fn.exepath("refines")
+    if on_path ~= "" then add(on_path) end
+    add("/Applications/FDR4.app/Contents/MacOS/refines")
+    add("~/Applications/FDR4.app/Contents/MacOS/refines")
+    add("/opt/fdr/bin/refines")
+    add("/usr/local/fdr/bin/refines")
+  end
+  for _, candidate in ipairs(candidates) do
+    local st = stat(candidate)
+    if st and st.type == "file" then return candidate, candidates end
+  end
+  return nil, candidates
+end
+
 function M.check()
   health.start("processj-lsp runtime")
   if vim.fn.has("nvim-0.11") == 1 then
@@ -128,6 +165,35 @@ function M.check()
       "Or set opts.init_options.installDir in your plugin spec",
       "The parser, lints, formatting, completion, and navigation still work without the compiler",
     })
+  end
+
+  health.start("Concurrency graph viewer")
+  -- The handler vim.ui.open uses (the server's showDocument with external = true goes through it).
+  local ok, cmd, err = pcall(function() return vim.ui._get_open_cmd() end)
+  if ok and cmd then
+    health.ok(":ProcessJGraph opens the viewer in your browser through vim.ui.open (" .. table.concat(cmd, " ") .. ")")
+  else
+    health.warn(ok and err or "vim.ui.open: no handler found", {
+      "Install xdg-open (or wslview on WSL), or open the page yourself: the server logs the viewer's address (or file) in :LspLog",
+      ":ProcessJGraph markdown shows a text report inside Neovim",
+    })
+  end
+
+  health.start("FDR integration (optional)")
+  local refines, tried_fdr = find_refines(options)
+  if refines then
+    health.ok("FDR refines: " .. refines .. " (:ProcessJCsp converts to CSPm, :ProcessJFdr checks with FDR, :ProcessJFdrCancel stops a check)")
+  elseif options.fdrPath and options.fdrPath ~= "" then
+    -- A setting that points nowhere is a mistake worth a warning; with it set, nothing else is tried.
+    health.warn("FDR's refines was not found at fdrPath = " .. options.fdrPath .. ". Tried: " .. table.concat(tried_fdr, ", "), {
+      "Point opts.init_options.fdrPath at the refines executable or FDR's install directory (macOS: /Applications/FDR4.app/Contents/MacOS/refines)",
+      "Or remove fdrPath to look on PATH and in the usual install locations",
+    })
+  else
+    -- FDR is optional: say where to get it, in the one message vim.health.info takes.
+    health.info("FDR's refines was not found; :ProcessJFdr is unavailable and no FDR code lenses are shown (:ProcessJCsp still works). Tried: "
+      .. table.concat(tried_fdr, ", ")
+      .. ". Install FDR4 from https://cocotec.io/fdr/, or set opts.init_options.fdrPath to the refines executable (macOS: /Applications/FDR4.app/Contents/MacOS/refines).")
   end
 
   health.start("processj-lsp attachment")

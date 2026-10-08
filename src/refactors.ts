@@ -10,7 +10,7 @@ import { check, type CheckResult, type VarInfo } from './checker/checker';
 import { forEachReachableStatement } from './checker/controlflow';
 import { DeclIndex, type ProcSig } from './checker/index';
 import { proveAllRendezvousSchedulesComplete } from './checker/rendezvous';
-import { endOf, typeStr } from './checker/types';
+import { chanTypeText, endOf, typeStr } from './checker/types';
 import { YieldAnalysis } from './checker/yields';
 import { KEYWORDS, LITERALS, PRIMITIVE_TYPES } from './keywords';
 import type * as A from './parser/ast';
@@ -1354,7 +1354,7 @@ export function planIntroduceChannel(source: string, range: A.Span, options: Ref
   const parIndent = baseIndent(ctx, par.span.start.line);
   const declaration: RefactorEdit = {
     range: { start: par.span.start, end: par.span.start },
-    newText: `chan<${typeStr(variable.type)}> ${channelName};${newline}${parIndent}`,
+    newText: `${chanTypeText(typeStr(variable.type))} ${channelName};${newline}${parIndent}`,
   };
   const send: RefactorEdit = {
     range: assignment.span,

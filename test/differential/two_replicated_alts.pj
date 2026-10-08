@@ -1,0 +1,16 @@
+// outcome: error
+import std.*;
+// A second replicated alt in one process: javac rejects it ("variable
+// repAltBooleanGuards is already defined in method run()"). One replicated alt
+// among plain alts builds and runs.
+public void main(string[] args) {
+    chan<int> a;
+    par {
+        {
+            int x;
+            alt (int i = 0; i < 2; i++) { (i == 0) && x = a.read() : { println("a " + x); } }
+            alt (int j = 0; j < 2; j++) { (j == 1) && x = a.read() : { println("a again " + x); } }
+        }
+        { a.write(1); a.write(3); }
+    }
+}

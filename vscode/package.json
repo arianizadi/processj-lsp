@@ -26,8 +26,11 @@
     "onCommand:processj.runCurrentFile",
     "onCommand:processj.buildCurrentFile",
     "onCommand:processj.showConcurrencyGraph",
+    "onCommand:processj.exportConcurrencyGraphFiles",
     "onCommand:processj.showProtocolFlow",
     "onCommand:processj.showProcedureEffects",
+    "onCommand:processj.convertCurrentFileToCsp",
+    "onCommand:processj.checkCurrentFileWithFdr",
     "onCommand:processj.restartServer",
     "onCommand:processj.showOutput"
   ],
@@ -75,6 +78,13 @@
         "enablement": "editorLangId == processj"
       },
       {
+        "command": "processj.exportConcurrencyGraphFiles",
+        "title": "Export Concurrency Graph",
+        "category": "ProcessJ",
+        "icon": "$(export)",
+        "enablement": "editorLangId == processj"
+      },
+      {
         "command": "processj.showProtocolFlow",
         "title": "Show Protocol Flow",
         "category": "ProcessJ",
@@ -87,6 +97,26 @@
         "category": "ProcessJ",
         "icon": "$(pulse)",
         "enablement": "editorLangId == processj"
+      },
+      {
+        "command": "processj.convertCurrentFileToCsp",
+        "title": "Convert to CSP",
+        "category": "ProcessJ",
+        "icon": "$(file-code)",
+        "enablement": "editorLangId == processj"
+      },
+      {
+        "command": "processj.checkCurrentFileWithFdr",
+        "title": "Check with FDR",
+        "category": "ProcessJ",
+        "icon": "$(debug-alt)",
+        "enablement": "editorLangId == processj"
+      },
+      {
+        "command": "processj.cancelFdrCheck",
+        "title": "Cancel FDR Check",
+        "category": "ProcessJ",
+        "icon": "$(debug-stop)"
       },
       {
         "command": "processj.restartServer",
@@ -121,6 +151,11 @@
           "group": "navigation@10"
         },
         {
+          "command": "processj.exportConcurrencyGraphFiles",
+          "when": "editorLangId == processj",
+          "group": "navigation@10"
+        },
+        {
           "command": "processj.showProtocolFlow",
           "when": "editorLangId == processj",
           "group": "navigation@11"
@@ -129,6 +164,16 @@
           "command": "processj.showProcedureEffects",
           "when": "editorLangId == processj",
           "group": "navigation@12"
+        },
+        {
+          "command": "processj.convertCurrentFileToCsp",
+          "when": "editorLangId == processj",
+          "group": "navigation@13"
+        },
+        {
+          "command": "processj.checkCurrentFileWithFdr",
+          "when": "editorLangId == processj",
+          "group": "navigation@14"
         }
       ]
     },
@@ -163,7 +208,12 @@
         "processj.codeLens": {
           "type": "boolean",
           "default": true,
-          "description": "Show inline Run, Build, effect, concurrency-graph, and protocol-summary code lenses. Commands remain available from the editor title and Command Palette when disabled."
+          "description": "Show inline Run, Build, effect, concurrency-graph, protocol-summary and FDR code lenses. Commands remain available from the editor title and Command Palette when disabled."
+        },
+        "processj.liveViewer": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the concurrency graph is opened in a browser (Neovim, Emacs, or the server command), serve it from a loopback-only local page that follows edits and new verification results. Off: write a self-contained HTML file instead. VS Code's own panel is not affected."
         },
         "processj.debounceMs": {
           "type": "integer",
@@ -185,6 +235,48 @@
           "minimum": 100,
           "maximum": 3600000,
           "description": "Maximum duration in milliseconds for a program launched with ProcessJ: Run Current File."
+        },
+        "processj.fdrPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "description": "FDR's refines executable (or FDR's install directory) for ProcessJ: Check with FDR. Empty: $FDR_REFINES, $FDR_HOME, PATH, then /Applications/FDR4.app/Contents/MacOS/refines and the usual install locations. Get FDR at https://cocotec.io/fdr/."
+        },
+        "processj.fdrTimeoutMs": {
+          "type": "integer",
+          "default": 120000,
+          "minimum": 1000,
+          "maximum": 3600000,
+          "description": "Maximum duration in milliseconds for one FDR check."
+        },
+        "processj.fdrMemoryMb": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 1048576,
+          "description": "Stop an FDR check once refines uses more than this many megabytes (a big model can take tens of gigabytes within seconds). 0: half of this machine's memory, at most 8 GB."
+        },
+        "processj.fdrWorkers": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 1024,
+          "description": "Workers FDR's search uses. 1 (the default) finds the same deadlock and runtime-error counterexamples every time you check (a termination or determinism counterexample can still differ); 0 uses every core, faster on big models but any counterexample may differ from one check to the next."
+        },
+        "processj.fdrShowGraph": {
+          "type": "string",
+          "enum": [
+            "onFailure",
+            "always",
+            "never"
+          ],
+          "enumDescriptions": [
+            "Open the graph on the result when a check fails, finds a partial deadlock or a runtime error; otherwise open the text report.",
+            "Open the graph on the result after every check.",
+            "Never open the graph: open the text report instead."
+          ],
+          "default": "onFailure",
+          "description": "After ProcessJ: Check with FDR, open the concurrency graph panel on the result, with the stuck processes and the run that leads there marked. The text report (.pjreport) is always written, and opened when the graph is not."
         },
         "processj.serverPath": {
           "type": "string",

@@ -1,0 +1,51 @@
+import std.io;
+
+// commstime with a consumer that stops after three values: the ring keeps
+// going, delta's next write on 'a' finds no reader, and everything stops.
+// commstime_bounded.fdr.json is an FDR-style report of that deadlock.
+
+public void prefix(long n, chan<long>.read in, chan<long>.write out) {
+  out.write(n);
+  long l = 0;
+  while (l < 1000000) {
+    l = in.read();
+    out.write(l);
+  }
+}
+
+public void succ(chan<long>.read in, chan<long>.write out) {
+  long l = 0;
+  while (l < 999999) {
+    l = in.read();
+    out.write(l + 1);
+  }
+}
+
+public void delta(chan<long>.read in, chan<long>.write out1, chan<long>.write out2) {
+  long l = 0;
+  while (l < 1000000) {
+    l = in.read();
+    par {
+      out1.write(l);
+      out2.write(l);
+    }
+  }
+}
+
+public void consume(chan<long>.read in) {
+  long l = 0;
+  for (int i = 0; i < 3; i++) {
+    l = in.read();
+    println(l);
+  }
+}
+
+public void main(string args[]) {
+  chan<long> a, b, c, d;
+  par {
+    delta(d.read, a.write, b.write);
+    succ(b.read, c.write);
+    prefix(0, c.read, d.write);
+    consume(a.read);
+  }
+}

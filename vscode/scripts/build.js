@@ -102,8 +102,11 @@ run(fs.existsSync(path.join(here, 'package-lock.json')) ? 'npm ci --no-audit --n
 // esbuild embeds the language client's production dependencies into one file,
 // so their license texts would otherwise disappear from the VSIX. Resolve the
 // actual installed dependency tree (including nested versions) and emit one
-// deterministic notice alongside the bundle.
+// deterministic notice alongside the bundle. The server under server/ ships its
+// own production dependencies (the LSP library, elkjs for graph layout) as
+// installed packages; they are listed too.
 const dependencyNotices = new Map();
+const serverNotices = new Map();
 const resolveDependencyManifest = (name, requester) => {
   let directory = requester;
   for (;;) {
@@ -114,13 +117,13 @@ const resolveDependencyManifest = (name, requester) => {
     directory = parent;
   }
 };
-const visitDependency = (name, requester) => {
+const visitDependency = (name, requester, notices = dependencyNotices) => {
   // Read the manifest by path instead of require.resolve("pkg/package.json"):
   // several LSP packages intentionally do not export that subpath.
   const manifest = resolveDependencyManifest(name, requester);
   const packageDir = path.dirname(manifest);
   const realDir = fs.realpathSync(packageDir);
-  if (dependencyNotices.has(realDir)) return;
+  if (notices.has(realDir)) return;
   const pkg = JSON.parse(fs.readFileSync(manifest, 'utf8'));
   const licenseFile = fs.readdirSync(packageDir)
     .sort()
@@ -129,32 +132,38 @@ const visitDependency = (name, requester) => {
   const noticeFiles = fs.readdirSync(packageDir)
     .sort()
     .filter((entry) => /^(?:notice|third[-_ ]?party.*notice)/i.test(entry));
-  dependencyNotices.set(realDir, {
+  notices.set(realDir, {
     name: pkg.name,
     version: pkg.version,
     license: pkg.license ?? 'see text below',
     text: fs.readFileSync(path.join(packageDir, licenseFile), 'utf8').trim(),
     notices: noticeFiles.map((file) => ({ file, text: fs.readFileSync(path.join(packageDir, file), 'utf8').trim() })),
   });
-  for (const child of Object.keys(pkg.dependencies ?? {}).sort()) visitDependency(child, packageDir);
+  for (const child of Object.keys(pkg.dependencies ?? {}).sort()) visitDependency(child, packageDir, notices);
 };
 for (const dependency of Object.keys(JSON.parse(fs.readFileSync(path.join(here, 'package.json'), 'utf8')).dependencies ?? {}).sort()) {
   visitDependency(dependency, here);
 }
+for (const dependency of Object.keys(serverPkg.dependencies).sort()) visitDependency(dependency, server, serverNotices);
+const noticeSection = (notices) => [...notices.values()]
+  .sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
+  .flatMap((entry) => [
+    '',
+    '='.repeat(78),
+    `${entry.name}@${entry.version} (${entry.license})`,
+    '='.repeat(78),
+    entry.text,
+    ...entry.notices.flatMap((notice) => ['', `Upstream notice: ${notice.file}`, '-'.repeat(78), notice.text]),
+  ]);
 const thirdPartyText = [
   'THIRD-PARTY SOFTWARE NOTICES AND INFORMATION',
   '',
   'The following production dependencies are bundled into the ProcessJ VS Code extension.',
-  ...[...dependencyNotices.values()]
-    .sort((a, b) => a.name.localeCompare(b.name) || a.version.localeCompare(b.version))
-    .flatMap((entry) => [
-      '',
-      '='.repeat(78),
-      `${entry.name}@${entry.version} (${entry.license})`,
-      '='.repeat(78),
-      entry.text,
-      ...entry.notices.flatMap((notice) => ['', `Upstream notice: ${notice.file}`, '-'.repeat(78), notice.text]),
-    ]),
+  ...noticeSection(dependencyNotices),
+  '',
+  '',
+  'The language server under server/ ships the following production dependencies, unmodified, as installed packages.',
+  ...noticeSection(serverNotices),
   '',
 ].join('\n');
 fs.writeFileSync(path.join(here, 'THIRD_PARTY_NOTICES.txt'), thirdPartyText);

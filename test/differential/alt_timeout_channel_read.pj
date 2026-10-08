@@ -1,0 +1,18 @@
+// outcome: compiler-limit
+import std.*;
+// A channel read inside an alt timeout guard is generated as its blocking code
+// in the middle of the guard's expression, and javac rejects it ("illegal start
+// of expression"). Reading the deadline into a variable before the alt builds.
+public void main(string[] args) {
+    chan<int> c;
+    chan<long> d;
+    timer t;
+    int x;
+    par {
+        { long deadline = t.read() + 300; d.write(deadline); }
+        alt {
+            x = c.read() : { println("read " + x); }
+            t.timeout(d.read()) : { println("late"); }
+        }
+    }
+}

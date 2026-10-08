@@ -1,7 +1,7 @@
-// outcome: compiler-limit
+// outcome: runs
 import std.*;
-// A read inside an alt timeout guard is generated inline and javac rejects it.
-// Computing the deadline into a local first builds and runs.
+// A timer read inside an alt timeout guard builds and runs with this compiler
+// (since commit 179847f, "Fix: Timer reads in channel guards"): "read 1".
 public void main(string[] args) {
     chan<int> c;
     timer t;

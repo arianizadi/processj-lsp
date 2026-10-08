@@ -1,0 +1,23 @@
+// outcome: runs-wrong
+import std.*;
+// Only index 2 of the replicated alt is enabled, so it takes the value. This ProcessJ
+// build evaluates the precondition once, before the index loop, with i = 0, for every
+// index (compiler/replicated-alt-precondition): the program stops with "One of the
+// boolean pre-guards must be true!".
+public void w(chan<int>.write c) {
+    c.write(5);
+}
+
+public void main(string[] args) {
+    chan<int> c;
+    int v = 0;
+    par {
+        w(c.write);
+        alt (int i = 0; i < 3; i++) {
+            (i == 2) && v = c.read() : {
+                println("index 2 took it");
+            }
+        }
+    }
+    println("done " + v);
+}

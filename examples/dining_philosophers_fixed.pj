@@ -1,0 +1,41 @@
+// expect: pj/unused
+// The dining philosophers of dining_philosophers.pj, with the circle broken:
+// philosopher 2 picks up its right chopstick first. Check with FDR proves
+// deadlock freedom over every interleaving. The program never ends (the
+// philosophers eat forever), so its Terminates check fails: that is
+// informational, not a defect.
+import std.*;
+
+// A chopstick is held by one neighbour at a time: picked up and put down on the same channel.
+public void chopstick(chan<boolean>.read left, chan<boolean>.read right) {
+    boolean b;
+    while (true) {
+        alt {
+            b = left.read() : { b = left.read(); }
+            b = right.read() : { b = right.read(); }
+        }
+    }
+}
+
+// Philosophers 0 and 1 take the left chopstick first; philosopher 2 takes its right chopstick first, which breaks the cycle.
+public void philosopher(int id, chan<boolean>.write left, chan<boolean>.write right) {
+    while (true) {
+        left.write(true);
+        right.write(true);
+        println("philosopher " + id + " eats");
+        left.write(true);
+        right.write(true);
+    }
+}
+
+public void main(string[] args) {
+    chan<boolean> p0f0, p0f1, p1f1, p1f2, p2f2, p2f0;
+    par {
+        philosopher(0, p0f0.write, p0f1.write);
+        philosopher(1, p1f1.write, p1f2.write);
+        philosopher(2, p2f0.write, p2f2.write);
+        chopstick(p0f0.read, p2f0.read);
+        chopstick(p1f1.read, p0f1.read);
+        chopstick(p2f2.read, p1f2.read);
+    }
+}

@@ -46,19 +46,154 @@ interface ProtocolResult {
 
 let activePanel: vscode.WebviewPanel | undefined;
 
-export async function showConcurrencyGraph(client: LanguageClient): Promise<void> {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor || editor.document.languageId !== 'processj') {
+interface NetworkResult {
+  payload: { title: string; uri: string; knownUris: string[] };
+  html?: string;
+}
+
+/** A result to open the viewer on: a check of the published report, and a process of it. */
+export interface GraphFocus {
+  check?: string;
+  process?: string;
+}
+
+interface NetworkPanel {
+  panel: vscode.WebviewPanel;
+  uri: string;
+  knownUris: Set<string>;
+  client?: LanguageClient;
+}
+
+let networkPanel: NetworkPanel | undefined;
+
+/**
+ * The process-network viewer (pan, zoom, search, verification overlay,
+ * timeline, sequence chart, state machines, exports) for a ProcessJ document,
+ * in a webview. The server renders the page; this panel only gives it a
+ * nonce, opens sources, fetches what the page asks for and saves exports for
+ * it. With a focus (an FDR result) the page opens on that result; a panel
+ * already showing the document only moves to it, keeping its pan and zoom.
+ */
+export async function showConcurrencyGraph(client: LanguageClient, target?: string | vscode.Uri, focus?: GraphFocus): Promise<void> {
+  const uri = target ? String(target) : vscode.window.activeTextEditor?.document.languageId === 'processj' ? vscode.window.activeTextEditor.document.uri.toString() : undefined;
+  if (!uri) {
     void vscode.window.showWarningMessage('ProcessJ: open a ProcessJ editor first.');
     return;
   }
-  const graph = await client.sendRequest<GraphResult | null>('processj/concurrencyGraph', { textDocument: { uri: editor.document.uri.toString() } });
-  if (!graph) {
-    void vscode.window.showWarningMessage('ProcessJ: the concurrency model is not available for this editor.');
+  if (focus && networkPanel?.uri === uri && networkPanel.client === client) {
+    const state = networkPanel;
+    state.panel.reveal(vscode.ViewColumn.Beside, true);
+    const result = await client.sendRequest<NetworkResult | null>('processj/processNetwork', { textDocument: { uri }, html: false });
+    if (!result || networkPanel !== state) return;
+    state.knownUris = new Set([uri, ...result.payload.knownUris]);
+    await state.panel.webview.postMessage({ type: 'update', payload: result.payload, focus });
     return;
   }
+  const document = vscode.workspace.textDocuments.find((entry) => entry.uri.toString() === uri);
+  const title = `ProcessJ network — ${path.basename(document?.fileName ?? vscode.Uri.parse(uri).path)}`;
+  if (!networkPanel) {
+    const panel = vscode.window.createWebviewPanel('processjNetwork', title, vscode.ViewColumn.Beside, { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [] });
+    const state: NetworkPanel = { panel, uri, knownUris: new Set([uri]) };
+    networkPanel = state;
+    const messages = panel.webview.onDidReceiveMessage((message: unknown) => {
+      void handleNetworkMessage(state, message);
+    });
+    panel.onDidDispose(() => {
+      messages.dispose();
+      if (networkPanel === state) networkPanel = undefined;
+    });
+  } else {
+    networkPanel.panel.reveal(vscode.ViewColumn.Beside, true);
+  }
+  const state = networkPanel;
+  state.uri = uri;
+  state.client = client;
+  state.panel.title = title;
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const result = await client.sendRequest<NetworkResult | null>('processj/processNetwork', { textDocument: { uri }, nonce, cspSource: state.panel.webview.cspSource, ...(focus ? { focus } : {}) });
+  if (!result?.html) {
+    void vscode.window.showWarningMessage('ProcessJ: the process network is not available for this editor.');
+    return;
+  }
+  state.knownUris = new Set([uri, ...result.payload.knownUris]);
+  state.panel.webview.html = result.html;
+}
 
-  showGraphPanel(graph, path.basename(editor.document.fileName), 'Concurrency topology');
+/** Bring an open viewer up to date (after a save, or when new verification results arrive), keeping its pan and zoom. */
+export async function refreshConcurrencyGraph(client: LanguageClient, uri: string): Promise<void> {
+  const state = networkPanel;
+  if (!state || state.uri !== uri) return;
+  const result = await client.sendRequest<NetworkResult | null>('processj/processNetwork', { textDocument: { uri }, html: false });
+  if (!result || networkPanel !== state) return;
+  state.knownUris = new Set([uri, ...result.payload.knownUris]);
+  await state.panel.webview.postMessage({ type: 'update', payload: result.payload });
+}
+
+/** The key the page files a state machine under (render-machine.ts machineRequestKey). */
+function machineKey(request: Record<string, unknown>): string {
+  const text = (value: unknown): string => (typeof value === 'string' ? value : '');
+  return [text(request.target), text(request.ref), text(request.check), text(request.process)].join('\u0001');
+}
+
+async function handleNetworkMessage(state: NetworkPanel, message: unknown): Promise<void> {
+  if (!message || typeof message !== 'object') return;
+  const value = message as { type?: unknown; uri?: unknown; line?: unknown; col?: unknown; name?: unknown; data?: unknown; encoding?: unknown; id?: unknown; request?: unknown };
+  try {
+    if (value.type === 'machine' && value.request && typeof value.request === 'object' && state.client) {
+      // A process's state machine; the server checks the request and says when there is none. The page waits
+      // for an answer either way: without a machine, it is told why.
+      const key = machineKey(value.request as Record<string, unknown>);
+      let result: { machine: { key: string; states?: Array<{ at?: { uri: string } }> } | null } | null = null;
+      try {
+        result = await state.client.sendRequest('processj/processNetwork', { textDocument: { uri: state.uri }, machine: value.request });
+      } catch (error) {
+        await state.panel.webview.postMessage({ type: 'machine', machine: { key, error: `The language server could not lay out this state machine (${error instanceof Error ? error.message : String(error)}).` } });
+        return;
+      }
+      if (result?.machine) {
+        for (const entry of result.machine.states ?? []) if (entry.at) state.knownUris.add(entry.at.uri);
+        await state.panel.webview.postMessage({ type: 'machine', machine: result.machine });
+      } else {
+        await state.panel.webview.postMessage({ type: 'machine', machine: { key, error: 'The language server has no state machine for this process (is the file still open?).' } });
+      }
+      return;
+    }
+    if (value.type === 'view' && typeof value.id === 'string' && state.client) {
+      // A procedure view the page has not laid out yet; it may link to files the first payload did not.
+      const result = await state.client.sendRequest<{ view: { knownUris?: string[] } | null } | null>('processj/processNetwork', { textDocument: { uri: state.uri }, view: value.id });
+      if (result?.view) {
+        for (const uri of result.view.knownUris ?? []) state.knownUris.add(uri);
+        await state.panel.webview.postMessage({ type: 'view', view: result.view });
+      }
+      return;
+    }
+    if (value.type === 'open') {
+      // Only locations the viewer was given, with sane coordinates: the webview is not trusted with arbitrary paths.
+      if (typeof value.uri !== 'string' || !state.knownUris.has(value.uri)) return;
+      if (typeof value.line !== 'number' || typeof value.col !== 'number' || !Number.isInteger(value.line) || !Number.isInteger(value.col) || value.line < 0 || value.col < 0) return;
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(value.uri));
+      const editor = await vscode.window.showTextDocument(document, { viewColumn: vscode.ViewColumn.One, preview: false, preserveFocus: false });
+      const position = new vscode.Position(value.line, value.col);
+      editor.selection = new vscode.Selection(position, position);
+      editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+      return;
+    }
+    if (value.type === 'export') {
+      if (typeof value.data !== 'string') return;
+      // Only a suggested file name: the user picks the place in the dialog. Anything with a path in it is replaced.
+      const name = typeof value.name === 'string' && value.name.length <= 200 && !/[\\/\0]/.test(value.name) && value.name !== '.' && value.name !== '..' ? value.name : 'graph.export';
+      const source = vscode.Uri.parse(state.uri);
+      const folder = source.scheme === 'file' ? vscode.Uri.file(path.dirname(source.fsPath)) : vscode.workspace.workspaceFolders?.[0]?.uri;
+      const target = await vscode.window.showSaveDialog({ defaultUri: folder ? vscode.Uri.joinPath(folder, name) : undefined, saveLabel: 'Export' });
+      if (!target) return;
+      const bytes = value.encoding === 'base64' ? Buffer.from(value.data, 'base64') : Buffer.from(value.data, 'utf8');
+      await vscode.workspace.fs.writeFile(target, bytes);
+      void vscode.window.showInformationMessage(`ProcessJ: saved ${target.fsPath || target.toString()}`);
+    }
+  } catch (error) {
+    const what = value.type === 'export' ? 'could not save the export' : value.type === 'view' ? 'could not lay out that view' : value.type === 'open' ? 'could not open the source' : 'could not answer the graph page';
+    void vscode.window.showErrorMessage(`ProcessJ: ${what}. ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 export async function showProtocolGraph(client: LanguageClient): Promise<void> {

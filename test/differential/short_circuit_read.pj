@@ -1,0 +1,25 @@
+// outcome: runs-wrong
+import std.*;
+// x is 0, so by Java's rules && never evaluates d.read() and the program ends. This
+// ProcessJ build performs every channel read of an expression before evaluating it
+// (compiler/short-circuit-read), so the reader waits on d, which nothing writes.
+public void reader(chan<int>.read c, chan<int>.read d) {
+    int x = c.read();
+    if (x > 5 && d.read() > 0) {
+        println("both");
+    }
+    println("reader done");
+}
+
+public void w(chan<int>.write c, int v) {
+    c.write(v);
+}
+
+public void main(string[] args) {
+    chan<int> c;
+    chan<int> d;
+    par {
+        reader(c.read, d.read);
+        w(c.write, 0);
+    }
+}

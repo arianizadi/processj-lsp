@@ -1,0 +1,399 @@
+0:  Compilation:
+0:    Sequence:[0 nodes]
+3:    Sequence:[1 nodes]
+3:    Sequence[0]:
+3:      Import:
+3:        Sequence:[1 nodes]
+3:        Sequence[0]:
+3:          Name = std
+3:        Name = *
+0:    Sequence:[5 nodes]
+4:    Sequence[0]:
+4:      ConstantDecl:
+4:        Sequence:[1 nodes]
+4:        Sequence[0]:
+4:          Modifier (const)
+4:        PrimitiveType = int
+4:        Var:
+4:          Name = N
+4:          PrimtiveLiteral = 2
+4:    Sequence[1]:
+4:      ConstantDecl:
+4:        Sequence:[1 nodes]
+4:        Sequence[0]:
+4:          Modifier (const)
+4:        PrimitiveType = int
+4:        Var:
+4:          Name = M
+5:    Sequence[2]:
+5:      RecordTypeDecl:
+0:        Sequence:[0 nodes]
+5:        Name = R
+5:        Sequence:[1 nodes]
+5:        Sequence[0]:
+5:          Name = Base
+0:        Sequence:[2 nodes]
+5:        Sequence[0]:
+5:          RecordMember:
+5:            PrimitiveType = int
+5:            Name = a
+5:        Sequence[1]:
+5:          RecordMember:
+5:            PrimitiveType = int
+5:            Name = b
+6:    Sequence[3]:
+6:      ProtocolTypeDecl:
+0:        Sequence:[0 nodes]
+6:        Name = P
+0:        Sequence:[0 nodes]
+6:        Sequence:[2 nodes]
+6:        Sequence[0]:
+6:          ProtocolCase:
+6:            Name = t
+0:            Sequence:[1 nodes]
+6:            Sequence[0]:
+6:              RecordMember:
+6:                PrimitiveType = int
+6:                Name = x
+6:        Sequence[1]:
+6:          ProtocolCase:
+6:            Name = u
+0:            Sequence:[0 nodes]
+8:    Sequence[4]:
+8:      ProcTypeDecl:
+8:        Annotations: {yield=true}
+8:        Sequence:[1 nodes]
+8:        Sequence[0]:
+8:          Modifier (public)
+8:        PrimitiveType = void
+8:        Name = f
+8:        Sequence:[5 nodes]
+8:        Sequence[0]:
+8:          ParamDecl: 
+8:            ChannelEndType:
+8:              PrimitiveType = int
+8:            Name = c
+8:        Sequence[1]:
+8:          ParamDecl: 
+8:            ChannelEndType:
+8:              ChannelType:
+8:                PrimitiveType = int
+8:            Name = d
+8:        Sequence[2]:
+8:          ParamDecl: 
+8:            PrimitiveType = timer
+8:            Name = t
+8:        Sequence[3]:
+8:          ParamDecl: 
+8:            NamedType:
+8:              Name = R
+8:            Name = r
+8:        Sequence[4]:
+8:          ParamDecl: 
+8:            ArrayType:[]
+8:              PrimitiveType = int
+8:            Name = v
+0:        Sequence:[0 nodes]
+0:        Block:
+0:          Sequence:[14 nodes]
+9:          Sequence[0]:
+9:            LocalDecl:
+9:              PrimitiveType = int
+9:              Var:
+9:                Name = x
+9:                BinaryExpr:
+9:                  BinaryExpr:
+9:                    CastExpr:
+9:                      PrimitiveType = int
+9:                      UnaryPreExpr:
+9:                        PrimtiveLiteral = 1
+9:                        Operator = -
+9:                    BinaryExpr:
+9:                      PrimtiveLiteral = 2
+9:                      PrimtiveLiteral = 3
+9:                      Operator: *
+9:                    Operator: +
+9:                  PrimtiveLiteral = 1
+9:                  Operator: <<
+9:          Sequence[1]:
+9:            LocalDecl:
+9:              PrimitiveType = int
+9:              Var:
+9:                Name = y
+9:                ArrayLiteral:
+9:                  Sequence:[2 nodes]
+9:                  Sequence[0]:
+9:                    PrimtiveLiteral = 1
+9:                  Sequence[1]:
+9:                    PrimtiveLiteral = 2
+10:         Sequence[2]:
+10:           ExprStat:
+10:             Assignment:
+10:               NameExpr:
+10:                 Name = x
+10:               Ternary:
+10:                 BinaryExpr:
+10:                   NameExpr:
+10:                     Name = x
+10:                   PrimtiveLiteral = 0
+10:                   Operator: >
+10:                 RecordAccess:
+10:                   NameExpr:
+10:                     Name = r
+10:                   Name = a
+10:                 BinaryExpr:
+10:                   NameExpr:
+10:                     Name = x
+10:                   PrimtiveLiteral = 1
+10:                   Operator: -
+10:               Operator: =
+11:         Sequence[3]:
+11:           ExprStat:
+11:             Assignment:
+11:               NameExpr:
+11:                 Name = x
+11:               BinaryExpr:
+11:                 CastExpr:
+11:                   NamedType:
+11:                     Name = R
+11:                   ArrayAccessExpr:
+11:                     RecordAccess:
+11:                       NameExpr:
+11:                         Name = r
+11:                       Name = b
+11:                     PrimtiveLiteral = 0
+11:                 CastExpr:
+11:                   NamedType:
+11:                     Name = R
+11:                   RecordAccess:
+11:                     NameExpr:
+11:                       Name = v
+11:                     Name = length
+11:                 Operator: -
+11:               Operator: +=
+12:         Sequence[4]:
+12:           IfStat:
+12:             BinaryExpr:
+12:               BinaryExpr:
+12:                 NameExpr:
+12:                   Name = x
+12:                 NameExpr:
+12:                   Name = t
+12:                 Operator: instanceof
+12:               PrimtiveLiteral = true
+12:               Operator: ==
+12:             IfStat:
+12:               BinaryExpr:
+12:                 ArrayAccessExpr:
+12:                   NameExpr:
+12:                     Name = y
+12:                   PrimtiveLiteral = 0
+12:                 PrimtiveLiteral = 2
+12:                 Operator: <
+12:               ExprStat:
+12:                 UnaryPostExpr:
+12:                   NameExpr:
+12:                     Name = x
+12:                   Operator = ++
+12:               ExprStat:
+12:                 UnaryPreExpr:
+12:                   NameExpr:
+12:                     Name = x
+12:                   Operator = --
+13:         Sequence[5]:
+13:           ForStat:
+0:              Sequence:[1 nodes]
+13:             Sequence[0]:
+13:               LocalDecl:
+13:                 PrimitiveType = int
+13:                 Var:
+13:                   Name = i
+13:                   PrimtiveLiteral = 0
+13:             BinaryExpr:
+13:               NameExpr:
+13:                 Name = i
+13:               NameExpr:
+13:                 Name = N
+13:               Operator: <
+13:             Sequence:[2 nodes]
+13:             Sequence[0]:
+13:               ExprStat:
+13:                 UnaryPostExpr:
+13:                   NameExpr:
+13:                     Name = i
+13:                   Operator = ++
+13:             Sequence[1]:
+13:               ExprStat:
+13:                 Assignment:
+13:                   NameExpr:
+13:                     Name = x
+13:                   NameExpr:
+13:                     Name = i
+13:                   Operator: >>>=
+0:              Sequence:[0 nodes]
+13:             ExprStat:
+13:               ChannelReadExpr:
+13:                 NameExpr:
+13:                   Name = c
+14:         Sequence[6]:
+14:           ForStat:
+0:              Sequence:[0 nodes]
+0:              Sequence:[0 nodes]
+14:             Sequence:[1 nodes]
+14:             Sequence[0]:
+14:               NameExpr:
+14:                 Name = b
+14:             ChannelWriteStat:
+14:               NameExpr:
+14:                 Name = d
+14:               ChannelReadExpr:
+14:                 NameExpr:
+14:                   Name = c
+14:                 Block:
+14:                   Sequence:[1 nodes]
+14:                   Sequence[0]:
+14:                     ExprStat:
+14:                       Assignment:
+14:                         NameExpr:
+14:                           Name = x
+14:                         PrimtiveLiteral = 1
+14:                         Operator: =
+15:         Sequence[7]:
+15:           AltStat:
+15:             Sequence:[3 nodes]
+15:             Sequence[0]:
+15:               AltCase:
+15:                 BinaryExpr:
+15:                   NameExpr:
+15:                     Name = x
+15:                   PrimtiveLiteral = 0
+15:                   Operator: >
+15:                 Guard:
+15:                   ExprStat:
+15:                     Assignment:
+15:                       NameExpr:
+15:                         Name = x
+15:                       ChannelReadExpr:
+15:                         NameExpr:
+15:                           Name = c
+15:                       Operator: =
+15:                 SkipStat
+15:             Sequence[1]:
+15:               AltCase:
+15:                 Guard:
+15:                   TimeoutStat:
+15:                     NameExpr:
+15:                       Name = t
+15:                     PrimtiveLiteral = 5
+15:             Sequence[2]:
+15:               AltCase:
+15:                 Guard:
+15:                   SkipStat
+16:         Sequence[8]:
+16:           WhileStat:
+16:             PrimtiveLiteral = true
+16:             Block:
+16:               Sequence:[2 nodes]
+16:               Sequence[0]:
+16:                 BreakStat
+16:               Sequence[1]:
+16:                 Continue Statement
+17:         Sequence[9]:
+17:           SwitchStat:
+17:             NameExpr:
+17:               Name = x
+17:             Sequence:[2 nodes]
+17:             Sequence[0]:
+17:               SwitchGroup:
+17:                 Sequence:[2 nodes]
+17:                 Sequence[0]:
+17:                   SwitchLabel:
+17:                     PrimtiveLiteral = 1
+17:                 Sequence[1]:
+17:                   SwitchLabel:
+17:                     PrimtiveLiteral = 2
+17:                 Sequence:[1 nodes]
+17:                 Sequence[0]:
+17:                   ExprStat:
+17:                     Assignment:
+17:                       NameExpr:
+17:                         Name = x
+17:                       PrimtiveLiteral = 1
+17:                       Operator: =
+0:              Sequence[1]:
+0:                SwitchGroup:
+0:                  Sequence:[1 nodes]
+0:                  Sequence[0]:
+0:                    SwitchLabel:
+0:                  Sequence:[1 nodes]
+0:                  Sequence[0]: = null
+18:         Sequence[10]:
+18:           ClaimStat:
+18:             Sequence:[1 nodes]
+18:             Sequence[0]:
+18:               NameExpr:
+18:                 Name = d
+18:             Block:
+18:               Sequence:[1 nodes]
+18:               Sequence[0]:
+18:                 ChannelWriteStat:
+18:                   NameExpr:
+18:                     Name = d
+18:                   ProtocolLiteral:
+18:                     Name = P
+18:                     Name = t
+18:                     Sequence:[1 nodes]
+18:                     Sequence[0]:
+18:                       Name = x
+18:                       PrimtiveLiteral = 1
+19:         Sequence[11]:
+19:           ParBlock:
+19:             Sequence:[1 nodes]
+19:             Sequence[0]:
+19:               Block:
+19:                 Sequence:[1 nodes]
+19:                 Sequence[0]:
+19:                   Return
+19:             Sequence:[2 nodes]
+19:             Sequence[0]:
+19:               NameExpr:
+19:                 Name = b
+19:             Sequence[1]:
+19:               NameExpr:
+19:                 Name = e
+20:         Sequence[12]:
+20:           LocalDecl:
+20:             NamedType:
+20:               Name = R
+20:             Var:
+20:               Name = s
+20:               RecordLiteral:
+20:                 Name = R
+20:                 Sequence:[2 nodes]
+20:                 Sequence[0]:
+20:                   Name = a
+20:                   PrimtiveLiteral = 1
+20:                 Sequence[1]:
+20:                   Name = b
+20:                   New Array
+20:                     PrimitiveType = int
+20:                     Sequence:[1 nodes]
+20:                     Sequence[0]:
+20:                       PrimtiveLiteral = 2
+0:                      Sequence:[1 nodes]
+0:                      Sequence[0]: = null
+21:         Sequence[13]:
+21:           ExprStat:
+21:             Invocation:
+21:               Name = lib::g
+21:               Sequence:[2 nodes]
+21:               Sequence[0]:
+21:                 Invocation:
+21:                   Name = fork
+21:                   Sequence:[1 nodes]
+21:                   Sequence[0]:
+21:                     NameExpr:
+21:                       Name = x
+21:               Sequence[1]:
+21:                 NameExpr:
+21:                   Name = std.lib::h

@@ -19,12 +19,13 @@ test('declaration index invalidates derived inheritance caches when programs are
 });
 
 test('qualified types keep package identity instead of binding to a same-named local type', () => {
-  const parsed = parse('record Thing { int value; }\npublic pkg::Thing[] copy(pkg::Thing[] values) { return values; }\n');
+  // The compiler grammar accepts a qualified array type only with a dotted package.
+  const parsed = parse('record Thing { int value; }\npublic my.pkg::Thing[] copy(my.pkg::Thing[] values) { return values; }\n');
   assert.equal(parsed.errors.length, 0);
   const index = new DeclIndex();
   index.addProgram(parsed.program, 'qualified.pj');
 
   const signature = index.procs.get('copy')?.[0];
-  assert.deepEqual(signature?.params[0], { k: 'array', elem: { k: 'unknown', name: 'pkg::Thing' }, dims: 1 });
-  assert.deepEqual(signature?.ret, { k: 'array', elem: { k: 'unknown', name: 'pkg::Thing' }, dims: 1 });
+  assert.deepEqual(signature?.params[0], { k: 'array', elem: { k: 'unknown', name: 'my.pkg::Thing' }, dims: 1 });
+  assert.deepEqual(signature?.ret, { k: 'array', elem: { k: 'unknown', name: 'my.pkg::Thing' }, dims: 1 });
 });

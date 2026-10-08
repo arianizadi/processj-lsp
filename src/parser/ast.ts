@@ -596,7 +596,9 @@ export function typeToString(t: TypeNode): string {
       return typeToString(t.elem) + '[]'.repeat(t.dims);
     case 'ChanType': {
       const head = t.shared ? `shared ${t.sharedEnd ? t.sharedEnd + ' ' : ''}` : '';
-      return `${head}chan<${typeToString(t.elem)}>${t.end ? '.' + t.end : ''}`;
+      // The compiler's lexer reads `>>` as a shift, so a nested type closes with `> >`.
+      const elem = typeToString(t.elem);
+      return `${head}chan<${elem}${elem.endsWith('>') ? ' ' : ''}>${t.end ? '.' + t.end : ''}`;
     }
   }
 }

@@ -1,0 +1,2621 @@
+{
+  "version": 1,
+  "producer": "fdr",
+  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+  "documentVersion": 1,
+  "tool": {
+    "name": "FDR",
+    "version": "4.2.7"
+  },
+  "assumptions": [
+    "long values are modelled as the integers 0..6.",
+    "println is not modelled: it does not communicate.",
+    "Every par branch is a CSP process synchronising only on the channels it shares; a par ends (τ) when all its branches have."
+  ],
+  "checks": [
+    {
+      "id": "fdr:deadlock-free:main",
+      "property": "deadlock-free",
+      "label": "Deadlock freedom",
+      "target": {
+        "kind": "program",
+        "name": "main",
+        "at": {
+          "uri": "file:///fixtures/verification/commstime_bounded.pj",
+          "span": {
+            "start": {
+              "line": 42,
+              "col": 12
+            },
+            "end": {
+              "line": 42,
+              "col": 16
+            }
+          }
+        }
+      },
+      "status": "failed",
+      "severity": "error",
+      "stats": {
+        "states": 28,
+        "transitions": 37,
+        "ms": 190
+      },
+      "assertion": "MAIN :[deadlock free [F]]",
+      "counterexample": {
+        "kind": "deadlock",
+        "steps": [
+          {
+            "index": 0,
+            "event": "d.0",
+            "kind": "communication",
+            "channel": {
+              "name": "d",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 22
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 23
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "0",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 47,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 47,
+                            "col": 31
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 3
+                    }
+                  ],
+                  "label": "prefix(0, c, d)",
+                  "procedure": "prefix"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 7,
+                      "col": 2
+                    },
+                    "end": {
+                      "line": 7,
+                      "col": 15
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "delta(d, a, b)",
+                  "procedure": "delta"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 26,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 26,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "prefix writes its initial 0 on d; delta reads it",
+            "visible": true
+          },
+          {
+            "index": 1,
+            "event": "b.0",
+            "kind": "communication",
+            "channel": {
+              "name": "b",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 16
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 17
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "0",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 35
+                          }
+                        }
+                      },
+                      "kind": "call"
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 29,
+                            "col": 6
+                          },
+                          "end": {
+                            "line": 29,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "branch 2 of delta"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 29,
+                      "col": 6
+                    },
+                    "end": {
+                      "line": 29,
+                      "col": 20
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 46,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 46,
+                            "col": 26
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "succ(b, c)",
+                  "procedure": "succ"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 18,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 18,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's branch 2 writes 0 on b; succ reads it",
+            "visible": true
+          },
+          {
+            "index": 2,
+            "event": "a.0",
+            "kind": "communication",
+            "channel": {
+              "name": "a",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 13
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 14
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "0",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 35
+                          }
+                        }
+                      },
+                      "kind": "call"
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 28,
+                            "col": 6
+                          },
+                          "end": {
+                            "line": 28,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "branch 1 of delta"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 28,
+                      "col": 6
+                    },
+                    "end": {
+                      "line": 28,
+                      "col": 20
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 48,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 48,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 4
+                    }
+                  ],
+                  "label": "consume(a)",
+                  "procedure": "consume"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 37,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 37,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's branch 1 writes 0 on a; consume reads it (1 of 3)",
+            "visible": true
+          },
+          {
+            "index": 3,
+            "event": "c.1",
+            "kind": "communication",
+            "channel": {
+              "name": "c",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 19
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 20
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "1",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 46,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 46,
+                            "col": 26
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "succ(b, c)",
+                  "procedure": "succ"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 19,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 19,
+                      "col": 21
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 47,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 47,
+                            "col": 31
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 3
+                    }
+                  ],
+                  "label": "prefix(0, c, d)",
+                  "procedure": "prefix"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 10,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 10,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "succ writes 1 on c; prefix reads it",
+            "visible": true
+          },
+          {
+            "index": 4,
+            "event": "τ",
+            "kind": "internal",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "delta(d, a, b)",
+                  "procedure": "delta"
+                },
+                "role": "actor",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 27,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 30,
+                      "col": 5
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's par ends; delta starts its next round",
+            "visible": false
+          },
+          {
+            "index": 5,
+            "event": "d.1",
+            "kind": "communication",
+            "channel": {
+              "name": "d",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 22
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 23
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "1",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 47,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 47,
+                            "col": 31
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 3
+                    }
+                  ],
+                  "label": "prefix(0, c, d)",
+                  "procedure": "prefix"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 11,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 11,
+                      "col": 17
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "delta(d, a, b)",
+                  "procedure": "delta"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 26,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 26,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "prefix writes 1 on d; delta reads it",
+            "visible": true
+          },
+          {
+            "index": 6,
+            "event": "b.1",
+            "kind": "communication",
+            "channel": {
+              "name": "b",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 16
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 17
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "1",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 35
+                          }
+                        }
+                      },
+                      "kind": "call"
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 29,
+                            "col": 6
+                          },
+                          "end": {
+                            "line": 29,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "branch 2 of delta"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 29,
+                      "col": 6
+                    },
+                    "end": {
+                      "line": 29,
+                      "col": 20
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 46,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 46,
+                            "col": 26
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "succ(b, c)",
+                  "procedure": "succ"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 18,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 18,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's branch 2 writes 1 on b; succ reads it",
+            "visible": true
+          },
+          {
+            "index": 7,
+            "event": "c.2",
+            "kind": "communication",
+            "channel": {
+              "name": "c",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 19
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 20
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "2",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 46,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 46,
+                            "col": 26
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "succ(b, c)",
+                  "procedure": "succ"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 19,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 19,
+                      "col": 21
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 47,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 47,
+                            "col": 31
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 3
+                    }
+                  ],
+                  "label": "prefix(0, c, d)",
+                  "procedure": "prefix"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 10,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 10,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "succ writes 2 on c; prefix reads it",
+            "visible": true
+          },
+          {
+            "index": 8,
+            "event": "a.1",
+            "kind": "communication",
+            "channel": {
+              "name": "a",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 13
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 14
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "1",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 35
+                          }
+                        }
+                      },
+                      "kind": "call"
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 28,
+                            "col": 6
+                          },
+                          "end": {
+                            "line": 28,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "branch 1 of delta"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 28,
+                      "col": 6
+                    },
+                    "end": {
+                      "line": 28,
+                      "col": 20
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 48,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 48,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 4
+                    }
+                  ],
+                  "label": "consume(a)",
+                  "procedure": "consume"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 37,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 37,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's branch 1 writes 1 on a; consume reads it (2 of 3)",
+            "visible": true
+          },
+          {
+            "index": 9,
+            "event": "τ",
+            "kind": "internal",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "delta(d, a, b)",
+                  "procedure": "delta"
+                },
+                "role": "actor",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 27,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 30,
+                      "col": 5
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's par ends; delta starts its next round",
+            "visible": false
+          },
+          {
+            "index": 10,
+            "event": "d.2",
+            "kind": "communication",
+            "channel": {
+              "name": "d",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 22
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 23
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "2",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 47,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 47,
+                            "col": 31
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 3
+                    }
+                  ],
+                  "label": "prefix(0, c, d)",
+                  "procedure": "prefix"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 11,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 11,
+                      "col": 17
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "delta(d, a, b)",
+                  "procedure": "delta"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 26,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 26,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "prefix writes 2 on d; delta reads it",
+            "visible": true
+          },
+          {
+            "index": 11,
+            "event": "a.2",
+            "kind": "communication",
+            "channel": {
+              "name": "a",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 13
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 14
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "2",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 35
+                          }
+                        }
+                      },
+                      "kind": "call"
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 28,
+                            "col": 6
+                          },
+                          "end": {
+                            "line": 28,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "branch 1 of delta"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 28,
+                      "col": 6
+                    },
+                    "end": {
+                      "line": 28,
+                      "col": 20
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 48,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 48,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 4
+                    }
+                  ],
+                  "label": "consume(a)",
+                  "procedure": "consume"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 37,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 37,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's branch 1 writes 2 on a; consume reads it (3 of 3) and then finishes",
+            "visible": true
+          },
+          {
+            "index": 12,
+            "event": "b.2",
+            "kind": "communication",
+            "channel": {
+              "name": "b",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 16
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 17
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "2",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 35
+                          }
+                        }
+                      },
+                      "kind": "call"
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 29,
+                            "col": 6
+                          },
+                          "end": {
+                            "line": 29,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "branch 2 of delta"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 29,
+                      "col": 6
+                    },
+                    "end": {
+                      "line": 29,
+                      "col": 20
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 46,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 46,
+                            "col": 26
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "succ(b, c)",
+                  "procedure": "succ"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 18,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 18,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's branch 2 writes 2 on b; succ reads it",
+            "visible": true
+          },
+          {
+            "index": 13,
+            "event": "τ",
+            "kind": "internal",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "delta(d, a, b)",
+                  "procedure": "delta"
+                },
+                "role": "actor",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 27,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 30,
+                      "col": 5
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's par ends; delta starts its next round",
+            "visible": false
+          },
+          {
+            "index": 14,
+            "event": "c.3",
+            "kind": "communication",
+            "channel": {
+              "name": "c",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 19
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 20
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "3",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 46,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 46,
+                            "col": 26
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "succ(b, c)",
+                  "procedure": "succ"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 19,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 19,
+                      "col": 21
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 47,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 47,
+                            "col": 31
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 3
+                    }
+                  ],
+                  "label": "prefix(0, c, d)",
+                  "procedure": "prefix"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 10,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 10,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "succ writes 3 on c; prefix reads it",
+            "visible": true
+          },
+          {
+            "index": 15,
+            "event": "d.3",
+            "kind": "communication",
+            "channel": {
+              "name": "d",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 22
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 23
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "3",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 47,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 47,
+                            "col": 31
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 3
+                    }
+                  ],
+                  "label": "prefix(0, c, d)",
+                  "procedure": "prefix"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 11,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 11,
+                      "col": 17
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    }
+                  ],
+                  "label": "delta(d, a, b)",
+                  "procedure": "delta"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 26,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 26,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "prefix writes 3 on d; delta reads it",
+            "visible": true
+          },
+          {
+            "index": 16,
+            "event": "b.3",
+            "kind": "communication",
+            "channel": {
+              "name": "b",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 16
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 17
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "3",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 36
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 1
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 45,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 45,
+                            "col": 35
+                          }
+                        }
+                      },
+                      "kind": "call"
+                    },
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 29,
+                            "col": 6
+                          },
+                          "end": {
+                            "line": 29,
+                            "col": 20
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "branch 2 of delta"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 29,
+                      "col": 6
+                    },
+                    "end": {
+                      "line": 29,
+                      "col": 20
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 46,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 46,
+                            "col": 26
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "succ(b, c)",
+                  "procedure": "succ"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 18,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 18,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "delta's branch 2 writes 3 on b; succ reads it",
+            "visible": true
+          },
+          {
+            "index": 17,
+            "event": "c.4",
+            "kind": "communication",
+            "channel": {
+              "name": "c",
+              "kind": "channel",
+              "declaration": {
+                "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                "span": {
+                  "start": {
+                    "line": 43,
+                    "col": 19
+                  },
+                  "end": {
+                    "line": 43,
+                    "col": 20
+                  }
+                }
+              },
+              "owner": []
+            },
+            "value": "4",
+            "participants": [
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 46,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 46,
+                            "col": 26
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 2
+                    }
+                  ],
+                  "label": "succ(b, c)",
+                  "procedure": "succ"
+                },
+                "role": "writer",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 19,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 19,
+                      "col": 21
+                    }
+                  }
+                }
+              },
+              {
+                "process": {
+                  "path": [
+                    {
+                      "site": {
+                        "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                        "span": {
+                          "start": {
+                            "line": 47,
+                            "col": 4
+                          },
+                          "end": {
+                            "line": 47,
+                            "col": 31
+                          }
+                        }
+                      },
+                      "kind": "branch",
+                      "index": 3
+                    }
+                  ],
+                  "label": "prefix(0, c, d)",
+                  "procedure": "prefix"
+                },
+                "role": "reader",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 10,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 10,
+                      "col": 18
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "succ writes 4 on c; prefix reads it",
+            "visible": true
+          }
+        ],
+        "final": [
+          {
+            "process": {
+              "path": [
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 45,
+                        "col": 4
+                      },
+                      "end": {
+                        "line": 45,
+                        "col": 36
+                      }
+                    }
+                  },
+                  "kind": "branch",
+                  "index": 1
+                },
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 45,
+                        "col": 4
+                      },
+                      "end": {
+                        "line": 45,
+                        "col": 35
+                      }
+                    }
+                  },
+                  "kind": "call"
+                },
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 28,
+                        "col": 6
+                      },
+                      "end": {
+                        "line": 28,
+                        "col": 20
+                      }
+                    }
+                  },
+                  "kind": "branch",
+                  "index": 1
+                }
+              ],
+              "label": "branch 1 of delta"
+            },
+            "status": "blocked",
+            "at": {
+              "uri": "file:///fixtures/verification/commstime_bounded.pj",
+              "span": {
+                "start": {
+                  "line": 28,
+                  "col": 6
+                },
+                "end": {
+                  "line": 28,
+                  "col": 20
+                }
+              }
+            },
+            "description": "branch 1 of delta waits to write 3 on a",
+            "waits": [
+              {
+                "operation": "write",
+                "channel": {
+                  "name": "a",
+                  "kind": "channel",
+                  "declaration": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 43,
+                        "col": 13
+                      },
+                      "end": {
+                        "line": 43,
+                        "col": 14
+                      }
+                    }
+                  },
+                  "owner": []
+                },
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 28,
+                      "col": 6
+                    },
+                    "end": {
+                      "line": 28,
+                      "col": 20
+                    }
+                  }
+                },
+                "detail": "waits to write a",
+                "partner": {
+                  "process": {
+                    "path": [
+                      {
+                        "site": {
+                          "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                          "span": {
+                            "start": {
+                              "line": 48,
+                              "col": 4
+                            },
+                            "end": {
+                              "line": 48,
+                              "col": 20
+                            }
+                          }
+                        },
+                        "kind": "branch",
+                        "index": 4
+                      }
+                    ],
+                    "label": "consume(a)",
+                    "procedure": "consume"
+                  },
+                  "state": "terminated",
+                  "detail": "consume read its three values and finished"
+                }
+              }
+            ]
+          },
+          {
+            "process": {
+              "path": [
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 45,
+                        "col": 4
+                      },
+                      "end": {
+                        "line": 45,
+                        "col": 36
+                      }
+                    }
+                  },
+                  "kind": "branch",
+                  "index": 1
+                },
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 45,
+                        "col": 4
+                      },
+                      "end": {
+                        "line": 45,
+                        "col": 35
+                      }
+                    }
+                  },
+                  "kind": "call"
+                },
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 29,
+                        "col": 6
+                      },
+                      "end": {
+                        "line": 29,
+                        "col": 20
+                      }
+                    }
+                  },
+                  "kind": "branch",
+                  "index": 2
+                }
+              ],
+              "label": "branch 2 of delta"
+            },
+            "status": "terminated",
+            "at": {
+              "uri": "file:///fixtures/verification/commstime_bounded.pj",
+              "span": {
+                "start": {
+                  "line": 29,
+                  "col": 6
+                },
+                "end": {
+                  "line": 29,
+                  "col": 20
+                }
+              }
+            },
+            "description": "branch 2 of delta wrote 3 on b and finished"
+          },
+          {
+            "process": {
+              "path": [
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 45,
+                        "col": 4
+                      },
+                      "end": {
+                        "line": 45,
+                        "col": 36
+                      }
+                    }
+                  },
+                  "kind": "branch",
+                  "index": 1
+                }
+              ],
+              "label": "delta(d, a, b)",
+              "procedure": "delta"
+            },
+            "status": "blocked",
+            "at": {
+              "uri": "file:///fixtures/verification/commstime_bounded.pj",
+              "span": {
+                "start": {
+                  "line": 27,
+                  "col": 4
+                },
+                "end": {
+                  "line": 30,
+                  "col": 5
+                }
+              }
+            },
+            "description": "delta waits for its par to finish (its branch 1 is stuck), so it never reads d again",
+            "waits": [
+              {
+                "operation": "other",
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 27,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 30,
+                      "col": 5
+                    }
+                  }
+                },
+                "detail": "waits for its par to finish",
+                "partner": {
+                  "process": {
+                    "path": [
+                      {
+                        "site": {
+                          "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                          "span": {
+                            "start": {
+                              "line": 45,
+                              "col": 4
+                            },
+                            "end": {
+                              "line": 45,
+                              "col": 36
+                            }
+                          }
+                        },
+                        "kind": "branch",
+                        "index": 1
+                      },
+                      {
+                        "site": {
+                          "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                          "span": {
+                            "start": {
+                              "line": 45,
+                              "col": 4
+                            },
+                            "end": {
+                              "line": 45,
+                              "col": 35
+                            }
+                          }
+                        },
+                        "kind": "call"
+                      },
+                      {
+                        "site": {
+                          "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                          "span": {
+                            "start": {
+                              "line": 28,
+                              "col": 6
+                            },
+                            "end": {
+                              "line": 28,
+                              "col": 20
+                            }
+                          }
+                        },
+                        "kind": "branch",
+                        "index": 1
+                      }
+                    ],
+                    "label": "branch 1 of delta"
+                  },
+                  "state": "blocked-elsewhere",
+                  "detail": "branch 1 of delta is stuck writing a"
+                }
+              }
+            ]
+          },
+          {
+            "process": {
+              "path": [
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 46,
+                        "col": 4
+                      },
+                      "end": {
+                        "line": 46,
+                        "col": 26
+                      }
+                    }
+                  },
+                  "kind": "branch",
+                  "index": 2
+                }
+              ],
+              "label": "succ(b, c)",
+              "procedure": "succ"
+            },
+            "status": "blocked",
+            "at": {
+              "uri": "file:///fixtures/verification/commstime_bounded.pj",
+              "span": {
+                "start": {
+                  "line": 18,
+                  "col": 4
+                },
+                "end": {
+                  "line": 18,
+                  "col": 18
+                }
+              }
+            },
+            "description": "succ waits to read b",
+            "waits": [
+              {
+                "operation": "read",
+                "channel": {
+                  "name": "b",
+                  "kind": "channel",
+                  "declaration": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 43,
+                        "col": 16
+                      },
+                      "end": {
+                        "line": 43,
+                        "col": 17
+                      }
+                    }
+                  },
+                  "owner": []
+                },
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 18,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 18,
+                      "col": 18
+                    }
+                  }
+                },
+                "detail": "waits to read b",
+                "partner": {
+                  "process": {
+                    "path": [
+                      {
+                        "site": {
+                          "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                          "span": {
+                            "start": {
+                              "line": 45,
+                              "col": 4
+                            },
+                            "end": {
+                              "line": 45,
+                              "col": 36
+                            }
+                          }
+                        },
+                        "kind": "branch",
+                        "index": 1
+                      }
+                    ],
+                    "label": "delta(d, a, b)",
+                    "procedure": "delta"
+                  },
+                  "state": "blocked-elsewhere",
+                  "detail": "delta never starts the par that writes b: it waits for its current par to finish"
+                }
+              }
+            ]
+          },
+          {
+            "process": {
+              "path": [
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 47,
+                        "col": 4
+                      },
+                      "end": {
+                        "line": 47,
+                        "col": 31
+                      }
+                    }
+                  },
+                  "kind": "branch",
+                  "index": 3
+                }
+              ],
+              "label": "prefix(0, c, d)",
+              "procedure": "prefix"
+            },
+            "status": "blocked",
+            "at": {
+              "uri": "file:///fixtures/verification/commstime_bounded.pj",
+              "span": {
+                "start": {
+                  "line": 11,
+                  "col": 4
+                },
+                "end": {
+                  "line": 11,
+                  "col": 17
+                }
+              }
+            },
+            "description": "prefix waits to write 4 on d",
+            "waits": [
+              {
+                "operation": "write",
+                "channel": {
+                  "name": "d",
+                  "kind": "channel",
+                  "declaration": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 43,
+                        "col": 22
+                      },
+                      "end": {
+                        "line": 43,
+                        "col": 23
+                      }
+                    }
+                  },
+                  "owner": []
+                },
+                "at": {
+                  "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                  "span": {
+                    "start": {
+                      "line": 11,
+                      "col": 4
+                    },
+                    "end": {
+                      "line": 11,
+                      "col": 17
+                    }
+                  }
+                },
+                "detail": "waits to write d",
+                "partner": {
+                  "process": {
+                    "path": [
+                      {
+                        "site": {
+                          "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                          "span": {
+                            "start": {
+                              "line": 45,
+                              "col": 4
+                            },
+                            "end": {
+                              "line": 45,
+                              "col": 36
+                            }
+                          }
+                        },
+                        "kind": "branch",
+                        "index": 1
+                      }
+                    ],
+                    "label": "delta(d, a, b)",
+                    "procedure": "delta"
+                  },
+                  "state": "blocked-elsewhere",
+                  "detail": "delta waits for its par to finish instead of reading d"
+                }
+              }
+            ]
+          },
+          {
+            "process": {
+              "path": [
+                {
+                  "site": {
+                    "uri": "file:///fixtures/verification/commstime_bounded.pj",
+                    "span": {
+                      "start": {
+                        "line": 48,
+                        "col": 4
+                      },
+                      "end": {
+                        "line": 48,
+                        "col": 20
+                      }
+                    }
+                  },
+                  "kind": "branch",
+                  "index": 4
+                }
+              ],
+              "label": "consume(a)",
+              "procedure": "consume"
+            },
+            "status": "terminated",
+            "at": {
+              "uri": "file:///fixtures/verification/commstime_bounded.pj",
+              "span": {
+                "start": {
+                  "line": 38,
+                  "col": 4
+                },
+                "end": {
+                  "line": 38,
+                  "col": 15
+                }
+              }
+            },
+            "description": "consume finished after reading three values"
+          }
+        ],
+        "summary": "deadlock after 18 steps: branch 1 of delta waits to write a, but consume has terminated; delta, succ and prefix all wait on delta"
+      }
+    },
+    {
+      "id": "fdr:divergence-free:main",
+      "property": "divergence-free",
+      "label": "Divergence freedom",
+      "target": {
+        "kind": "program",
+        "name": "main"
+      },
+      "status": "passed",
+      "severity": "error",
+      "stats": {
+        "states": 28,
+        "transitions": 37,
+        "ms": 120
+      },
+      "assertion": "MAIN :[divergence free]"
+    },
+    {
+      "id": "fdr:no-runtime-errors:main",
+      "property": "no-runtime-errors",
+      "label": "No runtime errors",
+      "target": {
+        "kind": "program",
+        "name": "main"
+      },
+      "status": "passed",
+      "severity": "error",
+      "stats": {
+        "states": 28,
+        "transitions": 37,
+        "ms": 95
+      },
+      "assertion": "MAIN \\ Events [T= MAIN_NO_ERRORS"
+    }
+  ]
+}

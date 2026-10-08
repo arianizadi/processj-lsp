@@ -1,11 +1,14 @@
-// outcome: error
+// outcome: runs
 import std.*;
-// javac: "variable __booleanGuards1 is already defined in method run()".
+// Two alts one after another in one process build and run with this compiler
+// (before its alt_timer_update commits, javac rejected the second: "variable
+// __booleanGuards1 is already defined in method run()"). A second replicated
+// alt in one process still fails javac (pj/multiple-alts).
 public void main(string[] args) {
     chan<int> a;
     int x;
     par {
-        a.write(1);
+        { a.write(1); a.write(2); }
         {
             alt { x = a.read() : { println("A " + x); } }
             alt { x = a.read() : { println("B " + x); } }

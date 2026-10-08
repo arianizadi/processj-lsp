@@ -4,3 +4,7 @@ Copyright 2026 Arian Izadi
 This product includes example programs from the ProcessJ compiler
 (https://github.com/mattunlv/ProcessJ), Copyright University of Nevada, Las Vegas,
 licensed under the Apache License, Version 2.0, in test/fixtures/processj/.
+
+The concurrency graph is laid out with elkjs (https://github.com/kieler/elkjs),
+the Eclipse Layout Kernel compiled to JavaScript, used unmodified as an npm
+dependency under the Eclipse Public License 2.0 (or, at your option, GPL-3.0-or-later).

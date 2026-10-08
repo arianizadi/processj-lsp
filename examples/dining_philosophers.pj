@@ -1,0 +1,45 @@
+// expect: pj/unused
+// Three philosophers share three chopsticks, and each one picks up the
+// chopstick on its left before the one on its right. When all three hold
+// their left chopstick, each waits forever for its right one, held by its
+// neighbour, and each chopstick waits for its holder to put it down: six
+// processes waiting for each other in a circle. The checker proves nothing
+// stuck here (its only note is that `b` is never used): no statement is stuck
+// in every run, the deadlock needs one particular interleaving. FDR tries
+// every interleaving and finds it. Run Check with FDR and the graph opens on
+// the circle; dining_philosophers_fixed.pj breaks it.
+import std.*;
+
+// A chopstick is held by one neighbour at a time: picked up and put down on the same channel.
+public void chopstick(chan<boolean>.read left, chan<boolean>.read right) {
+    boolean b;
+    while (true) {
+        alt {
+            b = left.read() : { b = left.read(); }
+            b = right.read() : { b = right.read(); }
+        }
+    }
+}
+
+// Every philosopher takes the left chopstick first, then the right one.
+public void philosopher(int id, chan<boolean>.write left, chan<boolean>.write right) {
+    while (true) {
+        left.write(true);
+        right.write(true);
+        println("philosopher " + id + " eats");
+        left.write(true);
+        right.write(true);
+    }
+}
+
+public void main(string[] args) {
+    chan<boolean> p0f0, p0f1, p1f1, p1f2, p2f2, p2f0;
+    par {
+        philosopher(0, p0f0.write, p0f1.write);
+        philosopher(1, p1f1.write, p1f2.write);
+        philosopher(2, p2f2.write, p2f0.write);
+        chopstick(p0f0.read, p2f0.read);
+        chopstick(p1f1.read, p0f1.read);
+        chopstick(p2f2.read, p1f2.read);
+    }
+}

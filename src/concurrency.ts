@@ -1,7 +1,9 @@
 /**
  * A source-mapped, editor-facing concurrency model. This is intentionally a
  * static topology: uncertain edges are retained and labelled instead of being
- * silently omitted or presented as runtime facts.
+ * silently omitted or presented as runtime facts. It stays the answer to the
+ * `processj/concurrencyGraph` request; the views users look at are drawn from
+ * the process network in src/graph.
  */
 import type * as A from './parser/ast';
 import { pathToFileURL } from 'node:url';
@@ -437,48 +439,11 @@ export function buildConcurrencyGraph(program: A.Program, checked: CheckResult, 
   return { version: 1, uri: normalizedUri(opts.uri), nodes: [...nodes.values()], edges, deadlocks, procedureEffects };
 }
 
-/** Portable Markdown/DOT-like report for clients without the VS Code webview. */
-export function formatConcurrencyMarkdown(title: string, graph: ConcurrencyGraph): string {
-  const lines = [`# Concurrency graph — ${title}`, '', '```mermaid', 'flowchart LR'];
-  const shortIds = new Map(graph.nodes.map((node, index) => [node.id, `n${index}`]));
-  for (const node of graph.nodes) {
-    const id = shortIds.get(node.id)!;
-    const label = escapeMermaid(`${icon(node.kind)} ${node.label}${node.replicated ? ' × N' : ''}`);
-    const shape = node.kind === 'channel' ? [`${id}[("${label}")]`] : node.kind === 'parallel' || node.kind === 'alternation' ? [`${id}{{"${label}"}}`] : [`${id}["${label}"]`];
-    lines.push(`    ${shape[0]}`);
-    if (node.confidence !== 'exact') lines.push(`    class ${id} uncertain`);
-  }
-  for (const edge of graph.edges) {
-    const from = shortIds.get(edge.from);
-    const to = shortIds.get(edge.to);
-    if (!from || !to) continue;
-    const label = escapeMermaid(edge.label ?? edge.kind);
-    lines.push(`    ${from} ${edge.confidence === 'exact' ? '-->' : '-.->'}|"${label}"| ${to}`);
-  }
-  lines.push('    classDef uncertain stroke-dasharray: 5 5,opacity:0.75', '```', '');
-
-  if (graph.deadlocks.length) {
-    lines.push('## Confirmed deadlocks', '');
-    for (const finding of graph.deadlocks) {
-      const waits = finding.waits.map((wait) => `branch ${wait.branch} ${wait.operation}s on ${graph.nodes.find((n) => n.id === wait.channelNode)?.label ?? 'a channel'} (line ${wait.source.span.start.line + 1})`).join('; ');
-      lines.push(`- **${finding.cause === 'circular-wait' ? 'Circular wait' : 'Missing peer'}:** ${waits}.`);
-    }
-    lines.push('');
-  }
-
-  const effectEntries = Object.entries(graph.procedureEffects).filter(([, facts]) => facts.length);
-  if (effectEntries.length) {
-    lines.push('## Procedure effects', '');
-    for (const [id, facts] of effectEntries) {
-      const proc = graph.nodes.find((node) => node.id === id);
-      lines.push(`- **${proc?.label ?? id}:** ${facts.map((fact) => `${fact.label}${fact.confidence === 'exact' ? '' : ' (partial)'}`).join(', ')}`);
-    }
-    lines.push('');
-  }
-
-  lines.push('_Solid edges are exact. Dashed edges cross unresolved or conditional code._', '');
-  return lines.join('\n');
-}
+/**
+ * The portable Markdown report describes the process network (src/graph); it
+ * replaced the topology flowchart that used to be rendered from this graph.
+ */
+export { formatConcurrencyMarkdown } from './graph/render-markdown';
 
 function rootName(e: A.Expr): A.NameExpr | undefined {
   if (e.kind === 'NameExpr') return e;
@@ -540,21 +505,4 @@ function effectLabels(summary: GraphEffectSummary): ProcedureEffectView[] {
   add(f.mobile, 'uses mobile-process semantics');
   add(f.unknown, 'has opaque effects');
   return out;
-}
-
-function icon(kind: ConcurrencyNodeKind): string {
-  switch (kind) {
-    case 'channel': return '↔';
-    case 'parallel': return '⑂';
-    case 'branch': return '⑂';
-    case 'alternation': return '◇';
-    case 'barrier': return '⏸';
-    case 'timer': return '◷';
-    case 'mobile': return '⇢';
-    case 'procedure': return 'ƒ';
-  }
-}
-
-function escapeMermaid(value: string): string {
-  return value.replace(/["<>]/g, (character) => character === '"' ? "'" : character === '<' ? '‹' : '›').replace(/\|/g, '¦');
 }
