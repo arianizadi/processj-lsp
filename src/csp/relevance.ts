@@ -112,6 +112,7 @@ export function saturate(input: RelevanceInput): Saturation {
           n.call.args.forEach((a, i) => {
             const param = callee.params[i];
             if (param && a.value) flow(v(callee, param.cspm), vars(p, a.value));
+            if (param?.len && a.chan?.len) flow(v(callee, param.len), vars(p, a.chan.len));
           });
           if (n.ret) flow(v(p, n.ret), [r(callee)]);
           break;

@@ -75,9 +75,10 @@ let networkPanel: NetworkPanel | undefined;
  * already showing the document only moves to it, keeping its pan and zoom.
  */
 export async function showConcurrencyGraph(client: LanguageClient, target?: string | vscode.Uri, focus?: GraphFocus): Promise<void> {
-  const uri = target ? String(target) : vscode.window.activeTextEditor?.document.languageId === 'processj' ? vscode.window.activeTextEditor.document.uri.toString() : undefined;
+  const language = vscode.window.activeTextEditor?.document.languageId;
+  const uri = target ? String(target) : language === 'processj' || language === 'cspm' ? vscode.window.activeTextEditor!.document.uri.toString() : undefined;
   if (!uri) {
-    void vscode.window.showWarningMessage('ProcessJ: open a ProcessJ editor first.');
+    void vscode.window.showWarningMessage('ProcessJ: open a ProcessJ or CSPm editor first.');
     return;
   }
   if (focus && networkPanel?.uri === uri && networkPanel.client === client) {

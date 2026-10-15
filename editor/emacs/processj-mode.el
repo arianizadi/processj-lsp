@@ -8,6 +8,9 @@
 ;; `processj-export-graph' (C-c C-e) writes it next to the file.
 ;; `processj-check-with-fdr' (C-c C-f) checks the file with FDR and, when a check
 ;; fails, opens the graph on what FDR found.
+;; `cspm-mode' is for CSPm files (.csp, hand-written or made by Convert to CSP):
+;; the same server draws their process network (C-c C-g) and checks their own
+;; assertions with FDR (C-c C-f), with no ProcessJ analysis.
 ;;
 ;; Manual use: (load "/path/to/processj-lsp/editor/emacs/processj-mode.el")
 
@@ -102,16 +105,65 @@ When nil, the server from this checkout is run with node."
 ;;;###autoload
 (add-to-list 'auto-mode-alist '("\\.pj\\'" . processj-mode))
 
-;; eglot (Emacs 29+, or from GNU ELPA on older Emacs)
+;; CSPm, as FDR reads it: `--' and nested `{- -}' comments, its keywords and process names.
+
+(defconst cspm--keywords
+  '("channel" "datatype" "subtype" "nametype" "assert" "include" "external" "transparent"
+    "if" "then" "else" "let" "within" "not" "and" "or" "module" "exports" "endmodule"
+    "instance" "Timed" "print"))
+
+(defconst cspm--builtins
+  '("STOP" "SKIP" "CHAOS" "RUN" "DIV" "WAIT" "Events" "Int" "Bool" "Char" "true" "false"))
+
+(defvar cspm-font-lock-keywords
+  `((,(regexp-opt cspm--keywords 'symbols) . font-lock-keyword-face)
+    (,(regexp-opt cspm--builtins 'symbols) . font-lock-constant-face)
+    (":\\[[^]\n]*\\]?\\]" . font-lock-builtin-face)
+    ("\\[\\(?:T\\|F\\|FD\\|R\\|RD\\|V\\)=" . font-lock-builtin-face)
+    ("^\\([A-Za-z_][A-Za-z0-9_']*\\)\\(?:([^)\n]*)\\)*[ \t]*=[^=]" 1 font-lock-function-name-face)))
+
+(defvar cspm-mode-syntax-table
+  (let ((table (make-syntax-table)))
+    ;; `--' to the end of the line, and `{- -}' (nested), as in Haskell.
+    (modify-syntax-entry ?\{ "(}1nb" table)
+    (modify-syntax-entry ?\} "){4nb" table)
+    (modify-syntax-entry ?- ". 123" table)
+    (modify-syntax-entry ?\n ">" table)
+    (modify-syntax-entry ?\" "\"" table)
+    (modify-syntax-entry ?' "_" table)
+    (modify-syntax-entry ?_ "_" table)
+    (modify-syntax-entry ?< "." table)
+    (modify-syntax-entry ?> "." table)
+    table)
+  "Syntax table for `cspm-mode'.")
+
+;;;###autoload
+(define-derived-mode cspm-mode prog-mode "CSPm"
+  "Major mode for CSPm, FDR's input language.
+The processj-lsp server draws the file's process network and checks its
+assertions with FDR; it runs no ProcessJ analysis on it."
+  :syntax-table cspm-mode-syntax-table
+  (setq-local font-lock-defaults '(cspm-font-lock-keywords))
+  (setq-local comment-start "-- ")
+  (setq-local comment-end "")
+  (setq-local comment-start-skip "\\(?:--+\\|{-+\\)[ \t]*")
+  (setq-local indent-tabs-mode nil))
+
+;;;###autoload
+(add-to-list 'auto-mode-alist '("\\.csp\\'" . cspm-mode))
+
+;; eglot (Emacs 29+, or from GNU ELPA on older Emacs). One server for both
+;; languages: eglot names the language after the mode (`processj', `cspm').
 (with-eval-after-load 'eglot
-  (add-to-list 'eglot-server-programs `(processj-mode . ,(processj-lsp-command))))
+  (add-to-list 'eglot-server-programs `((processj-mode cspm-mode) . ,(processj-lsp-command))))
 
 ;; lsp-mode, when installed
 (with-eval-after-load 'lsp-mode
   (add-to-list 'lsp-language-id-configuration '(processj-mode . "processj"))
+  (add-to-list 'lsp-language-id-configuration '(cspm-mode . "cspm"))
   (lsp-register-client
    (make-lsp-client :new-connection (lsp-stdio-connection #'processj-lsp-command)
-                    :activation-fn (lsp-activate-on "processj")
+                    :activation-fn (lsp-activate-on "processj" "cspm")
                     ;; processj/verificationChanged goes only to clients that ask for it (VS Code's
                     ;; graph panel), processj/fdrReportChanged to every client: the graph page in the
                     ;; browser follows both by itself. Ignore them rather than warn.
@@ -132,6 +184,7 @@ When nil, the server from this checkout is run with node."
     (message "processj-mode: no LSP client found; install eglot (Emacs 29+ has it built in) or lsp-mode"))))
 
 (add-hook 'processj-mode-hook #'processj--start-lsp)
+(add-hook 'cspm-mode-hook #'processj--start-lsp)
 
 ;; Server commands: the concurrency graph, Convert to CSP and Check with FDR
 
@@ -213,6 +266,8 @@ write into. Files that were not written by processj-lsp are never overwritten."
 
 (define-key processj-mode-map (kbd "C-c C-g") #'processj-show-graph)
 (define-key processj-mode-map (kbd "C-c C-e") #'processj-export-graph)
+(define-key cspm-mode-map (kbd "C-c C-g") #'processj-show-graph)
+(define-key cspm-mode-map (kbd "C-c C-e") #'processj-export-graph)
 
 (defconst processj--procedure-regexp
   (concat "^[ \t]*\\(?:\\(?:public\\|private\\|protected\\|native\\|mobile\\)[ \t]+\\)*"
@@ -274,8 +329,10 @@ The model is written next to the file (NAME.csp or NAME.PROCEDURE.csp)."
   "Check this file's program, or PROCEDURE on its own, with FDR.
 Stuck statements get diagnostics.  When a check fails, the graph opens
 on the result in a browser; otherwise the step-by-step report opens
-(the server's fdrShowGraph setting says which)."
-  (interactive (list (processj--read-procedure "Check with FDR (empty: the whole program): ")))
+(the server's fdrShowGraph setting says which).  In a CSPm buffer FDR
+checks the file's own assertions, and there is no procedure to ask for."
+  (interactive (list (unless (derived-mode-p 'cspm-mode)
+                       (processj--read-procedure "Check with FDR (empty: the whole program): "))))
   (processj--execute "processj.checkWithFdr" procedure))
 
 ;;;###autoload
@@ -285,6 +342,7 @@ on the result in a browser; otherwise the step-by-step report opens
   (processj--execute "processj.cancelFdr"))
 
 (define-key processj-mode-map (kbd "C-c C-f") #'processj-check-with-fdr)
+(define-key cspm-mode-map (kbd "C-c C-f") #'processj-check-with-fdr)
 
 (provide 'processj-mode)
 ;;; processj-mode.el ends here

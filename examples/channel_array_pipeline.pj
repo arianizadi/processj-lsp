@@ -1,0 +1,46 @@
+// expect: none
+import std.*;
+//@csp int -1..8
+
+// A pipeline of stages joined by an array of channels. The array is created in its
+// declaration (this ProcessJ build creates the channels only there), each stage gets
+// the ends of its two elements, and the reader stores each read with a plain
+// assignment: the forms of channel arrays this compiler builds and runs.
+const int STAGES = 4;
+
+public void stage(chan<int>.read in, chan<int>.write out) {
+    int v = 0;
+    while (v != -1) {
+        v = in.read();
+        if (v != -1)
+            out.write(v + 1);
+        else
+            out.write(v);
+    }
+}
+
+public void source(chan<int>.write out) {
+    for (int x = 0; x < 3; x++)
+        out.write(x);
+    out.write(-1);
+}
+
+public void sink(chan<int>[] links, int last) {
+    int v = 0;
+    while (v != -1) {
+        v = links[last].read();
+        if (v != -1)
+            println(v);
+    }
+}
+
+public void main(string[] args) {
+    chan<int> links[] = new chan<int>[STAGES + 1];
+    par {
+        source(links[0].write);
+        par for (int i = 0; i < STAGES; i++) {
+            stage(links[i].read, links[i + 1].write);
+        }
+        sink(links, STAGES);
+    }
+}

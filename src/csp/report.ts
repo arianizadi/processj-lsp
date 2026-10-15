@@ -259,6 +259,13 @@ function sameSpan(a: Span, b: Span): boolean {
  * (`; the compiled program may differ`). A report without a check proves nothing.
  */
 export function lensVerdict(report: VerificationReport): string {
+  // A procedure checked with the arguments its calls give says which (`· size = 6`).
+  const args = report.checks[0]?.target.arguments;
+  const verdict = lensVerdictText(report);
+  return args ? `${verdict} · ${args}` : verdict;
+}
+
+function lensVerdictText(report: VerificationReport): string {
   if (!report.checks.length) return 'FDR: not checked';
   const failed = report.checks.find((c) => c.status === 'failed' && c.severity !== 'info');
   // No deadlock of the whole program, but a process waits forever while others run on.
@@ -300,7 +307,7 @@ export interface ReportContext {
   fileName: string;
   /** Where the CSPm model was written for the user, when it was. */
   cspFile?: string;
-  model: Pick<CspModel, 'target' | 'intRange' | 'warnings' | 'unsupported' | 'sourceMap'>;
+  model: Pick<CspModel, 'target' | 'intRange' | 'warnings' | 'unsupported' | 'sourceMap'> & Partial<Pick<CspModel, 'checkedWith'>>;
   /** The whole run, wall clock. */
   durationMs?: number;
   /** Where the report's JSON was written. */
@@ -313,7 +320,7 @@ export interface ReportContext {
 export function formatFdrReport(report: VerificationReport, ctx: ReportContext): string {
   const lines: string[] = [];
   const names = namesFor(report, ctx.model);
-  const target = ctx.model.target.kind === 'program' ? 'the whole program, from main' : `procedure ${ctx.model.target.name} on its own`;
+  const target = ctx.model.target.kind === 'program' ? 'the whole program, from main' : `procedure ${ctx.model.target.name} on its own${ctx.model.checkedWith ? `, with ${ctx.model.checkedWith.detail}` : ''}`;
   lines.push(`# FDR check: ${ctx.fileName}`, '');
   if (ctx.stale) lines.push(`**${ctx.stale}**`, '');
   const facts = [

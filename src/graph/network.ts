@@ -39,6 +39,8 @@ export interface NetworkModel {
   views: NetworkView[];
   /** The program view when there is a `main`, else the first procedure that communicates. */
   defaultView: string;
+  /** The language the network was drawn from: ProcessJ (when absent) or a CSPm file (src/cspm/network.ts). */
+  language?: 'processj' | 'cspm';
 }
 
 export interface NetworkView {
@@ -56,6 +58,10 @@ export interface NetworkView {
   notes: string[];
   /** Procedures expanded in this view, so a result about one procedure can be placed on each instance. */
   instances: NetInstance[];
+  /** The heading the viewer lists the view under, when not the ProcessJ default (a CSPm file: `Asserted`, `Defined`). */
+  section?: string;
+  /** Drawn from a CSPm file: boxes are processes, arrows are the events they share (src/cspm/network.ts). */
+  language?: 'cspm';
 }
 
 /** One expanded call: the callee's root process is `prefix`; its spawned processes start with `spawn`. */
@@ -100,7 +106,8 @@ export interface NetNode {
   own?: boolean;
   /** Styling of a group: the procedure root, a par container, a replicated body, an expanded call, a branch running a par. */
   group?: 'procedure' | 'par' | 'par-for' | 'call' | 'branch';
-  port?: { parameter: number; name: string; direction: 'in' | 'out' | 'sync' | 'unknown'; type: string };
+  /** `index`: one channel of a channel-array parameter. */
+  port?: { parameter: number; name: string; direction: 'in' | 'out' | 'sync' | 'unknown'; type: string; index?: number };
   /** A dangling side of a channel. */
   stub?: { side: 'no-writer' | 'no-reader'; proven: boolean };
   /** Barrier or channel this node stands for (barrier nodes, junctions, ports, stubs). */
@@ -208,6 +215,22 @@ export interface NetworkOptions {
   maxProcesses?: number;
   /** Build only these views (`program` and/or procedure names); all by default. */
   only?: readonly string[];
+  /**
+   * The arguments a procedure's own view is drawn with: those its data
+   * parameters take in every instance FDR checks it with (they decide its
+   * network: recursion depth, channel-array lengths, par for counts), and
+   * the length of each channel-array parameter, whose channels are then
+   * ports of their own (CheckedWith in src/csp/model.ts).
+   */
+  procedureArguments?: (decl: A.ProcDecl) => ProcedureArguments | undefined;
+}
+
+/** Values by parameter name; `arrays`: channel-array parameters by their length. */
+export interface ProcedureArguments {
+  values: Readonly<Record<string, number | boolean>>;
+  arrays: Readonly<Record<string, number>>;
+  /** Said in the view's notes: `size = 6 (the call at line 75)`. */
+  text?: string;
 }
 
 const CONFIDENCE_RANK: Record<Confidence, number> = { exact: 0, conditional: 1, unknown: 2 };
@@ -257,7 +280,7 @@ export function buildNetwork(program: A.Program, checked: CheckResult, options: 
 }
 
 /** A view known by name before it is built: what a list of views needs. */
-export type NetworkViewStub = Pick<NetworkView, 'id' | 'kind' | 'procedure' | 'label' | 'source' | 'notes'>;
+export type NetworkViewStub = Pick<NetworkView, 'id' | 'kind' | 'procedure' | 'label' | 'source' | 'notes' | 'section' | 'language'>;
 
 /**
  * Every view a program has, without elaborating any: the program view when
@@ -492,10 +515,11 @@ function checkedInteger(value: number): number | undefined {
 // ---------------------------------------------------------------------------
 
 interface CodeHandlers {
-  read(target: A.Expr, kind: 'read' | 'alt-guard' | 'extended-read', at: SourceRef, confidence: Confidence): void;
-  write(target: A.Expr, at: SourceRef, confidence: Confidence): void;
-  sync(target: A.Expr, at: SourceRef, confidence: Confidence): void;
-  call(call: A.Invocation, confidence: Confidence): void;
+  /** `env`: the constants known where the operation runs (an index into a channel array, a call's arguments). */
+  read(target: A.Expr, kind: 'read' | 'alt-guard' | 'extended-read', at: SourceRef, confidence: Confidence, env: ReadonlyMap<VarInfo, ConstValue>): void;
+  write(target: A.Expr, at: SourceRef, confidence: Confidence, env: ReadonlyMap<VarInfo, ConstValue>): void;
+  sync(target: A.Expr, at: SourceRef, confidence: Confidence, env: ReadonlyMap<VarInfo, ConstValue>): void;
+  call(call: A.Invocation, confidence: Confidence, env: ReadonlyMap<VarInfo, ConstValue>): void;
   /** A par or par for reached in this code; return true when the handler elaborates it (its body is then not walked). */
   spawn?(statement: A.ParBlock | A.ForStmt, confidence: Confidence, env: Map<VarInfo, ConstValue>): boolean;
   timer?(at: SourceRef): void;
@@ -663,17 +687,34 @@ class CodeWalker {
 
   private alt(statement: A.AltStmt, confidence: Confidence, env: Map<VarInfo, ConstValue>): void {
     const choice = combineConfidence(confidence, 'conditional');
+    // A replicated alt's guards see every value of its index (`cs[j]` for each j): the index is
+    // not the constant its initialiser gives.
+    const guards = new Map(env);
     if (statement.replicated?.init) {
-      if (Array.isArray(statement.replicated.init)) statement.replicated.init.forEach((expr) => this.expression(expr, confidence, env));
-      else this.statement(statement.replicated.init, confidence, env);
+      if (Array.isArray(statement.replicated.init)) statement.replicated.init.forEach((expr) => this.expression(expr, confidence, guards));
+      else this.statement(statement.replicated.init, confidence, guards);
+      this.forget(statement, guards);
+      const init = statement.replicated.init;
+      if (!Array.isArray(init) && init.kind === 'LocalDecl') {
+        for (const declarator of init.declarators) {
+          const variable = this.variableOf(declarator.name);
+          if (variable) guards.delete(variable);
+        }
+      } else if (Array.isArray(init)) {
+        for (const expr of init) {
+          const target = expr.kind === 'AssignExpr' ? expr.target : expr.kind === 'UnaryExpr' ? expr.operand : undefined;
+          const variable = target?.kind === 'NameExpr' ? this.unit.checked.resolutions.get(target) : undefined;
+          if (variable) guards.delete(variable);
+        }
+      }
     }
     for (const altCase of statement.cases) {
-      const local = new Map(env);
+      const local = new Map(guards);
       if (altCase.precondition) this.expression(altCase.precondition, choice, local);
       if (altCase.guard?.kind === 'ReadGuard') {
         const read = altCase.guard.read;
         this.expression(read.target, choice, local, true);
-        if (!this.isTimer(read.target)) this.on.read(read.target, read.extended ? 'extended-read' : 'alt-guard', { uri: this.unit.uri, span: read.span }, choice);
+        if (!this.isTimer(read.target)) this.on.read(read.target, read.extended ? 'extended-read' : 'alt-guard', { uri: this.unit.uri, span: read.span }, choice, local);
         if (read.extended) this.walkBlock(read.extended, choice, local);
         this.expression(altCase.guard.target, choice, local, true);
         const variable = altCase.guard.target.kind === 'NameExpr' ? this.unit.checked.resolutions.get(altCase.guard.target) : undefined;
@@ -717,7 +758,7 @@ class CodeWalker {
       case 'Invocation':
         if (expr.target) this.expression(expr.target, confidence, env);
         for (const arg of expr.args) if (!isEndArgument(arg)) this.expression(arg, confidence, env);
-        this.on.call(expr, confidence);
+        this.on.call(expr, confidence, env);
         return;
       case 'RecordAccess':
       case 'ChanEnd':
@@ -733,17 +774,17 @@ class CodeWalker {
           this.on.timer?.({ uri: this.unit.uri, span: expr.span });
           return;
         }
-        this.on.read(expr.target, expr.extended ? 'extended-read' : 'read', { uri: this.unit.uri, span: expr.span }, confidence);
+        this.on.read(expr.target, expr.extended ? 'extended-read' : 'read', { uri: this.unit.uri, span: expr.span }, confidence, env);
         if (expr.extended) this.walkBlock(expr.extended, confidence, new Map(env));
         return;
       case 'ChanWrite':
         this.expression(expr.target, confidence, env, true);
         this.expression(expr.value, confidence, env);
-        this.on.write(expr.target, { uri: this.unit.uri, span: expr.span }, confidence);
+        this.on.write(expr.target, { uri: this.unit.uri, span: expr.span }, confidence, env);
         return;
       case 'Sync':
         this.expression(expr.target, confidence, env, true);
-        this.on.sync(expr.target, { uri: this.unit.uri, span: expr.span }, confidence);
+        this.on.sync(expr.target, { uri: this.unit.uri, span: expr.span }, confidence, env);
         return;
       case 'Timeout':
         this.expression(expr.target, confidence, env, true);
@@ -956,6 +997,9 @@ function spawnCount(statements: readonly A.Stmt[]): number {
 // Elaboration of one view
 // ---------------------------------------------------------------------------
 
+/** How many stages of a recursion through par the drawing unfolds below its first call. */
+const MAX_DRAWN_STAGES = 8;
+
 interface Frame {
   decl: A.ProcDecl;
   unit: NetworkUnit;
@@ -967,9 +1011,27 @@ interface Frame {
   container: string;
   stack: readonly A.ProcDecl[];
   depth: number;
+  /** Data parameters whose value the call fixes (`FIFO(6, ...)`: size is 6 here), for the constants of the body. */
+  values?: ReadonlyMap<VarInfo, ConstValue>;
+  /** Recursive procedure instances unfolded on the way here, with their known arguments: a repeat never stops. */
+  unfolding?: readonly string[];
 }
 
-type Binding = { channel: string } | { unknown: string };
+/** An array of channels: its declaration instance and, when the elaboration knows it, its length. */
+interface ChanArray {
+  variable: VarInfo;
+  unit: NetworkUnit;
+  owner: ProcessPath;
+  container: string;
+  size?: number;
+}
+
+/**
+ * `choice`: one element of an array picked by an index only the run knows
+ * (`cs[k]`, the array's length known): any of `channels`, as in the
+ * translation, where the process is a user of every element it could pick.
+ */
+type Binding = { channel: string } | { unknown: string } | { array: ChanArray } | { choice: string[]; label: string };
 
 interface ProcessCtx {
   /** Path of the process executing the code. */
@@ -987,6 +1049,8 @@ interface ProcessCtx {
 interface ChannelState {
   channel: NetChannel;
   variable?: VarInfo;
+  /** The known arguments of the procedure instance that declared it (`size = 5`), to tell same-named channels apart. */
+  instance?: string;
   endpoints: Map<string, { ops: NetOperation[]; tags: Set<string>; enrolled: boolean }>;
 }
 
@@ -1030,7 +1094,19 @@ class Elaborator {
       operations: [],
     });
     const frame: Frame = { decl, unit, bindings: new Map(), instance: [], container: root.id, stack: [decl], depth: 0 };
-    if (kind === 'procedure') this.addPorts(decl, frame);
+    // A procedure whose arguments decide its network is drawn as it is checked: with the values its calls give.
+    const args = kind === 'procedure' ? this.shared.options.procedureArguments?.(decl) : undefined;
+    if (args) {
+      const values = new Map<VarInfo, ConstValue>();
+      for (const param of decl.params) {
+        const variable = this.shared.variableByDecl(unit, param.name);
+        const value = args.values[param.name.name];
+        if (variable && value !== undefined) values.set(variable, value);
+      }
+      if (values.size) frame.values = values;
+      if (args.text) this.notes.push(`Drawn with ${args.text}: these arguments decide its network, and FDR checks it with them.`);
+    }
+    if (kind === 'procedure') this.addPorts(decl, frame, args);
     this.runProcedure(frame, { path: [], node: root.id, container: root.id, spawn: [], collapse: true });
     if (root.kind === 'group') root.group ??= 'procedure';
     const { edges, channels } = this.finish();
@@ -1097,11 +1173,36 @@ class Elaborator {
     return facts;
   }
 
-  private addPorts(decl: A.ProcDecl, frame: Frame): void {
+  private addPorts(decl: A.ProcDecl, frame: Frame, args?: ProcedureArguments): void {
     decl.params.forEach((param, index) => {
       const variable = this.shared.variableByDecl(frame.unit, param.name);
       if (!variable) return;
       const type = variable.type;
+      const length = args?.arrays[param.name.name];
+      if (isChanArrayType(type) && length !== undefined) {
+        // An array of channels of a known length: each channel is a port of its own (`chans[2]`).
+        const array: ChanArray = { variable, unit: frame.unit, owner: [], container: frame.container, size: length };
+        const end = type.k === 'array' && type.elem.k === 'chan' ? type.elem.end : undefined;
+        for (let k = 0; k < length; k++) {
+          const channel = this.elementChannel(array, k);
+          const port = this.addNode({
+            id: `port:${index}:${k}`,
+            kind: 'port',
+            label: `${param.name.name}[${k}]`,
+            name: `parameter ${param.name.name}[${k}]`,
+            source: { uri: frame.unit.uri, span: param.name.span },
+            confidence: 'exact',
+            port: { parameter: index, name: `${param.name.name}[${k}]`, direction: end === 'read' ? 'in' : end === 'write' ? 'out' : 'unknown', type: typeStr(type), index: k },
+            channel: channel.channel.id,
+            facts: [`parameter ${index + 1}: ${typeStr(type)}, channel ${k} of ${length}`],
+            operations: [],
+          });
+          channel.channel.port = port.id;
+          channel.channel.container = undefined;
+        }
+        frame.bindings.set(variable, { array });
+        return;
+      }
       const barrier = type.k === 'prim' && type.name === 'barrier';
       if (type.k !== 'chan' && !barrier) return;
       const direction = barrier ? 'sync' : type.k === 'chan' && type.end === 'read' ? 'in' : type.k === 'chan' && type.end === 'write' ? 'out' : 'unknown';
@@ -1152,20 +1253,35 @@ class Elaborator {
       hazard: frame.unit === this.shared.root ? this.hazards.get(variable) : undefined,
       edges: [],
     };
-    state = { channel, variable, endpoints: new Map() };
+    state = { channel, variable, endpoints: new Map(), instance: how.isPort ? undefined : valuesText(frame.values) };
     this.channels.set(key, state);
     return state;
   }
 
   /** The channel or barrier an operated or passed expression denotes in this frame. */
-  private resolve(expr: A.Expr, frame: Frame, depth = 0): Binding | undefined {
+  private resolve(expr: A.Expr, frame: Frame, depth = 0, env: ReadonlyMap<VarInfo, ConstValue> = frame.values ?? new Map()): Binding | undefined {
     while (expr.kind === 'ParenExpr' || expr.kind === 'CastExpr' || expr.kind === 'ChanEnd') expr = expr.kind === 'ChanEnd' ? expr.target : expr.expr;
+    if (expr.kind === 'ArrayAccess') {
+      // One channel of an array: drawn on its own when the index is known here.
+      const array = this.resolve(expr.target, frame, depth + 1, env);
+      if (!array || !('array' in array)) return array && 'unknown' in array ? array : { unknown: exprLabel(expr) };
+      const index = this.shared.constant(expr.index, frame.unit, env);
+      const size = array.array.size;
+      if (typeof index === 'number' && size !== undefined && (index < 0 || index >= size)) return { unknown: `${exprLabel(expr)} (index ${index}, outside the ${size} channels of '${array.array.variable.name}')` };
+      if (size === undefined) return { unknown: exprLabel(expr) };
+      if (typeof index !== 'number') {
+        if (size === 0) return { unknown: exprLabel(expr) };
+        return { choice: Array.from({ length: size }, (_, k) => this.elementChannel(array.array, k).channel.id), label: `${array.array.variable.name}[${this.indexText(expr.index, frame)}]` };
+      }
+      return { channel: this.elementChannel(array.array, index).channel.id };
+    }
     if (expr.kind === 'NameExpr') {
       const variable = frame.unit.checked.resolutions.get(expr);
       if (!variable) return { unknown: expr.name.name };
       const bound = frame.bindings.get(variable);
       if (bound) return bound;
       const type = variable.type;
+      if (isChanArrayType(type) && !variable.isParam) return { array: { variable, unit: frame.unit, owner: frame.instance, container: frame.container, size: this.arraySize(variable, frame) } };
       const barrier = type.k === 'prim' && type.name === 'barrier';
       if (type.k !== 'chan' && !barrier) return undefined;
       if (variable.isParam) return { unknown: variable.name };
@@ -1192,6 +1308,60 @@ class Elaborator {
     return { unknown: exprLabel(expr) };
   }
 
+  /** An index as written, when it is short (`k`, `i - 1`), else `…`. */
+  private indexText(index: A.Expr, frame: Frame): string {
+    const text = this.shared.sourceText(frame.unit.uri, index.span)?.replace(/\s+/g, ' ');
+    return text && text.length <= 12 ? text : '…';
+  }
+
+  /**
+   * The length of an array of channels declared with `new chan<T>[n]`, when n
+   * follows from constants and the call's arguments (the declaration is what
+   * creates the channels in this ProcessJ build).
+   */
+  private arraySize(variable: VarInfo, frame: Frame): number | undefined {
+    if (!frame.decl.body) return undefined;
+    let size: number | undefined;
+    visitStatement(frame.decl.body, {
+      expr: () => undefined,
+      stmt: (stmt) => {
+        if (stmt.kind !== 'LocalDecl') return;
+        for (const declarator of stmt.declarators) {
+          if (declarator.name !== variable.decl || declarator.init?.kind !== 'NewArray' || declarator.init.dimExprs.length !== 1) continue;
+          const value = this.shared.constant(declarator.init.dimExprs[0], frame.unit, frame.values ?? new Map());
+          if (typeof value === 'number' && value >= 0) size = value;
+        }
+      },
+    });
+    return size;
+  }
+
+  /** The drawn channel for one element of an array: `chans[2]`, with the array's declarator and owner. */
+  private elementChannel(array: ChanArray, index: number): ChannelState {
+    const variable = array.variable;
+    const key = `c${pathKey(array.owner, this.shared.root.uri)}@${uriTag(array.unit.uri, this.shared.root.uri)}${variable.decl.span.start.line}_${variable.decl.span.start.col}[${index}]`;
+    const known = this.channels.get(key);
+    if (known) return known;
+    const name = `${variable.name}[${index}]`;
+    const elem = variable.type.k === 'array' && variable.type.elem.k === 'chan' ? typeStr(variable.type.elem.elem) : '?';
+    const channel: NetChannel = {
+      id: key,
+      kind: 'channel',
+      ref: { name, kind: 'channel', declaration: { uri: array.unit.uri, span: variable.decl.span }, owner: array.owner, index },
+      name,
+      type: elem,
+      shared: { read: false, write: false },
+      container: array.container,
+      writers: [],
+      readers: [],
+      members: [],
+      edges: [],
+    };
+    const state: ChannelState = { channel, variable, endpoints: new Map() };
+    this.channels.set(key, state);
+    return state;
+  }
+
   /** What a local end variable was initialised with, when nothing assigns it again. */
   private endAlias(variable: VarInfo, frame: Frame): A.Expr | undefined {
     if (variable.type.k !== 'chan' || !variable.type.end || !frame.decl.body) return undefined;
@@ -1216,8 +1386,23 @@ class Elaborator {
     if (!binding) return;
     const node = this.node(nodeId);
     if ('unknown' in binding) {
-      node.facts.push(`${op.kind === 'write' ? 'writes' : op.kind === 'sync' ? 'syncs on' : op.kind === 'pass' ? 'passes' : 'reads'} '${binding.unknown}', which this view cannot resolve`);
+      const fact = `${op.kind === 'write' ? 'writes' : op.kind === 'sync' ? 'syncs on' : op.kind === 'pass' ? 'passes' : 'reads'} '${binding.unknown}', which this view cannot resolve`;
+      if (!node.facts.includes(fact)) node.facts.push(fact);
       node.confidence = combineConfidence(node.confidence, 'conditional');
+      return;
+    }
+    if ('array' in binding) {
+      const fact = `hands the whole channel array '${binding.array.variable.name}' to code this view does not follow`;
+      if (!node.facts.includes(fact)) node.facts.push(fact);
+      return;
+    }
+    if ('choice' in binding) {
+      // Drawn as a possible (dashed) use of every element the index could pick.
+      const first = this.channels.get(binding.choice[0])?.channel.name;
+      const last = this.channels.get(binding.choice[binding.choice.length - 1])?.channel.name;
+      const fact = `${op.kind === 'write' ? 'writes' : op.kind === 'sync' ? 'syncs on' : op.kind === 'pass' ? 'passes' : 'reads'} ${binding.label}, an element chosen at run time: any of ${first === last ? first : `${first} to ${last}`}`;
+      if (!node.facts.includes(fact)) node.facts.push(fact);
+      for (const channel of binding.choice) this.addOperation(nodeId, { channel }, { ...op, confidence: combineConfidence(op.confidence, 'conditional') }, tags);
       return;
     }
     const state = this.channels.get(binding.channel);
@@ -1234,7 +1419,7 @@ class Elaborator {
   }
 
   private enroll(nodeId: string, binding: Binding | undefined): void {
-    if (!binding || 'unknown' in binding) return;
+    if (!binding || !('channel' in binding)) return;
     const state = this.channels.get(binding.channel);
     if (!state || state.channel.kind !== 'barrier') return;
     let endpoint = state.endpoints.get(nodeId);
@@ -1251,7 +1436,7 @@ class Elaborator {
   private runProcedure(frame: Frame, ctx: ProcessCtx, confidence: Confidence = 'exact'): void {
     if (!frame.decl.body) return;
     const collapse = ctx.collapse && spawnCount(frame.decl.body.stmts) === 1;
-    this.runCode(frame.decl.body.stmts, frame, { ...ctx, collapse }, confidence, new Map());
+    this.runCode(frame.decl.body.stmts, frame, { ...ctx, collapse }, confidence, new Map(frame.values ?? []));
     // The view's own locals are listed even when nothing here uses them.
     if (frame.depth > 0) return;
     const body = frame.decl.body.span;
@@ -1264,14 +1449,14 @@ class Elaborator {
 
   private runCode(statements: readonly A.Stmt[], frame: Frame, ctx: ProcessCtx, confidence: Confidence, env: Map<VarInfo, ConstValue>): void {
     const walker = new CodeWalker(this.shared, frame.unit, {
-      read: (target, kind, at, conf) => this.addOperation(ctx.node, this.resolve(target, frame), { kind, at, confidence: conf }, kind === 'alt-guard' ? ['alt'] : kind === 'extended-read' ? ['extended'] : []),
-      write: (target, at, conf) => this.addOperation(ctx.node, this.resolve(target, frame), { kind: 'write', at, confidence: conf }),
-      sync: (target, at, conf) => this.addOperation(ctx.node, this.resolve(target, frame), { kind: 'sync', at, confidence: conf }, ['sync']),
+      read: (target, kind, at, conf, known) => this.addOperation(ctx.node, this.resolve(target, frame, 0, known), { kind, at, confidence: conf }, kind === 'alt-guard' ? ['alt'] : kind === 'extended-read' ? ['extended'] : []),
+      write: (target, at, conf, known) => this.addOperation(ctx.node, this.resolve(target, frame, 0, known), { kind: 'write', at, confidence: conf }),
+      sync: (target, at, conf, known) => this.addOperation(ctx.node, this.resolve(target, frame, 0, known), { kind: 'sync', at, confidence: conf }, ['sync']),
       timer: () => {
         const node = this.node(ctx.node);
         if (!node.facts.includes('waits on a timer')) node.facts.push('waits on a timer');
       },
-      call: (call, conf) => this.call(call, frame, ctx, conf),
+      call: (call, conf, known) => this.call(call, frame, ctx, conf, known),
       spawn: (statement, conf, spawnEnv) => {
         const container = ctx.collapse ? ctx.container : this.parGroup(statement, frame, ctx);
         if (statement.kind === 'ParBlock') this.spawnPar(statement, frame, { ...ctx, container }, conf, spawnEnv);
@@ -1326,6 +1511,42 @@ class Elaborator {
     for (const variable of assignedVariables(loop, frame.unit.checked)) bodyEnv.delete(variable);
     const statements = loop.body.kind === 'Block' ? loop.body.stmts : [loop.body];
     const bound = loop.cond ? this.shared.sourceText(frame.unit.uri, loop.cond.span) ?? exprLabel(loop.cond) : '';
+    const { values } = this.iterations(loop, frame, env);
+    const loopVariable = loop.init && !Array.isArray(loop.init) && loop.init.declarators.length === 1 ? this.shared.variableByDecl(frame.unit, loop.init.declarators[0].name) : undefined;
+    if (statements.length === 1 && values?.length && values.length <= 32 && loopVariable && this.usesChannelArray(loop.body, frame)) {
+      // Each iteration uses its own channels of an array (`foo(i, chans, ...)`): one box per iteration, so
+      // every element is drawn as the channel between the iterations that use it. A branch that is
+      // nothing but this par for is drawn as its container already: the iterations go there.
+      const label = `par for ${bound}`.trim();
+      const fact = `${values.length} iterations, ${loopVariable.name} = ${values[0]} to ${values[values.length - 1]}, each drawn on its own because each uses its own channels of an array`;
+      const host = this.nodes.get(ctx.container);
+      const reuse = host?.kind === 'group' && host.label === label && !!host.source && inside(host.source.span, loop.span) && !host.replicated;
+      if (reuse) {
+        host.group = 'par-for';
+        host.badge = 'par for';
+        if (!host.facts.includes(fact)) host.facts.push(fact);
+      }
+      const group = reuse ? host : this.addNode({
+        id: `r${pathKey(path, this.shared.root.uri)}`,
+        kind: 'group',
+        parent: ctx.container,
+        group: 'par-for',
+        label: `par for ${bound}`.trim(),
+        name: `par for ${bound}`.trim(),
+        badge: 'par for',
+        source: { uri: frame.unit.uri, span: loop.span },
+        confidence,
+        facts: [fact],
+        operations: [],
+      });
+      for (const value of values) {
+        const iterationEnv = new Map(bodyEnv).set(loopVariable, value);
+        const step: SpawnSite = { ...parForStep(loop, frame.unit.uri), index: value };
+        const child = this.processFor(statements[0], 'iteration', value, [...ctx.spawn, step], frame, group.id, confidence, iterationEnv, { loop, bound, value: `${loopVariable.name} = ${value}` });
+        for (const barrier of barriers) this.enroll(child, barrier);
+      }
+      return;
+    }
     if (statements.length > 1) {
       // The code generator runs each statement of a par for body as its own process.
       const group = this.addNode({
@@ -1356,7 +1577,7 @@ class Elaborator {
   }
 
   /** How many iterations a par for has, when known, and its first test (whether it spawns anything at all). */
-  private iterations(loop: A.ForStmt, frame: Frame, env: Map<VarInfo, ConstValue>): { count?: number; first?: ConstValue } {
+  private iterations(loop: A.ForStmt, frame: Frame, env: Map<VarInfo, ConstValue>): { count?: number; first?: ConstValue; values?: number[] } {
     if (!loop.cond) return { first: true };
     const local = new Map(env);
     const assign = (expr: A.Expr): boolean => {
@@ -1393,9 +1614,14 @@ class Elaborator {
       }
     }
     const first = this.shared.constant(loop.cond, frame.unit, local);
+    // The loop variable's value in each iteration, while the count is small enough to draw them one by one.
+    const loopVariable = loop.init && !Array.isArray(loop.init) && loop.init.declarators.length === 1 ? this.shared.variableByDecl(frame.unit, loop.init.declarators[0].name) : undefined;
+    const values: number[] = [];
     for (let count = 0; count <= 100_000; count++) {
       const test = count === 0 ? first : this.shared.constant(loop.cond, frame.unit, local);
-      if (test === false) return { count, first };
+      if (test === false) return { count, first, ...(loopVariable && values.length === count ? { values } : {}) };
+      const current = loopVariable ? local.get(loopVariable) : undefined;
+      if (typeof current === 'number' && count < 64) values.push(current);
       if (test !== true) return { first };
       if (!loop.update.length || !loop.update.every(assign)) return { first };
     }
@@ -1407,7 +1633,7 @@ class Elaborator {
    * like the call and expanded when the callee has its own network; a branch that
    * is itself a par is drawn as that par's container.
    */
-  private processFor(statement: A.Stmt, role: 'branch' | 'iteration' | 'stmt', index: number, path: ProcessPath, frame: Frame, container: string, confidence: Confidence, env: Map<VarInfo, ConstValue>, loop?: { replicated: { count?: number; text: string }; loop: A.ForStmt; bound: string }): string {
+  private processFor(statement: A.Stmt, role: 'branch' | 'iteration' | 'stmt', index: number, path: ProcessPath, frame: Frame, container: string, confidence: Confidence, env: Map<VarInfo, ConstValue>, loop?: { replicated?: { count?: number; text: string }; loop: A.ForStmt; bound: string; value?: string }): string {
     this.processCount++;
     let inner = statement;
     while (inner.kind === 'Block' && inner.stmts.length === 1) inner = inner.stmts[0];
@@ -1432,7 +1658,8 @@ class Elaborator {
     };
     if (call) {
       const label = this.callLabel(call, frame);
-      const node = this.addNode({ ...base, kind: 'process', label, name: label, badge: role === 'stmt' ? badge : 'call', detail: loopText, procedure: call.name.name });
+      // One box per iteration: the iteration's value is on its second line and in its name.
+      const node = this.addNode({ ...base, kind: 'process', label, name: loop?.value ? `${label} [${loop.value}]` : label, badge: role === 'stmt' ? badge : 'call', detail: loop?.value ? `${loop.value} · ${loopText}` : loopText, procedure: call.name.name });
       // The call is this process; communication in its arguments happens in it too.
       this.ownedCall = call;
       this.runCode([inner], frame, { path, node: node.id, container: node.id, spawn: path, collapse: true }, confidence, env);
@@ -1453,6 +1680,19 @@ class Elaborator {
     return node.id;
   }
 
+  /** Whether code names an array of channels (an element of one, or the whole array handed to a call). */
+  private usesChannelArray(statement: A.Stmt, frame: Frame): boolean {
+    let found = false;
+    visitStatement(statement, {
+      expr: (expr) => {
+        if (found || expr.kind !== 'NameExpr') return;
+        const variable = frame.unit.checked.resolutions.get(expr);
+        if (variable && isChanArrayType(variable.type)) found = true;
+      },
+    });
+    return found;
+  }
+
   /**
    * ` of <owner>` for a process spawned below the top of the view: the callee of
    * an expanded call (`branch 1 of delta`), the branch a nested par runs in
@@ -1467,15 +1707,29 @@ class Elaborator {
   }
 
   /** A call in a process's code: expand a callee with its own network, or add the callee's parameter uses. */
-  private call(call: A.Invocation, frame: Frame, ctx: ProcessCtx, confidence: Confidence): void {
+  private call(call: A.Invocation, frame: Frame, ctx: ProcessCtx, confidence: Confidence, env: ReadonlyMap<VarInfo, ConstValue> = new Map()): void {
     if (call.target) return;
     const selected = frame.unit.checked.calls.get(call);
     const owns = this.ownedCall === call;
     if (owns) this.ownedCall = undefined;
-    this.callProcess(call, selected, frame, { ...ctx, spawn: [...ctx.spawn, callStep(call, frame.unit.uri)] }, confidence, owns);
+    this.callProcess(call, selected, frame, { ...ctx, spawn: [...ctx.spawn, callStep(call, frame.unit.uri)] }, confidence, owns, env);
   }
 
-  private callProcess(call: A.Invocation, selected: ProcSig | undefined, frame: Frame, ctx: ProcessCtx, confidence: Confidence, ownsNode: boolean): void {
+  /** The data parameters a call fixes: an argument known here, for a parameter the callee never assigns. */
+  private calleeValues(call: A.Invocation, callee: A.ProcDecl, calleeUnit: NetworkUnit, callerUnit: NetworkUnit, env: ReadonlyMap<VarInfo, ConstValue>): Map<VarInfo, ConstValue> {
+    const out = new Map<VarInfo, ConstValue>();
+    const assigned = callee.body ? assignedVariables(callee.body, calleeUnit.checked) : new Set<VarInfo>();
+    callee.params.forEach((param, index) => {
+      const variable = this.shared.variableByDecl(calleeUnit, param.name);
+      const arg = call.args[index];
+      if (!variable || !arg || assigned.has(variable)) return;
+      const value = this.shared.constant(arg, callerUnit, env);
+      if (value !== undefined) out.set(variable, value);
+    });
+    return out;
+  }
+
+  private callProcess(call: A.Invocation, selected: ProcSig | undefined, frame: Frame, ctx: ProcessCtx, confidence: Confidence, ownsNode: boolean, env: ReadonlyMap<VarInfo, ConstValue> = new Map()): void {
     const node = this.node(ctx.node);
     const callee = selected?.decl;
     const calleeUnit = callee?.body ? this.shared.unitOf(callee) : undefined;
@@ -1489,32 +1743,56 @@ class Elaborator {
     if (!selected) {
       if (ownsNode) node.confidence = combineConfidence(node.confidence, 'unknown');
       node.facts.push(`calls '${call.name.name}', which could not be resolved: its effects are unknown`);
-      this.passArguments(call, frame, ctx, 'unknown');
+      this.passArguments(call, frame, ctx, 'unknown', env);
       return;
     }
     if (!callee?.body) {
       // A native or bodyless declaration: only the trusted output leaves are known not to communicate.
       if (call.args.some((arg) => isEndArgument(arg) || this.isResourceArgument(arg, frame))) {
         node.facts.push(`passes channels to '${call.name.name}', which has no body here: what it does with them is unknown`);
-        this.passArguments(call, frame, ctx, 'unknown');
+        this.passArguments(call, frame, ctx, 'unknown', env);
       }
       return;
     }
     const spawns = !!this.shared.options.effects?.get(callee)?.transitive.par || hasSpawn(callee);
+    const values = calleeUnit ? this.calleeValues(call, callee, calleeUnit, frame.unit, env) : new Map<VarInfo, ConstValue>();
+    // Recursion through par is drawn unfolded when every data argument is known and the arguments
+    // never repeat (altFIFO(6) .. altFIFO(1)): the stages of the recursion, nested.
+    const key = `${callee.name.name}@${callee.name.span.start.line}|${[...values].map(([v, x]) => `${v.name}=${x}`).sort().join(',')}`;
+    const dataParams = calleeUnit ? callee.params.map((param) => this.shared.variableByDecl(calleeUnit, param.name)).filter((v): v is VarInfo => !!v && (v.type.k === 'prim' && v.type.name !== 'barrier' && v.type.name !== 'timer')) : [];
     const onStack = frame.stack.includes(callee);
-    const expandable = spawns && !!calleeUnit && !onStack && frame.depth < this.maxDepth;
+    const finite = onStack && dataParams.every((v) => values.has(v)) && !(frame.unfolding ?? []).includes(key) && !!calleeUnit && this.recursionEnds(callee, calleeUnit, values, frame.stack);
+    // Deeper stages are not drawn: each adds a nested container, and past a few they only push the
+    // stages out of sight. The model still checks them all.
+    const capped = finite && (frame.unfolding?.length ?? 0) >= MAX_DRAWN_STAGES;
+    const unfolds = finite && !capped;
+    const expandable = spawns && !!calleeUnit && (unfolds || (!onStack && frame.depth < this.maxDepth));
+    const known = valuesText(values);
+    if (ownsNode && known && (expandable || onStack)) {
+      // The call's known arguments tell the stages of an unfolded recursion apart (`size = 5`).
+      node.name = `${node.name} (${known})`;
+      node.detail = node.detail ? `${known} · ${node.detail}` : known;
+    }
+    if (!spawns && calleeUnit && callee.params.some((param) => isChanArrayType(this.shared.variableByDecl(calleeUnit, param.name)?.type))) {
+      // A callee without a network of its own that is handed an array of channels: which elements it
+      // uses depends on its arguments, so its code runs here with them (`foo(i, chans, ...)` in iteration 2).
+      if (!onStack) {
+        this.inlineCall(call, callee, calleeUnit, values, frame, ctx, confidence, env);
+        return;
+      }
+    }
     if (!expandable) {
       if (spawns) {
         const reason: NetCall['collapsed'] = onStack ? 'recursion' : !calleeUnit ? 'unavailable' : 'depth';
         if (reason === 'depth') this.collapsedForDepth = true;
         if (ownsNode) {
           node.call = { ...callInfo, collapsed: reason };
-          node.facts.push(reason === 'recursion' ? `calls '${callee.name.name}' recursively: its network is drawn once, higher up` : reason === 'depth' ? `runs a network of its own (open the '${callee.name.name}' view to see it)` : `runs a network of its own declared in another file`);
+          node.facts.push(capped ? `calls '${callee.name.name}' recursively: the stages from here on (${valuesText(values)}) are not drawn, to keep the drawing readable; the model checks every stage` : reason === 'recursion' ? `calls '${callee.name.name}' recursively: its network is drawn once, higher up` : reason === 'depth' ? `runs a network of its own (open the '${callee.name.name}' view to see it)` : `runs a network of its own declared in another file`);
         } else {
           node.facts.push(`calls '${callee.name.name}', which runs a network of its own${reason === 'recursion' ? ' (recursively)' : ''}`);
         }
       }
-      this.leafCall(call, callee, frame, ctx, confidence);
+      this.leafCall(call, callee, frame, ctx, confidence, env);
       return;
     }
     // Expand: bind the callee's parameters to what this call passes.
@@ -1524,8 +1802,8 @@ class Elaborator {
       const arg = call.args[index];
       if (!variable || !arg) return;
       const type = variable.type;
-      if (type.k !== 'chan' && !(type.k === 'prim' && type.name === 'barrier')) return;
-      const resolved = this.resolve(arg, frame);
+      if (type.k !== 'chan' && !(type.k === 'prim' && type.name === 'barrier') && !isChanArrayType(type)) return;
+      const resolved = this.resolve(arg, frame, 0, env);
       if (resolved) bindings.set(variable, resolved);
     });
     let container = ctx.container;
@@ -1536,7 +1814,8 @@ class Elaborator {
         parent: ctx.container,
         group: 'call',
         label: text,
-        name: text,
+        name: known ? `${text} (${known})` : text,
+        ...(known ? { detail: known } : {}),
         badge: 'call',
         source: { uri: frame.unit.uri, span: call.span },
         confidence,
@@ -1548,18 +1827,73 @@ class Elaborator {
       container = group.id;
     }
     this.instances.push({ procedure: callee.name.name, declaration: declaration!, prefix: ctx.path, spawn: ctx.spawn, node: container });
-    const calleeFrame: Frame = { decl: callee, unit: calleeUnit!, bindings, instance: ctx.spawn, container, stack: [...frame.stack, callee], depth: frame.depth + 1 };
+    const calleeFrame: Frame = { decl: callee, unit: calleeUnit!, bindings, instance: ctx.spawn, container, stack: [...frame.stack, callee], depth: frame.depth + 1, values, unfolding: onStack ? [...(frame.unfolding ?? []), key] : frame.unfolding };
     // Everything the callee does is only as certain as the call itself (`if (go) tee(...)`).
     this.runProcedure(calleeFrame, { path: ctx.path, node: ctx.node, container, spawn: ctx.spawn, collapse: true }, confidence);
   }
 
+  /**
+   * Whether a recursive call with these arguments stops calling itself within
+   * 32 levels: the calls back into the recursion that the body can reach with
+   * the known arguments (conditions on them decide), followed until none is left.
+   */
+  private recursionEnds(callee: A.ProcDecl, unit: NetworkUnit, values: ReadonlyMap<VarInfo, ConstValue>, stack: readonly A.ProcDecl[], depth = 0, seen = new Set<string>()): boolean {
+    if (depth >= 32 || !callee.body) return depth < 32;
+    const key = `${callee.name.name}@${callee.name.span.start.line}|${[...values].map(([v, x]) => `${v.name}=${x}`).sort().join(',')}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    const recursiveCalls: Array<{ call: A.Invocation; env: Map<VarInfo, ConstValue> }> = [];
+    const onStack = new Set([...stack, callee]);
+    const walker = new CodeWalker(this.shared, unit, {
+      read: () => undefined,
+      write: () => undefined,
+      sync: () => undefined,
+      call: (call, _confidence, env) => {
+        const target = unit.checked.calls.get(call)?.decl;
+        if (target && onStack.has(target)) recursiveCalls.push({ call, env: new Map(env) });
+      },
+    });
+    walker.walkBlock(callee.body, 'exact', new Map(values));
+    for (const { call, env } of recursiveCalls) {
+      const target = unit.checked.calls.get(call)!.decl!;
+      const targetUnit = this.shared.unitOf(target);
+      if (!targetUnit) return false;
+      const next = this.calleeValues(call, target, targetUnit, unit, env);
+      const params = target.params.map((param) => this.shared.variableByDecl(targetUnit, param.name)).filter((v): v is VarInfo => !!v && v.type.k === 'prim' && v.type.name !== 'barrier' && v.type.name !== 'timer');
+      if (!params.every((v) => next.has(v))) return false;
+      if (!this.recursionEnds(target, targetUnit, next, stack, depth + 1, seen)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * A callee without a network of its own, handed an array of channels: its
+   * code runs in the calling process with the call's channels and known
+   * arguments, so each operation lands on the element it uses.
+   */
+  private inlineCall(call: A.Invocation, callee: A.ProcDecl, calleeUnit: NetworkUnit, values: Map<VarInfo, ConstValue>, frame: Frame, ctx: ProcessCtx, confidence: Confidence, env: ReadonlyMap<VarInfo, ConstValue>): void {
+    const bindings = new Map<VarInfo, Binding>();
+    callee.params.forEach((param, index) => {
+      const variable = this.shared.variableByDecl(calleeUnit, param.name);
+      const arg = call.args[index];
+      if (!variable || !arg) return;
+      const type = variable.type;
+      if (type.k !== 'chan' && !(type.k === 'prim' && type.name === 'barrier') && !isChanArrayType(type)) return;
+      const resolved = this.resolve(arg, frame, 0, env);
+      if (resolved) bindings.set(variable, resolved);
+    });
+    // A call that leads to no par adds nothing to the path: the callee's locals belong to the calling process.
+    const calleeFrame: Frame = { decl: callee, unit: calleeUnit, bindings, instance: ctx.spawn.slice(0, -1), container: ctx.container, stack: [...frame.stack, callee], depth: frame.depth, values, unfolding: frame.unfolding };
+    if (callee.body) this.runCode(callee.body.stmts, calleeFrame, { ...ctx, spawn: ctx.spawn.slice(0, -1) }, confidence, new Map(values));
+  }
+
   /** The operations of a callee without its own drawn network, attributed to the calling process. */
-  private leafCall(call: A.Invocation, callee: A.ProcDecl, frame: Frame, ctx: ProcessCtx, confidence: Confidence): void {
+  private leafCall(call: A.Invocation, callee: A.ProcDecl, frame: Frame, ctx: ProcessCtx, confidence: Confidence, env: ReadonlyMap<VarInfo, ConstValue> = new Map()): void {
     const uses = this.shared.paramUses(callee);
     call.args.forEach((arg, index) => {
       const paramUses = uses[index];
       if (!paramUses?.length) return;
-      const binding = this.resolve(arg, frame);
+      const binding = this.resolve(arg, frame, 0, env);
       const parameter = callee.params[index]?.name.name ?? `#${index + 1}`;
       for (const use of paramUses) {
         const tags = ['via call', ...(use.kind === 'alt-guard' ? ['alt'] : use.kind === 'extended-read' ? ['extended'] : [])];
@@ -1574,12 +1908,12 @@ class Elaborator {
   }
 
   /** Arguments handed to opaque code: the channel is used in an unknown way. */
-  private passArguments(call: A.Invocation, frame: Frame, ctx: ProcessCtx, confidence: Confidence): void {
+  private passArguments(call: A.Invocation, frame: Frame, ctx: ProcessCtx, confidence: Confidence, env: ReadonlyMap<VarInfo, ConstValue> = new Map()): void {
     for (const arg of call.args) {
       if (!isEndArgument(arg) && !this.isResourceArgument(arg, frame)) continue;
       const end = endOfArgument(arg);
       const kind: OperationKind = end === 'read' ? 'read' : end === 'write' ? 'write' : 'pass';
-      this.addOperation(ctx.node, this.resolve(arg, frame), { kind, at: { uri: frame.unit.uri, span: arg.span }, confidence, via: { procedure: call.name.name, parameter: '?' } }, ['via call']);
+      this.addOperation(ctx.node, this.resolve(arg, frame, 0, env), { kind, at: { uri: frame.unit.uri, span: arg.span }, confidence, via: { procedure: call.name.name, parameter: '?' } }, ['via call']);
     }
   }
 
@@ -1668,6 +2002,14 @@ class Elaborator {
 
   private finish(): { edges: NetEdge[]; channels: NetChannel[] } {
     this.splitOwnCode();
+    // Channels of the same declaration in several procedure instances (the stages of an unfolded
+    // recursion, each with its own `middle`) are named with the instance's known arguments.
+    const byName = new Map<string, ChannelState[]>();
+    for (const state of this.channels.values()) byName.set(state.channel.name, [...(byName.get(state.channel.name) ?? []), state]);
+    for (const same of byName.values()) {
+      if (same.length < 2 || new Set(same.map((state) => state.instance)).size < same.length) continue;
+      for (const state of same) if (state.instance) state.channel.name = `${state.channel.name} (${state.instance})`;
+    }
     const edges: NetEdge[] = [];
     const channels: NetChannel[] = [];
     let serial = 0;
@@ -1947,7 +2289,8 @@ export function processTotal(nodes: ReadonlyMap<string, NetNode>, ids: readonly 
 /** Every process a view draws below its root: calls, branches, statements of a par for body, each par for iteration. */
 export function viewProcesses(view: NetworkView): ProcessTotal {
   const nodes = new Map(view.nodes.map((node) => [node.id, node]));
-  return processTotal(nodes, view.nodes.filter((node) => node.path && node.path.length > 0 && !node.statements && !node.own).map((node) => node.id));
+  // In a CSPm view a group is a composition, not a process of its own: only its operands count.
+  return processTotal(nodes, view.nodes.filter((node) => node.path && node.path.length > 0 && !node.statements && !node.own && (view.language !== 'cspm' || node.kind === 'process')).map((node) => node.id));
 }
 
 /** `4 processes`, `2 processes and a par for of unknown size`. */
@@ -1976,6 +2319,12 @@ function isEndArgument(expr: A.Expr): boolean {
 function endOfArgument(expr: A.Expr): 'read' | 'write' | undefined {
   while (expr.kind === 'ParenExpr' || expr.kind === 'CastExpr') expr = expr.expr;
   return expr.kind === 'ChanEnd' ? expr.end : undefined;
+}
+
+/** `size = 5, n = 2`: the data arguments a procedure instance is known to have. */
+function valuesText(values: ReadonlyMap<VarInfo, ConstValue> | undefined): string | undefined {
+  if (!values?.size) return undefined;
+  return [...values].map(([variable, value]) => `${variable.name} = ${String(value)}`).join(', ');
 }
 
 function channelLabel(channel: NetChannel): string {
@@ -2020,7 +2369,7 @@ export function exprLabel(expr: A.Expr): string {
     case 'NameExpr': return expr.name.name;
     case 'Literal': return expr.text.length > 12 ? `${expr.text.slice(0, 11)}…` : expr.text;
     case 'RecordAccess': return `${exprLabel(expr.target)}.${expr.member.name}`;
-    case 'ArrayAccess': return `${exprLabel(expr.target)}[…]`;
+    case 'ArrayAccess': return `${exprLabel(expr.target)}[${expr.index.kind === 'NameExpr' || expr.index.kind === 'Literal' ? exprLabel(expr.index) : '…'}]`;
     case 'ChanEnd': return `${exprLabel(expr.target)}.${expr.end}`;
     case 'ParenExpr':
     case 'CastExpr': return exprLabel(expr.expr);
@@ -2221,3 +2570,8 @@ export function relocateChannel(instance: NetInstance, ref: ChannelRef): Channel
   return { ...ref, owner: ref.owner.length === 0 ? instance.spawn : [...instance.spawn, ...ref.owner] };
 }
 
+
+/** `chan<T>[]`: an array of channels (one dimension; deeper ones are not drawn element by element). */
+function isChanArrayType(type: { k: string; elem?: unknown } | undefined): boolean {
+  return type?.k === 'array' && (type.elem as { k?: string } | undefined)?.k === 'chan';
+}

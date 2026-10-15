@@ -11,6 +11,9 @@
  *   --no-run                do not build and run the programs: compare with their recorded outcomes only
  *   --include <dir>         ProcessJ include directory (default: the configured install, else the fixtures')
  *   --markdown              print the table as Markdown at the end (as in docs/DETAILS.md); the rows go to stderr
+ *   --procedures            check every procedure with a body (but main) on its own instead, as
+ *                           "Check with FDR" on that procedure does: a row per procedure with each
+ *                           check's verdict, not modelled (and why), or FDR rejecting the model
  *
  * What a program really does comes from running it (needs a ProcessJ install,
  * see README) or, without a run, from its `// outcome:` header
@@ -45,7 +48,7 @@ const { pathToFileURL } = require('node:url');
 const { findInstall } = require('../dist/src/config.js');
 const { build, run } = require('../dist/src/pipeline.js');
 const { loadProgram } = require('../dist/src/csp/load.js');
-const { translateProgram, findRefines, refinesNotFoundMessage, checkWithFdr } = require('../dist/src/csp/index.js');
+const { translateProgram, translateProcedure, findRefines, refinesNotFoundMessage, checkWithFdr } = require('../dist/src/csp/index.js');
 const { COMPILED_DIFFERS, MODEL_DIFFERS } = require('../dist/src/csp/explain.js');
 
 const ROOT = path.join(__dirname, '..');
@@ -57,6 +60,7 @@ const DIFFERS = new Set([
   'pj/par-for-body', 'pj/shared-unlocked-end', 'pj/timeout-deadline', 'pj/multiple-alts', 'pj/compiler-limit', 'pj/starving-loop',
   'pj/shared-channel-end', 'pj/channel-direction', 'pj/parallel-usage',
   'compiler/loop-labels', 'compiler/par-loop-calls', 'compiler/stop-ignored', 'compiler/short-circuit-read', 'compiler/replicated-alt-precondition', 'compiler/labelled-break',
+  'compiler/empty-par-for',
 ]);
 /** Where the model's own abstraction may make it differ from the program (an array or record shared between references). */
 const ABSTRACTS = new Set(['model/aliasing']);
@@ -86,7 +90,9 @@ function fdrVerdict(model, result) {
     terminates: terminates?.status,
     states: deadlock?.stats?.states,
     ms: result.rawResults?.durationMs,
-    rejected: result.rawResults?.errors.length ? result.rawResults.errors[0].split('\n')[0] : undefined,
+    // FDR rejects a model either as a whole (rawResults.errors) or per check (status 'error', e.g. an
+    // evaluation error such as an invalid event or a pattern-match failure).
+    rejected: result.rawResults?.errors.length ? result.rawResults.errors[0].split('\n')[0] : checks.find((c) => c.status === 'error')?.message?.split('\n')[0] || (checks.some((c) => c.status === 'error') ? 'FDR could not evaluate a check' : undefined),
     timedOut: checks.some((c) => c.status === 'timeout'),
     range: errors?.status === 'failed' && errors.counterexample?.error?.kind === 'range',
     caveats: [],
@@ -239,18 +245,96 @@ async function checkOne(file) {
   return row;
 }
 
+/**
+ * --procedures: every procedure with a body (but main, which is the program
+ * check) checked on its own, as "Check with FDR" on that procedure does. A
+ * row per procedure: the verdict of each check, not modelled (with the
+ * reason), FDR rejecting the model (always a translator bug), or no answer in
+ * time. Nothing is run: a procedure on its own has no real run to compare with.
+ */
+async function checkProcedures(file) {
+  const name = path.relative(ROOT, file);
+  const loaded = loadProgram(file, include);
+  if (loaded.syntaxErrors.length) return [{ name, procedure: '-', outcome: 'does not parse', note: loaded.syntaxErrors[0] }];
+  const input = { units: loaded.units, index: loaded.index };
+  const rows = [];
+  for (const decl of loaded.units[0].program.decls) {
+    if (decl.kind !== 'ProcDecl' || !decl.body || decl.name.name === 'main') continue;
+    const row = { name, procedure: `${decl.name.name}:${decl.name.span.start.line + 1}`, outcome: '', note: '' };
+    rows.push(row);
+    let model;
+    try {
+      model = translateProcedure(input, decl.name.name, decl.name.span.start);
+    } catch (e) {
+      Object.assign(row, { outcome: 'crash', note: String(e?.stack ?? e).split('\n').slice(0, 3).join(' ') });
+      continue;
+    }
+    row.instances = model.checkedWith?.text ?? '';
+    if (model.unsupported.length) {
+      Object.assign(row, { outcome: 'not modelled', note: model.unsupported[0].message });
+      continue;
+    }
+    let result;
+    try {
+      result = await checkWithFdr({ ...input, model, procedure: { name: decl.name.name, at: decl.name.span.start }, uri: pathToFileURL(file).href, refines, timeoutMs: timeout * 1000, workers: 1 });
+    } catch (e) {
+      Object.assign(row, { outcome: 'crash', note: String(e?.stack ?? e).split('\n').slice(0, 3).join(' ') });
+      continue;
+    }
+    const checks = result.report.checks;
+    const rejected = result.rawResults?.errors.length ? result.rawResults.errors[0].split('\n')[0] : checks.find((c) => c.status === 'error')?.message?.split('\n')[0];
+    if (rejected) Object.assign(row, { outcome: 'FDR error', note: rejected });
+    else if (checks.some((c) => c.status === 'timeout')) Object.assign(row, { outcome: 'no answer in time', note: checks.find((c) => c.status === 'timeout').message });
+    else {
+      const short = { 'deadlock-free': 'deadlock', 'divergence-free': 'divergence', 'no-runtime-errors': 'errors', deterministic: 'determinism' };
+      row.outcome = 'verdict';
+      row.note = checks.map((c) => `${short[c.property] ?? c.id} ${c.status === 'passed' ? 'ok' : c.status === 'failed' ? (c.counterexample?.error?.kind === 'range' ? 'RANGE' : 'FAIL') : c.status}`).join(', ');
+    }
+  }
+  return rows;
+}
+
+async function mainProcedures(files) {
+  const counts = new Map();
+  const all = [];
+  const w = (s, n) => String(s).padEnd(n);
+  for (const file of files) {
+    for (const r of await checkProcedures(file)) {
+      all.push(r);
+      counts.set(r.outcome, (counts.get(r.outcome) ?? 0) + 1);
+      console.log(`${w(r.name, 52)} ${w(r.procedure, 26)} ${w(r.outcome, 14)} ${r.note.slice(0, 300)}${r.instances ? `  [${r.instances.slice(0, 160)}]` : ''}`);
+    }
+  }
+  console.log('');
+  console.log([...counts].map(([k, n]) => `${n} ${k}`).join(', '));
+  const bad = all.filter((r) => r.outcome === 'FDR error' || r.outcome === 'crash');
+  if (bad.length) {
+    console.log(`\n${bad.length} to investigate:`);
+    for (const r of bad) console.log(`  ${r.name} ${r.procedure}: ${r.outcome}: ${r.note}`);
+  }
+  const missing = all.filter((r) => r.outcome === 'not modelled');
+  if (missing.length) {
+    console.log(`\n${missing.length} not modelled:`);
+    for (const r of missing) console.log(`  ${r.name} ${r.procedure}: ${r.note}`);
+  }
+  process.exit(bad.length ? 1 : 0);
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const inputs = [];
+  let procedures = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--timeout') timeout = Number(args[++i]);
     else if (args[i] === '--run-timeout') runTimeout = Number(args[++i]);
     else if (args[i] === '--no-run') runPrograms = false;
     else if (args[i] === '--include') include = args[++i];
     else if (args[i] === '--markdown') markdown = true;
+    else if (args[i] === '--procedures') procedures = true;
     else inputs.push(path.resolve(args[i]));
   }
   if (!inputs.length) inputs.push(path.join(ROOT, 'test', 'fixtures', 'processj'), path.join(ROOT, 'test', 'differential'), path.join(ROOT, 'examples'));
+  if (procedures) runPrograms = false;
   const found = findInstall();
   install = 'error' in found ? undefined : found;
   if (!include) include = install ? install.includeDir : path.join(ROOT, 'test', 'fixtures', 'include');
@@ -264,6 +348,7 @@ async function main() {
     process.exit(2);
   }
   const files = inputs.flatMap((p) => (fs.statSync(p).isDirectory() ? fs.readdirSync(p).filter((f) => f.endsWith('.pj')).sort().map((f) => path.join(p, f)) : [p]));
+  if (procedures) return mainProcedures(files);
 
   const rows = [];
   const counts = new Map();

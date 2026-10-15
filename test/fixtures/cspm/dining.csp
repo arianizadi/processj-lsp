@@ -1,0 +1,23 @@
+-- The dining philosophers in plain CSPm: each picks up the fork on its left,
+-- then the one on its right. With every philosopher holding one fork, nobody
+-- can go on.
+N = 3
+PHILS = {0..N-1}
+
+channel thinks, eats : PHILS
+channel pickup, putdown : PHILS.PHILS
+
+-- A philosopher thinks, takes its left fork, then its right one, and eats.
+PHIL(i) = thinks.i -> pickup.i.i -> pickup.i.((i+1)%N) -> eats.i ->
+          putdown.i.((i+1)%N) -> putdown.i.i -> PHIL(i)
+
+-- A fork is picked up and put down by the philosopher on either side.
+FORK(j) = pickup.j.j -> putdown.j.j -> FORK(j)
+       [] pickup.((j-1+N)%N).j -> putdown.((j-1+N)%N).j -> FORK(j)
+
+PHILOSOPHERS = ||| i : PHILS @ PHIL(i)
+FORKS = ||| j : PHILS @ FORK(j)
+
+SYSTEM = PHILOSOPHERS [| {| pickup, putdown |} |] FORKS
+
+assert SYSTEM :[deadlock free [F]]

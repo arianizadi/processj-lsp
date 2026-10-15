@@ -161,10 +161,12 @@ const CASES: Record<string, Case> = {
     name: 'shared',
     source: [
       'import std.*;',
+      // A call decides which iterations write (not a condition elaboration can work out), so every iteration may do both.
+      'public boolean even(int k) { return k % 2 == 0; }',
       'public void main(string[] args) {',
       '    shared chan<int> c;',
       '    par for (int i = 0; i < 3; i++) {',
-      '        if (i % 2 == 0) c.write(i);',
+      '        if (even(i)) c.write(i);',
       '        else println("odd read " + c.read());',
       '    }',
       '}',
@@ -726,9 +728,9 @@ test('several processes on both sides of a channel: a writer whose readers are a
   const stuck = cx.final.find((s) => s.status === 'blocked' && s.process.path.length === 1)!;
   assert.equal(stuck.process.path[0].kind, 'par-for');
   assert.match(stuck.waits![0].detail, /^waits to write \d on c \(no reader has taken it\)$/);
-  assert.match(stuck.waits![0].partner!.detail, /^no reader of c \(line 6\) can take part: .* have already terminated; .* reads c itself, but not while it waits here$/);
+  assert.match(stuck.waits![0].partner!.detail, /^no reader of c \(line 7\) can take part: .* have already terminated; .* reads c itself, but not while it waits here$/);
   // One fork starts every iteration of the par for.
-  assert.match(cx.steps[0].description, /^main starts iteration i = 0, iteration i = 1 and iteration i = 2 \(par for at line 4\)$/);
+  assert.match(cx.steps[0].description, /^main starts iteration i = 0, iteration i = 1 and iteration i = 2 \(par for at line 5\)$/);
 });
 
 test('shared writers: the one left over waits forever once the reader is done', async () => {
@@ -965,7 +967,7 @@ test('with //@csp compress, a process inside a compressed part is said to be so,
 });
 
 test('fail closed: a model with constructs it cannot express is never checked, so nothing passes', () => {
-  const c: Case = { name: 'arrays', source: 'public void main(string[] args) { chan<int>[] cs = new chan<int>[2]; }' };
+  const c: Case = { name: 'arrays', source: 'public void main(string[] args) { chan<int>[][] cs = new chan<int>[2][2]; }' };
   const { uri, input } = load(c);
   const model = translateProgram(input);
   assert.ok(model.unsupported.length);
@@ -1130,7 +1132,7 @@ test('server: Check with FDR puts the deadlock on both blocked writes; Convert t
     client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: CASES.crossed.source } });
     await client.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri);
     const before = await client.request('textDocument/codeLens', { textDocument: { uri } });
-    assert.ok(before.result.some((l: any) => l.command.title === 'FDR: check program' && l.command.command === 'processj.checkWithFdr'));
+    assert.ok(before.result.some((l: any) => l.command.title === 'FDR: check program & show graph' && l.command.command === 'processj.checkWithFdr'));
 
     const checked = await client.request('workspace/executeCommand', { command: 'processj.checkWithFdr', arguments: [uri] }, 60_000);
     assert.equal(checked.error, undefined);
@@ -1150,11 +1152,11 @@ test('server: Check with FDR puts the deadlock on both blocked writes; Convert t
     assert.equal(fdr[0].relatedInformation[0].location.range.start.line, 16);
     // The title names the file: two checks running at once each have their own line.
     assert.ok(client.messages.some((m) => m.method === '$/progress' && m.params.value.kind === 'begin' && /^FDR: checking the program of par_deadlock\.pj$/.test(m.params.value.title)));
-    // A failure opens the graph on it (fdrShowGraph: onFailure); the text report is written beside the model.
+    // The graph opens on the result (fdrShowGraph: always); the text report is written beside the model.
     assert.ok(client.messages.some((m) => m.method === 'window/showDocument' && m.params.external === true && /[?&]check=program%2Fdeadlock-free$/.test(m.params.uri)));
     assert.ok(fs.existsSync(result.reportFile));
     const after = await client.request('textDocument/codeLens', { textDocument: { uri } });
-    assert.ok(after.result.some((l: any) => l.command.title === 'FDR: deadlock (1 step)'));
+    assert.ok(after.result.some((l: any) => l.command.title === 'FDR: deadlock (1 step) · show graph'));
     const stored = await client.request('processj/fdrReport', { textDocument: { uri } });
     assert.deepEqual(stored.result.checks.map((c: any) => c.status), ['failed', 'passed', 'failed']);
 

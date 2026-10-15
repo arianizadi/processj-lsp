@@ -35,9 +35,16 @@ export interface ChanUse {
   ack?: Ex;
   take?: Ex;
   done?: Ex;
-  /** ProcessJ name the operation goes through (`out1`, `c`). */
+  /** ProcessJ name the operation goes through (`out1`, `c`, `cs[i]`). */
   variable: string;
   source: ChanSource;
+  /**
+   * A whole array of channels (passed to a `chan<T>[]` parameter): `ch` is
+   * the array (an indexed CSPm channel, or a parameter holding one) and `len`
+   * its length. An element is an ordinary operand whose `ch` is `array.k`.
+   */
+  array?: boolean;
+  len?: Ex;
 }
 
 export type ChannelKind = 'plain' | 'ack' | 'mediated';
@@ -60,6 +67,19 @@ export interface LocalResource {
   proc: ProcIR;
   /** The region whose process executes the declaration (a barrier's runtime counter lives there). */
   region: Region;
+  /**
+   * An array of channels (`chan<T> cs[] = new chan<T>[n]`): one CSPm channel
+   * indexed by the element (`cs.k`). `len` is the variable holding its length
+   * at runtime; `size` is the length expression, which the network evaluates
+   * per procedure instance to know the elements (static elaboration).
+   */
+  array?: { len: string; size: Ex };
+  /**
+   * Declared in a procedure that is part of a recursion: an instance of it can
+   * run inside another, so its events carry the procedure instance
+   * (`m.pj_h`), like a barrier's.
+   */
+  instanced?: boolean;
 }
 
 export interface AltCaseIR {
@@ -137,6 +157,9 @@ export interface ParamIR {
   /** For channel parameters bound to mediated channels. */
   take?: string;
   done?: string;
+  /** A `chan<T>[]` parameter: it holds the array, and `len` (a data parameter) its length. */
+  array?: boolean;
+  len?: string;
   info?: VarInfo;
 }
 
@@ -207,6 +230,8 @@ export interface LowerContext {
   isMain(decl: A.ProcDecl): boolean;
   /** Channels and barriers declared in procedures, by variable, shared by the whole translation. */
   locals: Map<VarInfo, LocalResource>;
+  /** Whether a procedure is part of a recursion (it calls itself, directly or through others). */
+  recursive(decl: A.ProcDecl): boolean;
 }
 
 interface LoopCtx {
@@ -291,10 +316,19 @@ class Lowerer {
       const info = this.varsByIdent.get(p.name);
       const t = info ? info.type : this.typeOfNode(p.type);
       const dt = this.ctx.data.type(t);
-      const role: ParamIR['role'] = dt.k === 'chan' ? 'channel' : dt.k === 'barrier' ? 'barrier' : dt.k === 'timer' ? 'timer' : 'value';
+      const chanArray = chanArrayDims(dt) === 1;
+      const role: ParamIR['role'] = dt.k === 'chan' || chanArray ? 'channel' : dt.k === 'barrier' ? 'barrier' : dt.k === 'timer' ? 'timer' : 'value';
       const cspm = info ? this.nameOf(info) : this.freshVar(p.name.name);
       const param: ParamIR = { name: p.name.name, cspm, type: dt, role, info };
-      const kind = role === 'channel' ? this.ctx.kindParam(this.decl, index) : 'plain';
+      if (chanArrayDims(dt) > 1) this.unsupported('arrays of channels with more than one dimension are not modelled', p.span);
+      let kind = role === 'channel' ? this.ctx.kindParam(this.decl, index) : 'plain';
+      if (chanArray) {
+        param.array = true;
+        param.len = this.freshVar(`${cspm}__len`, true);
+        ir.vars.set(param.len, { cspm: param.len, name: `${p.name.name}.size`, type: D.int, role: 'value' });
+        if (kind !== 'plain') this.unsupported(`the channels of '${p.name.name}' need ${kind === 'ack' ? 'an acknowledgement (an extended rendezvous)' : 'a channel server (the model cannot pair the processes that use them directly: several processes, or one on both sides, use one element)'}; that is not modelled for an array of channels`, p.span);
+        kind = 'plain';
+      }
       if (kind !== 'plain') {
         param.ack = this.freshVar(`${cspm}__ack`, true);
         ir.vars.set(param.ack, { cspm: param.ack, name: `${p.name.name} (ack)`, type: dt, role: 'ack' });
@@ -626,6 +660,7 @@ class Lowerer {
         const kind = dt.k === 'chan' ? 'channel' : 'barrier';
         const cspm = this.ctx.localName(this.decl, decl.name, kind);
         const local: LocalResource = { kind, name: info.name, cspm, ident: decl.name, proc: this.ir, region: this.region };
+        if (dt.k === 'chan' && this.ctx.recursive(this.decl)) local.instanced = true;
         if (dt.k === 'chan') {
           local.elem = dt.elem;
           local.elemText = typeText(info.type);
@@ -638,9 +673,8 @@ class Lowerer {
         continue;
       }
       if (dt.k === 'timer') continue;
-      if (dt.k === 'array' && dt.elem.k === 'chan') {
-        // This ProcessJ build compiles some uses (test/differential/replicated_alt.pj runs) and rejects others (channel_array.pj).
-        this.unsupported('arrays of channels are not modelled', decl.span);
+      if (chanArrayDims(dt) > 0) {
+        this.chanArrayDecl(decl, info, dt);
         continue;
       }
       const v = this.variable(info);
@@ -654,6 +688,44 @@ class Lowerer {
         this.add({ k: 'assign', v, e: defaultEx(this.ctx.data, dt), next: -1, at: decl.span } as Node);
       }
     }
+  }
+
+  /**
+   * `chan<T> cs[] = new chan<T>[n]`: n channels, one indexed CSPm channel
+   * (`cs.k`). The length is stored in a variable when the declaration runs
+   * (range-checked like any integer, a negative one is Java's
+   * NegativeArraySizeException); which elements exist is decided per
+   * procedure instance by the network, which evaluates the length there.
+   */
+  private chanArrayDecl(decl: A.Declarator, info: VarInfo, dt: DType): void {
+    if (chanArrayDims(dt) > 1) {
+      this.unsupported('arrays of channels with more than one dimension are not modelled', decl.span);
+      return;
+    }
+    const init = decl.init;
+    if (!init || init.kind !== 'NewArray' || init.init || init.dimExprs.length !== 1) {
+      this.unsupported(init && (init.kind === 'ArrayLiteral' || (init.kind === 'NewArray' && init.init))
+        ? 'an array literal of channels ({ a, b }) is not modelled; declare it with new chan<T>[n]'
+        : `the channel array '${info.name}' is modelled only when it is declared with 'new chan<T>[n]' (this ProcessJ build creates its channels only there)`, decl.span);
+      return;
+    }
+    const kind = this.ctx.kindLocal(decl.name);
+    if (kind !== 'plain') {
+      this.unsupported(`the channels of '${info.name}' need ${kind === 'ack' ? 'an acknowledgement (an extended rendezvous)' : 'a channel server (the model cannot pair the processes that use them directly: several processes, or one on both sides, use one element)'}; that is not modelled for an array of channels`, decl.span);
+      return;
+    }
+    const size = this.toConcrete(this.expr(init.dimExprs[0], D.int), D.int);
+    this.check(E.bin('>=', size, E.int(0)), 'array-index', 'negative array size', init.dimExprs[0].span);
+    const cspm = this.ctx.localName(this.decl, decl.name, 'channel');
+    const len = this.freshVar(`${cspm}__len`, true);
+    this.ir.vars.set(len, { cspm: len, name: `${info.name}.size`, type: D.int, role: 'value' });
+    this.assign(len, { e: size, t: D.int }, D.int, decl.span, `the size of '${info.name}'`);
+    const elemType = info.type.k === 'array' ? info.type.elem : info.type;
+    const elem = dt.k === 'array' && dt.elem.k === 'chan' ? dt.elem.elem : D.any;
+    const local: LocalResource = { kind: 'channel', name: info.name, cspm, ident: decl.name, proc: this.ir, region: this.region, elem, elemText: typeText(elemType), array: { len, size } };
+    if (this.ctx.recursive(this.decl)) local.instanced = true;
+    this.ir.locals.push(local);
+    this.ctx.locals.set(info, local);
   }
 
   private loop(s: A.WhileStmt | A.DoStmt | A.ForStmt, _init: unknown, cond: A.Expr | undefined, update: A.Expr[], body: A.Stmt, bodyFirst: boolean): void {
@@ -892,6 +964,7 @@ class Lowerer {
     };
     flatten(s);
     let replicated: { v: string; set: Ex } | undefined;
+    let replicatedVar: VarInfo | undefined;
     if (s.replicated) {
       const r = s.replicated;
       const init = r.init;
@@ -911,6 +984,7 @@ class Lowerer {
       const lo = this.pure(start).e;
       const hiBound = this.pure(bound.expr).e;
       replicated = { v, set: { k: 'range', lo, hi: bound.op === '<' ? E.bin('-', hiBound, E.int(1)) : hiBound } };
+      replicatedVar = loopVar;
     }
     // Java evaluates every boolean precondition before the alt waits.
     for (const entry of cases) {
@@ -922,6 +996,12 @@ class Lowerer {
         this.add({ k: 'assign', v: t, e: entry.pre, next: -1, at: entry.c.precondition.span } as Node);
         entry.pre = E.v(t);
       }
+    }
+    // The guards' channels (an element of a channel array is bounds-checked here, before the alt waits).
+    const guardChannels = new Map<A.AltCase, ChanUse | undefined>();
+    for (const { c } of cases) {
+      if (c.guard?.kind !== 'ReadGuard') continue;
+      guardChannels.set(c, this.chanOf(c.guard.read.target, replicated && replicatedVar ? { ...replicated, info: replicatedVar } : undefined));
     }
     const allGuarded = cases.length > 0 && cases.every((x) => x.pre);
     const allPreErr = allGuarded
@@ -938,7 +1018,7 @@ class Lowerer {
       const entryNode = this.ir.nodes[bodyEntry] as { next: number };
       this.open = [(t) => (entryNode.next = t)];
       if (g.kind === 'ReadGuard') {
-        const ch = this.chanOf(g.read.target);
+        const ch = guardChannels.get(c);
         if (!ch) {
           this.open = [];
           continue;
@@ -988,11 +1068,65 @@ class Lowerer {
     return E.dot(E.n(local.cspm), E.v('pj_h'));
   }
 
+  /**
+   * An array of channels named by `target` (a local declared with `new
+   * chan<T>[n]`, or a `chan<T>[]` parameter): the CSPm value of the array, its
+   * length, and where its channels come from.
+   */
+  private chanArrayOf(target: A.Expr): { base: Ex; len: Ex; source: ChanSource; name: string } | undefined {
+    let e = target;
+    while (e.kind === 'ParenExpr') e = e.expr;
+    if (e.kind !== 'NameExpr') return undefined;
+    const info = this.unit.checked.resolutions.get(e);
+    if (!info) return undefined;
+    const local = this.ctx.locals.get(info);
+    if (local?.array && local.proc === this.ir) return { base: local.instanced ? E.dot(E.n(local.cspm), E.v('pj_h')) : E.n(local.cspm), len: E.v(local.array.len), source: { k: 'local', decl: local }, name: info.name };
+    const index = info.isParam ? this.decl.params.findIndex((p) => p.name === info.decl) : -1;
+    const p = index >= 0 ? this.ir.params[index] : undefined;
+    if (p?.array && p.len) return { base: E.v(p.cspm), len: E.v(p.len), source: { k: 'param', index }, name: info.name };
+    return undefined;
+  }
+
+  /**
+   * An element of a channel array: `cs.k` for a statically known index, an
+   * index computed in CSPm otherwise, after Java's bounds check (an index
+   * outside the array is a runtime error: ArrayIndexOutOfBoundsException).
+   * In a replicated alt the index may be the alt's own variable: the check
+   * then covers the whole range before the alt waits.
+   */
+  private chanElementOf(e: A.ArrayAccess, replicated?: { v: string; set: Ex; info: VarInfo }): ChanUse | undefined {
+    const arr = this.chanArrayOf(e.target);
+    if (!arr) return undefined;
+    let index = e.index;
+    while (index.kind === 'ParenExpr') index = index.expr;
+    let idx: Ex;
+    if (replicated && index.kind === 'NameExpr' && this.unit.checked.resolutions.get(index) === replicated.info) {
+      idx = E.v(replicated.v);
+      const set = replicated.set;
+      if (set.k !== 'range') return undefined;
+      this.check(E.or(E.bin('<', set.hi, set.lo), E.and(E.bin('>=', set.lo, E.int(0)), E.bin('<', set.hi, arr.len))), 'array-index', `an index of '${exprText(e.target)}' this replicated alt uses is outside the array`, e.span);
+    } else {
+      if (replicated && mentions(e.index, replicated.info, this.unit.checked)) {
+        this.unsupported(`a replicated alt over '${exprText(e)}' is modelled only when the index is the alt's own variable`, e.span);
+        return undefined;
+      }
+      idx = this.toConcrete(this.expr(e.index), D.int);
+      this.check(E.and(E.bin('>=', idx, E.int(0)), E.bin('<', idx, arr.len)), 'array-index', `the index of '${exprText(e.target)}' is outside the array`, e.span);
+    }
+    return { ch: E.dot(arr.base, idx), variable: exprText(e), source: arr.source };
+  }
+
   /** The channel an operation goes through. */
-  private chanOf(target: A.Expr): ChanUse | undefined {
+  private chanOf(target: A.Expr, replicated?: { v: string; set: Ex; info: VarInfo }): ChanUse | undefined {
     let e = target;
     while (e.kind === 'ParenExpr' || e.kind === 'ChanEnd') e = e.kind === 'ParenExpr' ? e.expr : e.target;
+    if (e.kind === 'ArrayAccess') {
+      const element = this.chanElementOf(e, replicated);
+      if (element) return element;
+    }
     if (e.kind === 'NameExpr') {
+      const arr = this.chanArrayOf(e);
+      if (arr) return { ch: arr.base, len: arr.len, array: true, variable: arr.name, source: arr.source };
       const info = this.unit.checked.resolutions.get(e);
       if (info) {
         const local = this.ctx.locals.get(info);
@@ -1002,7 +1136,8 @@ class Lowerer {
             const q = (name: string): Ex => E.dot(E.n(name), E.v('pj_h'));
             return { ch: q(local.cspm), ack: q(local.ack!), take: q(local.mediated.take), done: q(local.mediated.done), variable: info.name, source: { k: 'local', decl: local } };
           }
-          return { ch: E.n(local.cspm), ack: local.ack ? E.n(local.ack) : undefined, variable: info.name, source: { k: 'local', decl: local } };
+          const q = (name: string): Ex => (local.instanced ? E.dot(E.n(name), E.v('pj_h')) : E.n(name));
+          return { ch: q(local.cspm), ack: local.ack ? q(local.ack) : undefined, variable: info.name, source: { k: 'local', decl: local } };
         }
         const index = this.decl.params.findIndex((p) => p.name === info.decl);
         if (index >= 0 && this.ir.params[index].role === 'channel') {
@@ -1210,7 +1345,7 @@ class Lowerer {
     const info = this.unit.checked.resolutions.get(e);
     if (info) {
       const local = this.ctx.locals.get(info);
-      if (local && local.proc === this.ir) return { e: local.kind === 'barrier' ? this.localBarrier(local) : E.n(local.cspm), t };
+      if (local && local.proc === this.ir) return { e: local.kind === 'barrier' || local.instanced ? this.localBarrier(local) : E.n(local.cspm), t };
       const dt = this.ctx.data.type(info.type);
       if (dt.k === 'timer') return { e: E.any, t: D.any };
       const index = info.isParam ? this.decl.params.findIndex((p) => p.name === info.decl) : -1;
@@ -1339,6 +1474,10 @@ class Lowerer {
 
   private assignment(e: A.AssignExpr): Value {
     const tt = this.dtypeOf(e.target);
+    if (chanArrayDims(tt) > 0) {
+      this.unsupported('assigning an array of channels is not modelled (this ProcessJ build creates its channels only in the declaration)', e.span);
+      return { e: E.any, t: tt };
+    }
     if (e.op === '=' && e.value.kind === 'ChanRead' && !isPrim(this.typeOf(e.value.target), 'timer')) {
       // `x = c.read()` binds x directly in the input.
       const direct = this.simpleTarget(e.target);
@@ -1548,6 +1687,8 @@ class Lowerer {
   private access(e: A.RecordAccess, t: DType): Value {
     const ownerType = this.typeOf(e.target);
     if (ownerType.k === 'array' && (e.member.name === 'length' || e.member.name === 'size')) {
+      const channels = this.chanArrayOf(e.target);
+      if (channels) return { e: channels.len, t: D.int };
       const arr = this.expr(e.target);
       return { e: E.call('length', arr.e), t: D.int };
     }
@@ -2140,6 +2281,7 @@ export function nodeUses(n: Node): Set<string> {
     add(c.ack);
     add(c.take);
     add(c.done);
+    add(c.len);
   };
   switch (n.k) {
     case 'assign':
@@ -2190,6 +2332,28 @@ export function nodeUses(n: Node): Set<string> {
       break;
   }
   return out;
+}
+
+/** How many dimensions of channels an array type has (`chan<int>[][]` is 2); 0 for anything else. */
+export function chanArrayDims(t: DType): number {
+  let dims = 0;
+  while (t.k === 'array') {
+    dims++;
+    t = t.elem;
+  }
+  return t.k === 'chan' ? dims : 0;
+}
+
+/** Whether an expression mentions a variable. */
+function mentions(e: A.Expr, info: VarInfo, checked: CheckResult): boolean {
+  let found = false;
+  const visit = (x: A.Expr): void => {
+    if (found) return;
+    if (x.kind === 'NameExpr' && checked.resolutions.get(x) === info) found = true;
+    forEachChildExpr(x, visit);
+  };
+  visit(e);
+  return found;
 }
 
 export function nodeSuccessors(n: Node): number[] {

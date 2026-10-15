@@ -1,0 +1,9 @@
+// outcome: compiler-limit
+import std.*;
+// A read of a channel-array element anywhere but 'x = cs[i].read();' or an alt guard
+// fails javac: the generated temporary is assigned from an uncast Object.
+void w(chan<int>.write o, int v) { o.write(v); }
+public void main(string[] args) {
+    chan<int>[] cs = new chan<int>[1];
+    par { w(cs[0].write, 7); { int x = cs[0].read(); println(x); } }
+}

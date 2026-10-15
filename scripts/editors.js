@@ -128,7 +128,7 @@ function nvimInstall() {
       '  {',
       '    "arianizadi/processj-lsp",',
       `    dir = ${luaString(ROOT)},`,
-      '    ft = "processj",',
+      '    ft = { "processj", "csp" },',
       '    opts = {},',
       '  },',
       '}',
@@ -257,7 +257,7 @@ function emacsInstall() {
     fs.mkdirSync(path.dirname(init), { recursive: true });
     fs.writeFileSync(init, next);
   }
-  console.log('   restart Emacs and open a .pj file; eglot (Emacs 29+) or lsp-mode starts the server.');
+  console.log('   restart Emacs and open a .pj (or .csp) file; eglot (Emacs 29+) or lsp-mode starts the server.');
 }
 
 function stripEmacsBlock(text) {

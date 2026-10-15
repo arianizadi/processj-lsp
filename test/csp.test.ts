@@ -137,7 +137,7 @@ test('straight-line code folds into the next definition and dead variables are n
   assert.match(m.text, /\nmain__body\(pj_h, pj_k\) = main__6\(pj_h, 2, pj_k\)\n/);
   assert.match(m.text, /\nmain__6\(pj_h, x, pj_k\) = pj_fork_main_6\.pj_h!x -> /);
   // The fork carries what any branch needs; a branch that needs nothing ignores it.
-  assert.match(m.text, /\nmain__par6_2\(pj_h\) = \(pj_fork_main_6\.pj_h\?_ -> /);
+  assert.match(m.text, /\nmain__par6_2\(pj_h\) = \(pj_fork_main_6\.pj_h\?_:pj_forkset_main_6\(pj_h\) -> /);
   assert.doesNotMatch(m.text, /\(.*\bunused\b.*\) =/);
   assert.match(m.text, /= c\?y -> main__par6_2__end/);
 });
@@ -280,8 +280,11 @@ test('constructs the model cannot express are reported, so no check of the model
     'public void main(string[] args) { shared chan<int> c; par { w(c.write); int x = c.read(); } }',
   ].join('\n'));
   assert.ok(claim.unsupported.some((u) => /claim/.test(u.message)));
-  const arrays = program('public void main(string[] args) { chan<int>[] cs = new chan<int>[2]; }');
-  assert.ok(arrays.unsupported.some((u) => /arrays of channels/.test(u.message)));
+  // An array of channels whose length only the run decides: its channels cannot be laid out.
+  const arrays = program('public void main(string[] args) { chan<int> c; int n; par { c.write(2); n = c.read(); } chan<int>[] cs = new chan<int>[n]; }');
+  assert.ok(arrays.unsupported.some((u) => /length of the channel array 'cs' is not known before the program runs/.test(u.message)));
+  const grid = program('public void main(string[] args) { chan<int>[][] g = new chan<int>[2][2]; }');
+  assert.ok(grid.unsupported.some((u) => /arrays of channels with more than one dimension/.test(u.message)));
   const recursive = program([
     'record Node { int value; Node next; }',
     'public void main(string[] args) { chan<Node> c; par { c.write(new Node { value = 1 }); Node n = c.read(); } }',
@@ -361,7 +364,8 @@ test('barriers are the runtime counter: syncs arrive and wait to be released, br
 });
 
 test('a channel shared by processes that both read and write it goes through a server', () => {
-  const m = program(fs.readFileSync(path.join(ROOT, 'test', 'differential', 'par_for_shared_even.pj'), 'utf8'), 'par_for_shared_even.pj');
+  // Which iterations write is decided by a call's result, so every iteration may both write and read.
+  const m = program(fs.readFileSync(path.join(ROOT, 'test', 'differential', 'par_for_shared_even.pj'), 'utf8').replace('if (i % 2 == 0)', 'if (even(i))').replace('public void main', 'public boolean even(int k) { return k % 2 == 0; }\npublic void main'), 'par_for_shared_even.pj');
   assert.deepEqual(m.unsupported, []);
   assert.match(m.text, /PJ_MED\(c\.1, c__take\.1, c__done\.1, c__ack\.1\)/);
   assert.match(m.text, /c__take\.pj_h\?pj_r\d+ -> /);
@@ -477,7 +481,8 @@ test('a par for with computed bounds: the bounds go on the fork clamped to the s
   assert.deepEqual(m.unsupported, []);
   const lo = m.intRange.lo;
   const hi = m.intRange.hi;
-  assert.match(m.text, new RegExp(`\\nchannel pj_fork_work_1 : PJInst_work\\.\\{${lo}\\.\\.${hi + 1}\\}\\.\\{ ?${lo - 1}\\.\\.${hi}\\}\\n`));
+  // The first iteration is known (0); the last arrives with n, any value.
+  assert.match(m.text, new RegExp(`\\nchannel pj_fork_work_1 : PJInst_work\\.\\{ 0 \\}\\.\\{ ?${lo - 1}\\.\\.${hi}\\}\\n`));
   assert.match(m.text, new RegExp(`pj_fork_work_1\\.pj_h!pj_clamp\\(0, ${lo}, ${hi + 1}\\)!pj_clamp\\(n - 1, \\(${lo - 1}\\), ${hi}\\)`));
   assert.ok(Object.values(m.sourceMap.errors).some((e) => e.kind === 'range' && /iterations of this par for go outside/.test(e.message)));
   assert.equal(m.sourceMap.channels.pj_fork_work_1.computedBounds, true);

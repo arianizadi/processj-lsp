@@ -115,7 +115,7 @@ why:
 | `pj/multiple-alts`         | a second replicated `alt` (`alt (int i = 0; ...)`) in the same generated process cannot be built (its guard lists are declared twice); any number of plain alts, with one replicated alt among them, builds, and so does one replicated alt per par branch |
 | `pj/read-placement`        | a channel read inside `?:` or inside a write's value; it must be its own statement (quick fix hoists it) |
 | `pj/call-as-condition`     | a bare call as the whole `if`/`while` condition; compare its result (quick fix adds `== true`) |
-| `pj/compiler-limit`        | a feature this ProcessJ build cannot compile, at the point of use: arrays of channels, variables holding a channel end, `claim`, `chan<string>`, nested record literals, record/protocol literals anywhere but a declaration initialiser, protocol parameters, `is`, assigning `null`, `break`/`continue` anywhere inside a par branch, a loop with `break` inside a switch case, records/protocols that refer to themselves through fields, reading through a `shared chan<T>.read` parameter, a value-returning procedure that can suspend, `!` as a whole condition, a channel read inside an `alt` timeout guard (a timer read there, `t.timeout(t.read() + 100)`, builds and runs), and a second `par for` in one process. The program is fine; it just will not build with this compiler |
+| `pj/compiler-limit`        | a feature this ProcessJ build cannot compile, at the point of use: a read of a channel-array element anywhere but `x = cs[i].read();` or an `alt` guard (arrays of channels themselves build and run: `new chan<T>[n]` in a declaration, element ends passed as arguments, `chan<T>[]` parameters, direct writes), a channel array created by an assignment after its declaration (it builds, but every element stays null and the first use throws), variables holding a channel end, `claim`, `chan<string>`, nested record literals, record/protocol literals anywhere but a declaration initialiser, protocol parameters, `is`, assigning `null`, `break`/`continue` anywhere inside a par branch, a loop with `break` inside a switch case, records/protocols that refer to themselves through fields, reading through a `shared chan<T>.read` parameter, a value-returning procedure that can suspend, `!` as a whole condition, a channel read inside an `alt` timeout guard (a timer read there, `t.timeout(t.read() + 100)`, builds and runs), and a second `par for` in one process. The program is fine; it just will not build with this compiler |
 | `pj/needs-yield-annotation` | a procedure that suspends through calls or a `par for` scheduler boundary that the compiler's own yield walkers overlook (the compiler does mark ordinary communication in the body, a channel-end, barrier or timer parameter, `suspend`, or `main`); quick fix adds `[yield=true]` right after the parameter list. The server also adds it in its private copy before every compiler run, so Run works regardless |
 | `pj/shadows-parameter`     | a local with the same name as a parameter (silently accepted)                      |
 | `pj/unused`                | unused locals and parameters                                                        |
@@ -167,6 +167,21 @@ delta's two branches inside its box writing `a` and `b`. A callee without a
 parameter uses. Expansion stops at four levels, at a recursive call (drawn once,
 marked recursive), and when a view would exceed about a hundred processes; a
 collapsed call's own network is one view-switch away.
+
+Two cases go further, as the translation does. An array of channels whose
+length is known where it is declared (`new chan<int>[size - 1]` in `FIFO(6,
+...)`) is drawn one channel per element, labelled `chans[0]`, `chans[1]`, and a
+`par for` whose body uses its own elements of an array is drawn one box per
+iteration (`i = 2` on the box's second line), not as one ×N box, so each
+element is the arrow between the iterations that use it. An element picked by
+an index only the run knows (`cs[k]`) is a dashed arrow to every element it
+could be. A recursion through `par` whose arguments are known (`altFIFO(6,
+...)` calling `altFIFO(size - 1, ...)` down to 1) is unfolded into nested
+stages, each named by its known arguments (`size = 5`), its local channels too
+(`middle (size = 5)`), so FDR's account of one stage lands on that stage. The
+drawing unfolds at most eight stages below the first call; deeper ones are one
+box (the model still checks every stage). A recursion whose arguments are not
+known, or repeat, is drawn once, as above.
 
 There is one view for the whole program (rooted at `main`) and one per
 procedure, with its channel and barrier parameters as boundary ports, in
@@ -338,9 +353,9 @@ translated from (an import, edited in the editor or on disk); closing the
 document drops it. A check whose file changes while FDR runs is not shown as
 current at all: no lens, diagnostic or graph; its message says the result is
 about the text before the edit, and its report says so at its top and is not
-opened. When a check fails
-(a defect, a partial deadlock or a runtime error; `fdrShowGraph: onFailure`, the
-default) the graph opens on that check: a page already open for the document is
+opened. When a check finishes
+(`fdrShowGraph: always`, the default; `onFailure` opens it only for a defect, a
+partial deadlock or a runtime error) the graph opens on that check: a page already open for the document is
 refreshed and moved to it (no second tab, and a message says so; a page in a
 background tab or behind another window shows it when you switch to it, and
 the message says that), otherwise a new page opens (live, or the file when the
@@ -636,7 +651,7 @@ reads FDR's answers back in ProcessJ terms.
 | | Neovim | VS Code | Emacs |
 | --- | --- | --- | --- |
 | convert to CSP | `:ProcessJCsp` or `:ProcessJCsp delta` | **ProcessJ: Convert to CSP** (pick the program or a procedure) | `M-x processj-convert-to-csp` |
-| check with FDR | `:ProcessJFdr` or `:ProcessJFdr delta`, or the **FDR: check** lens | **ProcessJ: Check with FDR**, or the lens | `M-x processj-check-with-fdr` |
+| check with FDR | `:ProcessJFdr` or `:ProcessJFdr delta`, or the **FDR: check & show graph** lens | **ProcessJ: Check with FDR**, or the lens | `M-x processj-check-with-fdr` |
 | stop a running check | `:ProcessJFdrCancel` | **Cancel** on the check's notification, or **ProcessJ: Cancel FDR Check** | `M-x processj-cancel-fdr` |
 
 The server commands are `processj.convertToCsp` and `processj.checkWithFdr`,
@@ -655,7 +670,9 @@ and every warning; each definition is preceded by the statement it stands for.
 A file of that name that processj-lsp did not generate (it does not start with
 `-- Generated by processj-lsp from`) is never overwritten: the model then goes
 to the server's private report directory, and a message says so. Neovim's
-built-in `csp` filetype highlights the file.
+built-in `csp` filetype highlights the file, and the server attaches to it: its
+graph and FDR's results on it are described in
+[Graphs and FDR for .csp files](#graphs-and-fdr-for-csp-files).
 
 **Check with FDR** converts (and so also regenerates the `.csp` next to the
 source), runs FDR's `refines --divide` on a private copy of the model, and then:
@@ -686,7 +703,7 @@ source), runs FDR's `refines --divide` on a private copy of the model, and then:
 - replaces the lens above the procedure with the verdict (`FDR: deadlock (6
   steps)`, `FDR: partial deadlock (2 steps)`, `FDR: no deadlock, 1,204
   states`), which opens the graph on that result; the lenses (above `main`
-  **FDR: check program**, above other `void` procedures **FDR: check**) appear
+  **FDR: check program & show graph**, above other `void` procedures **FDR: check & show graph**) appear
   only when `refines` is installed, and `codeLens: false` hides them like the
   others;
 - publishes the results to the graph and, when a check fails, opens the graph
@@ -765,6 +782,65 @@ are a divergence. They stay visible in the process itself, so a specification
 can name them. A procedure that runs forever is deadlock-free as long as it
 keeps talking.
 
+**Procedures whose arguments decide their network.** Some data parameters
+decide what the network of a procedure is, not just what it computes: the
+length of a channel array (`new chan<int>[size - 1]`), the bounds of a par for
+(`i < size`), the arguments of a recursion through par (`altFIFO(size - 1,
+...)`), the index of a channel-array element (`chans[i]`), a condition that
+decides which of those happen (`if (size <= 1)`), or an argument that becomes
+such a parameter of a callee. The network must be laid out before FDR runs, so
+"every value" cannot be given to these. A procedure checked on its own takes
+them from its calls instead: the whole program is elaborated from `main`, and
+every call of the procedure from outside it (not its own recursive calls) gives
+the values elaboration knows there. Each distinct tuple is one instance with a
+network of its own (`PJ_RUN_1`, `PJ_RUN_2`, ...), the instances are the
+alternatives of the first event (`foo = (pj_call.0.6 -> PJ_RUN_1) [] (pj_call.1.6
+-> PJ_RUN_2) [] ...`), so every check covers every instance and a
+counterexample starts with the call it is about (`foo is called with i = 5,
+size = 6`). A channel-array parameter is given fresh channels (a CSPm channel
+named after it, `chans.k`) of the length its calls give, each a channel of its
+own for the network, the explanation and the graph. The other data parameters
+keep "every value". In `test/fixtures/fifo/blocks.pj`, `altFIFO` is checked with
+`size = 6` (the call at line 75: six stages, unfolded), `FIFO` with `size = 6`
+(the call at line 69), and `foo` six times, with `i = 0..5`, `chans` of length 5
+and `size = 6` (the call in FIFO's par for); `id`, `producer` and `consumer`
+have no such parameter and are checked as before. The integers are widened to
+hold the arguments (`-2..6` for `altFIFO`), so a buffer's data ranges over
+more values: `altFIFO(6)` and `FIFO(6)` take about 45 s with one FDR worker,
+nearly all of it the determinism check.
+
+The report, the lens, the diagnostics and the graph say which arguments were
+used: the report's `Checked:` line and first assumption (`altFIFO checked
+with size = 6 (the call at line 75)`), every check's `target.arguments` in the
+VerificationReport (`size = 6`), the verdict lens (`FDR: no deadlock, 615,849
+states · size = 6`), the editor message and each diagnostic (`FDR (altFIFO on
+its own, size = 6): ...`). A procedure's own view in the graph is drawn with
+the arguments every instance shares (a note says so: `Drawn with size = 6`),
+so FDR's processes land on their own boxes (the six stages of `altFIFO(6)`)
+and a channel-array parameter's channels are ports of their own
+(`chans[0]` ... `chans[4]` for `foo`); an argument that differs between the
+instances (`foo`'s `i`) is left open there.
+
+Without a call that fixes them, these parameters take every modelled value for
+which elaboration ends (the integers of the inferred range, a channel array
+every length from 1 to the top of the range), each value an instance of its
+own, and the report says so (`chain checked with size = 0..2 (3 instances, each
+checked; no call in the program fixes size: ...)`). A procedure whose model
+with every value is already complete (a par for whose bounds are computed at
+run time covers every value by itself) is checked that way, as before. Only
+when no value elaborates (a recursion that never stops) is it not modelled, with
+the reason and what to do: call it from `main` with concrete arguments, or name
+them with a directive above the procedure:
+
+    //@csp check altFIFO(6)
+    //@csp check foo(i = 0, chans = 5, size = 6)
+
+The arguments are the data parameters in order (a channel-array parameter by
+its length), or named (`name = value`); several directives give several
+instances, and they take the place of the calls. A wrong argument is a warning
+and the directive is ignored. A call or directive whose value lies outside a
+range set with `//@csp int` or the settings is not checked, with a warning.
+
 **The model, construct by construct.**
 
 | ProcessJ | in the model | faithful? |
@@ -772,8 +848,11 @@ keeps talking.
 | `c.write(e)`, `x = c.read()` | `c!e`, `c?x`: synchronous rendezvous; reads nested in expressions are lifted in Java's evaluation order, so `x > 5 && d.read() > 0` reads `d` only when `x > 5` | exact for the language; this ProcessJ build performs every read of an expression before evaluating it, `&&` and `\|\|` included, which is named where it matters (`compiler/short-circuit-read`, `test/differential/short_circuit_read.pj` hangs) |
 | `x = c.read({ B })` | the reader runs `B` and then sends `c__ack`; the writer waits for it | exact |
 | a channel with no possible partner anywhere | the operation blocks forever (it is synchronised with `STOP`), as at runtime | exact |
-| `par { B1 ... Bn }` | every branch is a process of a fixed network, started together by one hidden fork event and collected by hidden join events; a `par` in a loop reuses its processes. No process of the network ends in `SKIP`: the program ends when the root (`main`, or the checked procedure) ends (`[\| {pj_end} \|> SKIP` around the network; a network of one process just ends), which keeps FDR from paying 2^n for n processes that end | exact |
-| `par for (int i = a; i < b; i++)` | one process per iteration value. With bounds computed at run time there is a process for every modelled integer; those outside the bounds of a run take part in its fork and join only, and the explanation leaves them out. An iteration whose value is outside the modelled integers is a range error | the language; this ProcessJ build runs each statement of the body as its own process (`pj/par-for-body`) |
+| `par { B1 ... Bn }` | every branch is a process of a fixed network, started together by one hidden fork event and collected by hidden join events; a `par` in a loop reuses its processes. The fork carries what the branches need from the parent, and a branch takes only the values its parent in that procedure instance can send (`pj_forkset_…`): what elaboration knows there, any value of the type otherwise. No process of the network ends in `SKIP`: the program ends when the root (`main`, or the checked procedure) ends (`[\| {pj_end} \|> SKIP` around the network; a network of one process just ends), which keeps FDR from paying 2^n for n processes that end | exact |
+| `par for (int i = a; i < b; i++)` | one process per iteration value. Bounds that elaboration knows (constants, or arguments known where the procedure instance is created: `i < size` in `FIFO(6, ...)`) give exactly those iterations; bounds computed at run time give a process for every modelled integer, and those outside the bounds of a run take part in its fork and join only (the explanation leaves them out). An iteration whose value is outside the modelled integers is a range error | the language; this ProcessJ build runs each statement of the body as its own process (`pj/par-for-body`), and never ends a par for that runs no iteration (`compiler/empty-par-for`) |
+| `chan<T> cs[] = new chan<T>[n]` (or `chan<T>[] cs`), `cs[i].write(v)`, `x = cs[i].read()`, `f(cs[i].read)`, `f(cs)` with a `chan<T>[]` parameter | one CSPm channel for the array, its first field the element (`FIFO_chans.2`). Each procedure instance's length must follow from constants and the call's arguments (static elaboration); each element is a channel of its own for the network, the source map (`chans[2]`, `ChannelRef.index`) and the graph. An index elaboration knows picks the element; one computed at run time is a CSPm expression, after Java's bounds check (an index outside the array is a runtime error, as the `ArrayIndexOutOfBoundsException` that stops the real process), and the process is a user of every element it may pick. Not modelled, each with its reason: arrays of more than one dimension, array literals of channels (`{ a, b }`), an array assigned after its declaration, a length only the run knows, an element with a run-time index handed to a par branch, and channels of an array that need an acknowledgement or a server. A channel-array parameter of a procedure checked on its own is given fresh channels of the length its calls give (see above) | exact; this ProcessJ build cannot compile a read of an element anywhere but `x = cs[i].read();` or an alt guard, and leaves the elements null when the array is assigned after its declaration (`pj/compiler-limit`) |
+| conditions on known values | while the network is elaborated, a condition on parameters no statement changes and on par for iterations is decided per instance (`if (i == 0)` in iteration 0): the code on the other side is not a use of its channels there. The generated CSPm still tests it, with the same values | exact |
+| recursion through `par` | unfolded into a finite network when every data argument of each recursive call is known during elaboration and the unfolding stops (`altFIFO(6)` is six stages); a recursive procedure's local channels carry its instance (`altFIFO_middle.3`), so the stages never share one. Unknown or repeated arguments (repeated arguments do not tell how deep it goes, even when data read at run time stops it), more than 200 levels or more processes than the budget (2,000) leave the program not modelled, with the reason. The stages are named by their known arguments in the explanation (`altFIFO (size = 3)`, `id of altFIFO (size = 3)`) | exact |
 | channels and barriers declared in a `par for` body | one per iteration: iterations never synchronise on each other's, and the explanation keeps their partners, circles and barrier counts inside one iteration | exact |
 | shared channel ends | several writers (or readers) interleave and meet the other side one at a time; when one process both writes and reads a channel others use too, a small server (`PJ_MED`) hands each value to one reader | the language (locked ends); `pj/shared-unlocked-end` is named when this build does not lock an end |
 | `barrier b`, `par enroll (b)`, `b.sync()` | a counter per barrier (`PJ_BAR`) that follows the runtime's `PJBarrier`: declaring enrolls one process, `par enroll` hands the parent's enrollment to its branches, a branch that ends resigns, a sync completes when the last enrolled process arrives | exact, including that a resignation never completes a barrier: processes already waiting when the last other branch ends stay blocked (verified on the runtime) |
@@ -827,8 +906,14 @@ left operand decides the result (`compiler/short-circuit-read`,
 `short_circuit_read.pj` hangs); a replicated alt's precondition that uses its
 index, evaluated once for every index (`compiler/replicated-alt-precondition`,
 `replicated_alt_precondition.pj` stops with "One of the boolean pre-guards must
-be true!"); `stop` (`compiler/stop-ignored`); and a `break` out of a labelled
-block (`compiler/labelled-break`). When one of these is in the program, a
+be true!"); `stop` (`compiler/stop-ignored`); a `break` out of a labelled
+block (`compiler/labelled-break`); and a `par for` that runs no iteration,
+which the language ends at once but this build never ends: it sets the par's
+count to 0, starts nothing and waits for a process to finish
+(`compiler/empty-par-for`, `par_for_empty.pj` hangs). That one is named where
+elaboration knows the instance runs no iteration (literal bounds, or
+`par for (int i = 1; i < n - 1; i++)` in `build(2)`); with bounds only the run
+knows it is not named, and the model ends such a par for. When one of these is in the program, a
 passing verdict adds "the compiled program may differ" with the place (in
 short on its lens and chip, and the message is a warning:
 `FDR: no deadlock, 11 states; the compiled program may differ`), and a
@@ -918,8 +1003,9 @@ checked, the lens reads `FDR: not modelled`, and the file written for it says
 why, marked as generated, so the next translation replaces it. Not modelled,
 so the program is not checked at all (each check
 is reported as not checked, never as passed): mobile procedures, `suspend`,
-`claim`, arrays of channels (`replicated_alt.pj`), variables holding a channel
-end, recursion through `par`, records or protocols that contain themselves,
+`claim`, the forms of channel arrays listed in the table above (more than one
+dimension, `{ a, b }` literals, lengths only the run knows), variables holding a channel
+end, recursion through `par` that elaboration cannot unfold, records or protocols that contain themselves,
 arrays passed into a `par` branch or sent over a channel (`arr.pj`,
 `mandelbrot.pj`, `bug_lookalikes.pj`, `read_positions_that_work.pj`: the model
 passes values to a branch in its start event, and a sequence of integers has too
@@ -958,6 +1044,8 @@ procedure's own channels and `PJ_LOCAL` (the set of them), and to `main`'s
 barriers (`b.1.pj_sync`). Generated names start with `pj_` or `PJ` or contain
 `__`; ProcessJ names that would clash are renamed (`length` becomes `length_`).
 `//@csp assert sum :[has trace]: <pj_call.4, pj_result.10>` tests a function;
+`//@csp check proc(args)` names the arguments a procedure checked on its own is
+elaborated with (see "Procedures whose arguments decide their network");
 `//@csp compress` compresses every sub-network (`sbisim(diamond(...))`). FDR
 counts successful termination as a deadlock, so `//@csp assert MAIN :[deadlock
 free [F]]` fails on a program that ends; write `PJ_NOERR(MAIN)` instead, as the
@@ -966,6 +1054,215 @@ reads `assert not` as a negated assertion even at the start of a name, so a
 procedure called `notGate` is written `assert (notGate) :[deadlock free]` (the
 generated assertions do this themselves). A channel your specification names
 keeps exact values, as does everything that flows into it.
+
+## Graphs and FDR for .csp files
+
+The server also attaches to CSPm files: language id `cspm` (VS Code's
+language for `*.csp`), `csp` (Neovim's filetype for `*.csp`), or any document
+whose name ends in `.csp`. For them it runs no ProcessJ analysis at all: no
+ProcessJ diagnostics, completion, hover, formatting, semantic tokens or code
+actions. What it does instead (`src/cspm/`):
+
+| | Neovim | VS Code | Emacs |
+| --- | --- | --- | --- |
+| the process network | `:ProcessJGraph` (and `markdown`, `svg`, `excalidraw`) | **ProcessJ: Show Concurrency Graph**, or the **Process network** lens | `C-c C-g` in `cspm-mode` |
+| export it next to the file (`<file>.csp.graph.svg`, …) | `:ProcessJGraphExport [format] [dir]` | **ProcessJ: Export Concurrency Graph** | `C-c C-e` |
+| FDR on the file's own assertions | `:ProcessJFdr` (no argument), or the **FDR: check & show graph** lens on an `assert` | **ProcessJ: Check with FDR** | `C-c C-f` |
+| stop a running check | `:ProcessJFdrCancel` | **Cancel** on the notification | `M-x processj-cancel-fdr` |
+
+Diagnostics come from the CSPm parser (what it cannot read, at its line) and
+from FDR's own type check (`refines --typecheck`, run on open and on save when
+FDR is installed; FDR reports one error at a time). The outline lists the
+definitions, channels, datatypes and assertions. Without FDR the graph still
+works: it is drawn from the file alone.
+
+### The network
+
+A view starts at a root process: each process an assertion is about (the
+implementation of a refinement, the subject of `:[deadlock free]` and the
+other properties), then `MAIN`, `SYSTEM` or `main`, then every process
+defined without parameters. The viewer lists them under **Asserted** and
+**Defined** and opens on `MAIN`/`SYSTEM`/`main` when one is a network, else on
+the first asserted network.
+
+From the root, references are unfolded while they lead to a composition
+(`SYSTEM = PHILOSOPHERS [| X |] FORKS`, then `PHILOSOPHERS = ||| i : PHILS @
+PHIL(i)`), through hiding, renaming, `[| A |>`, `;`, `[>`, `/\`, `let`, an
+`if` whose condition is known, and FDR's compression functions (`sbisim`,
+`normal`, `diamond`, ...), at most 8 references deep and never into a
+reference already being unfolded. A composition left at that depth (a
+recursive one such as `Q(n) = Q(n+1) ||| Q(n+2)`) is one box that says it
+was not unfolded, and the view's notes say the drawing was cut there. Each
+operand of a composition is a box;
+a nested composition is a box around its operands, named after the reference
+it was reached through. A chain of the same operator without a name of its
+own (`(A [| X |] B) [| Y |] C`, as a translator writes) is drawn in one box,
+its other synchronisation sets listed among the box's facts.
+`||| i : S @ P(i)`, `[| X |] i : S @ P(i)` and `|| i : S @ [A(i)] P(i)` get
+one box per member when the evaluator can list `S` and it has at most 16
+members; otherwise one box stands for all of them (`×100`, or `×N` when the
+set cannot be counted). A view stops unfolding at 160 boxes.
+
+What an operand does is found by walking its definition and every definition
+it refers to with its arguments (`PHIL(0)` follows `PHIL(i)` with `i = 0`):
+each prefix is an event on a channel with the fields that can be computed
+(`pickup.0.1`) and the inputs (`?x`) and outputs (`!v`) marked. Which
+operands share an event follows CSP exactly: it synchronises at a generalized
+parallel whose set holds it, at an alphabetized parallel whose two alphabets
+hold it, never at an interleaving; a hiding makes it internal from there up;
+a renaming around part of the network makes its events, outside it, the
+events they are renamed to. An input `c?x` stands for every event of `c`:
+where a set or an alphabet holds some of them and not others (`|| i : {0,1}
+@ [{c.i}] P(i)` against a server's `c?x`), each event is worked out on its
+own (`c.0` with P(0), `c.1` with P(1)) when the channel's type can be
+listed. So a link joins the operands that must take part in the same events:
+
+- an arrow from the operand that only outputs (`!`) to the one that only
+  inputs (`?`) them; a plain line when the events carry no direction;
+- a hub (the barrier shape) when three or more operands take part in each;
+- a port for an event an operand performs with nobody in the network and
+  that carries data (`left?x`): the environment's side; other events an
+  operand performs alone are listed on its box (`also eats.0, thinks.0`);
+- a dashed end, `never shared: coffee`, for an event a composition
+  synchronises on that its other side never performs, so it can never happen;
+- a faded link (`· hidden`) for events a hiding makes internal.
+
+Links between the same operands are one arrow labelled with their events
+(`pickup.0.1, putdown.0.1`). A link is drawn dashed (not certain) when the
+walk of an operand stopped short or a synchronisation set could not be
+worked out; the box then says why among its facts. Such an operand may take
+part in any event it synchronises on: its partners are linked to it dashed,
+rather than said to perform those events alone.
+
+Identity follows `src/verification.ts`, with sites in the `.csp` file: an
+operand's path adds `{ kind: 'branch', site: the composition, index }` per
+composition, `{ kind: 'par-for', site: the replicated operator, index }` per
+member (no index on a box drawn once for all), and `{ kind: 'call', site: the
+reference }` for each reference unfolded on the way to a nested composition.
+
+### FDR
+
+Check with FDR runs `refines --format=framed_json --divide` on a private copy
+of the buffer (unsaved edits included; an `include` is made absolute so it
+still finds its file) and checks exactly the file's own assertions: nothing
+is generated or added. Each assertion is one check: its verdict, FDR's state
+count and time, and for a failure the counterexample, matched to the
+assertion by its text as FDR prints it back (without comments, spaces and
+parentheses, `:[livelock free]` and `:[divergence-free]` as `:[divergence
+free]`, `i : S` as `i <- S`); when FDR reports as many results as the file
+has assertions, an assertion whose text still matches none takes the result
+at its position. `assert not` holds when the assertion without `not` fails;
+its label keeps the `not`.
+
+With `--divide`, FDR gives a behaviour for every component below the process
+the assertion is about: its own trace, aligned with the whole one, the named
+states it went through, and at the end what it still offers. These are
+matched to the drawn operands by following the composition the view was
+drawn from: through the hiding, `[| A |>` and named definitions around it
+(each may or may not be a node of FDR's tree), then operand by operand, by
+FDR's machine name where it agrees with the drawing (`PHIL(0)`), else by
+position. A chain drawn as one composition (`A [| X |] (B [| X |] C)`)
+stays binary in FDR's tree: it is followed in the shape it was written, so
+each operand gets its own node, never a neighbour's.
+FDR's members of a replicated composition drawn once are each placed on that
+box. When the tree does not have the drawn shape, the check says so and the
+processes it could not place are listed in the viewer; nothing is placed by
+guesswork.
+
+From that:
+
+- each step of the run names who took part and in which role (output, input,
+  synchronisation); a hidden event shows what happened inside (`COPY(left,
+  mid) outputs 0 on mid; COPY(mid, right) inputs it (hidden)`); an internal
+  choice is an internal step of the process that made it;
+- for a deadlock, each process is blocked waiting for exactly the events FDR
+  says it still offers, at the prefix that offers them, and each wait names
+  the operands it must share the event with that do not offer it (with what
+  they offer instead), or says that nobody ever can (`CUSTOMER never performs
+  coffee, and [| {| coin, tea, coffee |} |] synchronises on it`); waits that
+  go round are a circular wait; a process at `STOP` offers nothing; one at
+  `SKIP` has terminated (FDR counts the end of the whole system as a deadlock,
+  and says so);
+- for a trace refinement, the process that can perform the event the
+  specification refuses is marked (`can do left.1: refused`); for a failures
+  refinement or `:[has trace]`, what each process offers at that point (what
+  it may refuse is everything else), with what the specification needed. In
+  the F and FD models `:[has trace]` fails when the process can refuse the
+  next event of the trace, not only when the trace is impossible; the
+  message says which (`:[has trace [T]]` asks only whether it is possible);
+- for nondeterminism, the process that can both perform and refuse the
+  event; for a divergence, the processes in the steps that repeat forever.
+
+Results are diagnostics too: a failed assertion at its line, and one
+information diagnostic per place where processes are stuck (`PHIL(0), PHIL(1)
+and PHIL(2) are stuck here, waiting to sync on pickup.0.1, …`), and the lens
+on each `assert` shows its verdict and opens the graph on it. The text report
+(the step-by-step account) opens when the graph does not (`fdrShowGraph`). An
+edit takes the results back.
+
+### Generated models
+
+A model Convert to CSP wrote is an ordinary CSPm file here, with two
+differences: each box shows the ProcessJ line its definition's comment names
+(`line 22: branch 1 of the par`), and the translator's own events
+(`pj_fork_…`, `pj_join_…`, `pj_end`) are drawn without labels. Its header
+names the `.pj` file it came from; the page links back to it (to its live
+graph page when that file is open), and the graph command says once that the
+ProcessJ graph is in that file.
+
+### What is understood, and what is not
+
+Read: `channel`, `datatype`, `subtype`, `nametype`; definitions with
+parameters, several clauses and pattern parameters (literals, tuples, dotted
+values, `<x>^xs`, `{x}`, `_`); every process operator of FDR's manual with its
+precedence (`->`, `&`, `;`, `[>`, `/\`, `[| A |>`, `[]`, `|~|`, `[| A |]`,
+`[A || B]`, `[a <-> b]`, `|||`, `\`, `[[ a <- b ]]`); the replicated forms of
+`[]`, `|~|`, `;`, `|||`, `[| A |]`, `||` and `/\`; inputs `?x`, `?x : S`,
+outputs `!v`, dotted fields; `if`/`then`/`else`, `let`/`within`, lambdas;
+sets, ranges, `{| |}` and comprehensions of both, sequences and sequence
+comprehensions; `include`, `external`, `transparent`, `print`, type
+signatures (read past); every form of `assert`, with `[T=`, `[F=`, `[FD=`,
+`:[deadlock free]`, `:[divergence free]`, `:[livelock free]`,
+`:[deterministic]`, `:[has trace]: <...>`, their `[M]` models and options
+such as `:[tau priority]:`; `--` and nested `{- -}` comments.
+
+Evaluated (to draw): integers, booleans, dotted values and events, tuples,
+finite sets and sequences up to 4096 values, datatypes' values, `union`,
+`inter`, `diff`, `Union`, `Inter`, `member`, `card`, `empty`, `set`, `seq`,
+`head`, `tail`, `length`, `null`, `concat`, `elem`, `productions`, `Set`, and
+`Events`.
+
+Not understood, and said so where it matters:
+
+- Timed sections (`Timed(et) { ... }`) and modules are read past with an
+  information diagnostic; nothing in them is drawn (FDR still checks them).
+  A name a module exports (`M::Y`) is read as one name whose value is
+  unknown;
+- a linked parallel `[a <-> b]` is drawn with its two operands but not its
+  links (they rename the channels they join);
+- a renaming is followed when it maps whole channels to channels (one to
+  one, or one to several: `[[ a <- b, a <- c ]]` does both b and c);
+  otherwise (an event such as `d.0`, a comprehension) its events are drawn as
+  written, marked uncertain, and the box says so;
+- a value the evaluator cannot compute (an infinite set such as `Int`, a
+  library function it does not know, a value that depends on an input) is
+  unknown: an event with an unknown field matches any value there, a
+  replicated composition over an unknown set is one box, and a
+  synchronisation set that cannot be computed draws no links at that
+  composition (the view's notes say which);
+- the walk of an operand's definitions stops after 1,000 definition instances
+  (a counter with a large range, a barrier's bookkeeping); its links are then
+  dashed and the box says the walk stopped;
+- syntax the parser does not know becomes an opaque declaration or term with
+  a diagnostic at its line, and the rest of the file is still read; so does a
+  declaration nested more than 100 expressions deep (a warning: FDR may well
+  accept it).
+
+FDR's type errors are diagnostics on open and save, one per error at its own
+location (FDR can send several in one message). The summary after a check
+counts what FDR decided: an assertion it did not finish, or a file it could
+not load, is neither holding nor failing (`none of the 2 assertions was
+decided`).
 
 ## Performance
 
@@ -1098,7 +1395,7 @@ return {
   {
     "arianizadi/processj-lsp",
     build = "npm ci && npm run build",
-    ft = "processj",
+    ft = { "processj", "csp" },
     opts = { init_options = { installDir = "~/Documents/ProcessJ", checkOnChange = true } },
   },
 }
@@ -1113,7 +1410,7 @@ language id `processj` (extension `.pj`) and pass the options below as
 
 With AstroNvim the usual mappings apply: `K` hover, `gd` definition, `gr`
 references, `<Leader>lf` format, `<Leader>la` code action (quick fixes),
-`<Leader>lr` rename, `<Leader>ll` run a code lens (▶ Run, Build, FDR: check). The
+`<Leader>lr` rename, `<Leader>ll` run a code lens (▶ Run, Build, FDR: check & show graph). The
 `:ProcessJEffects` and `:ProcessJProtocols` commands open the complete analysis
 reports without locating a lens first, `:ProcessJGraph` opens the graph viewer in
 your browser (`:ProcessJGraph markdown` gives it as a report),
@@ -1172,7 +1469,7 @@ install directory; only `codeLens` needs a restart because it is a capability.
 | `fdrTimeoutMs`  | `120000` | stop an FDR check after this long                        |
 | `fdrMemoryMb`   | `0`     | stop an FDR check once `refines` uses more memory than this (MB; not on Windows); `0` is half of the machine's memory, at most 8 GB |
 | `fdrWorkers`    | `1`     | `refines`' search workers: `1` finds the same deadlock and runtime-error counterexamples on every check (a termination or determinism counterexample can still vary); `0` uses every core, faster on big models |
-| `fdrShowGraph`  | `onFailure` | after Check with FDR, open the graph on the result: `onFailure` (a defect, a partial deadlock or a runtime error), `always`, or `never` (the text report opens instead, as it does whenever the graph is not shown) |
+| `fdrShowGraph`  | `always` | after Check with FDR, open the graph on the result: `always`, `onFailure` (only a defect, a partial deadlock or a runtime error), or `never` (the text report opens instead, as it does whenever the graph is not shown) |
 
 ## How diagnostics work
 
@@ -1242,6 +1539,11 @@ src/csp/            ProcessJ to CSPm for FDR and back: lowering (lower.ts), inte
                     (translate.ts), refines (fdr.ts), FDR's answers as a VerificationReport (explain.ts),
                     diagnostics and the text report (report.ts), check.ts, each procedure's state machine
                     (machine.ts)
+src/cspm/           CSPm files: the tolerant parser (lexer.ts, parser.ts, ast.ts), the evaluator of values and event sets
+                    (eval.ts), the process network of a root (network.ts), one document's roots, views and symbols
+                    (document.ts), FDR's answers on the drawn network (explain.ts), refines on the file and its type check
+                    (check.ts), the text report and diagnostics (report.ts), the graph session (session.ts), and what
+                    the server does for a .csp document (features.ts)
 src/verification.ts verification results shared with the graph viewer: process and channel identities, checks, counterexamples
 src/diagnostics.ts  parses compiler output into structured diagnostics
 src/symbols.ts      regex-based extractor, used to top up symbols while a file has syntax errors
@@ -1253,6 +1555,8 @@ src/keywords.ts     keyword list and hover docs
 test/               node:test unit tests; test/fixtures holds the compiler's example corpus and std headers
 test/differential/  programs whose real compiler and runtime outcome is recorded in their header
 test/fixtures/verification/ an FDR-style report of a multi-step deadlock, for the viewer's timeline
+test/fixtures/cspm/ hand-written CSPm models (dining philosophers, a COPY pipeline, a ring, clients and a server, a vending
+                    machine) and a generated one, for the CSPm parser, network and FDR tests
 test/fixtures/fdr/  refines output recorded for the explanation and graph tests (`PJ_RECORD_FDR=1 npm test` re-records);
                     test/fdr-recordings.ts reads them, and replays them as a stand-in refines for the server tests
 examples/           one program per diagnostic, self-describing and tested; dining_philosophers.pj is for FDR
@@ -1265,7 +1569,7 @@ scripts/fdr-validate.js checks a corpus with FDR, runs it with the real compiler
 scripts/editors.js  `npm run setup` / `npm run remove`: install or uninstall the Neovim, VS Code and Emacs integrations
 lua/, plugin/, ftdetect/, syntax/, ftplugin/   the Neovim plugin
 editor/nvim/        ready-made lazy.nvim/AstroNvim spec and a plugin-manager-free config
-editor/emacs/       processj-mode.el: major mode, eglot/lsp-mode wiring, graph commands
+editor/emacs/       processj-mode.el: major modes for ProcessJ and CSPm, eglot/lsp-mode wiring, graph commands
 vscode/             VS Code extension: `npm run install-extension` builds the server, bundles it, packages and installs
 ```
 
@@ -1329,7 +1633,8 @@ server), and `integers out of range` is the model's limit. A row's result is
   `pj/shared-channel-end` (no lock is taken, so the compiled program hangs
   where the language has no deadlock), `pj/par-for-body`,
   `compiler/loop-labels`, `compiler/par-loop-calls`, `compiler/stop-ignored`,
-  `compiler/short-circuit-read`, `compiler/replicated-alt-precondition`. Also
+  `compiler/short-circuit-read`, `compiler/replicated-alt-precondition`,
+  `compiler/empty-par-for`. Also
   when the program hangs or fails as FDR says, but the report itself says the
   compiled program may differ from the model (one of these, or
   `compiler/labelled-break`, `pj/starving-loop`, `pj/multiple-alts`,
@@ -1346,8 +1651,8 @@ server), and `integers out of range` is the model's limit. A row's result is
   syntax), **no main**, **too big** (FDR did not finish in 60 s);
 - **MISMATCH** otherwise, which fails the script.
 
-Latest run (FDR 4.2.7, one search worker, 137 programs, about four minutes): 65
-confirmed, 19 language, 4 abstraction, 2 range limit, 23 not built, 13 not
+Latest run (FDR 4.2.7, one search worker, 144 programs, about four minutes): 70
+confirmed, 19 language, 4 abstraction, 2 range limit, 25 not built, 13 not
 modelled, 1 too big, 6 do not parse, 4 without `main`, and no mismatch.
 Programs that are clean and agree are listed together per directory:
 
@@ -1374,7 +1679,8 @@ Programs that are clean and agree are listed together per directory:
 | `test/differential/break_after_nested_do.pj` | no deadlock, terminates | hangs after java.lang.NullPointerException | language |
 | `test/differential/break_after_nested_for.pj` | deadlock (L14) | hangs after java.lang.NullPointerException | language |
 | `test/differential/break_after_par_for.pj` | no deadlock, terminates | hangs | language |
-| `test/differential/channel_array.pj` | not modelled: arrays of channels are not modelled | does not build (javac fails) | not modelled |
+| `test/differential/channel_array_assigned.pj` | not modelled: the channel array 'cs' is modelled only when it is declared with 'new chan<T>[n]' (this ProcessJ build creates its channels only there) | hangs | not modelled |
+| `test/differential/channel_array_forms.pj` | not modelled: arrays of channels with more than one dimension are not modelled | finishes | not modelled |
 | `test/differential/claim_shared.pj` | not modelled: 'claim' is not modelled | does not build (ProcessJc crashed) | not modelled |
 | `test/differential/continue_after_nested_for.pj` | no deadlock, terminates | hangs | language |
 | `test/differential/end_in_variable.pj` | not modelled: a variable holding a channel end is not modelled (and does not compile with this ProcessJ build) | does not build (javac fails) | not modelled |
@@ -1384,7 +1690,6 @@ Programs that are clean and agree are listed together per directory:
 | `test/differential/par_loop_of_calls.pj` | no deadlock, terminates | hangs | language |
 | `test/differential/read_as_index_target.pj` | not modelled: a par branch receives a int[] value from its parent, which the model cannot enumerate | does not build (javac fails) | not modelled |
 | `test/differential/read_positions_that_work.pj` | not modelled: a par branch receives a int[] value from its parent, which the model cannot enumerate | finishes | not modelled |
-| `test/differential/replicated_alt.pj` | not modelled: arrays of channels are not modelled | finishes | not modelled |
 | `test/differential/replicated_alt_precondition.pj` | no deadlock, terminates | fails (exit 1: RuntimeError: One of the boolean pre-guards must be true!) | language |
 | `test/differential/shared_inline_writers.pj` | no deadlock, terminates | hangs | language |
 | `test/differential/shared_par_for_writers.pj` | no deadlock, terminates | hangs | language |
@@ -1408,14 +1713,17 @@ Programs that are clean and agree are listed together per directory:
 | `examples/shared_channel.pj` | no deadlock, terminates | hangs | language |
 | `examples/shared_unlocked_end.pj` | no deadlock, terminates | hangs | language |
 | `examples/starving_loop.pj` | no deadlock, runs forever | hangs | language |
+| `test/fixtures/fifo/blocks_oob.pj` | no deadlock, array-index (L34) | hangs after java.lang.ArrayIndexOutOfBoundsException | CONFIRMED |
+| `test/fixtures/fifo/blocks_skip.pj` | deadlock (L15, L23, L9) | hangs | CONFIRMED |
 | test/fixtures/processj/: `Demo.pj`, `barrierEx.pj`, `binexpr.pj`, `bytecode.pj`, `protocolSwitch.pj`, `simplepj.pj` | - | - | does not parse |
 | test/fixtures/processj/: `Demo2.pj`, `Demo_matt.pj`, `Hello.pj`, `Matt.pj`, `SwitchDemo.pj`, `array.pj`, `bartest.pj`, `car.pj`, `channelWR.pj`, `enrolledtest.pj`, `iftest.pj`, `parExp.pj`, `protocols.pj`, `readEx.pj`, `recordchan.pj`, `santatest.pj`, `timer.pj`, `verySimple.pj` | no deadlock, terminates | finishes | CONFIRMED |
 | test/fixtures/processj/: `localDecl.pj`, `silly.pj`, `test22.pj` | - | - | no main |
-| test/differential/: `alt_per_par_branch.pj`, `barrier_enroll.pj`, `both_ends_to_proc.pj`, `break_after_for_nonyield.pj`, `break_after_nested_while.pj`, `break_after_par.pj`, `break_before_nested_for.pj`, `break_in_inner_for.pj`, `break_in_plain_while.pj`, `breaks_that_work.pj`, `const_from_channel_read.pj`, `const_from_variable_in_main.pj`, `extended_rendezvous.pj`, `forwarded_end.pj`, `loop_reader.pj`, `nested_par.pj`, `null_compare.pj`, `par_for_body_statements.pj`, `par_for_shared_even.pj`, `par_loop_in_own_proc.pj`, `pri_alt_precondition.pj`, `proc_only_calls.pj`, `sequential_pars.pj`, `shared_writers_locked.pj`, `switch_break_after_for.pj`, `timeout_is_a_deadline.pj`, `timer_arith.pj`, `two_alts_one_process.pj`, `while_true_with_break.pj` | no deadlock, terminates | finishes | CONFIRMED |
-| test/differential/: `alt_timeout_channel_read.pj`, `break_in_par.pj`, `chan_of_string.pj`, `const_from_variable_in_method.pj`, `negated_condition.pj`, `nonvoid_yielding.pj`, `null_assign.pj`, `par_for_twice.pj`, `read_as_array_size.pj`, `read_then_field.pj`, `record_literal_assigned.pj`, `shared_read_param.pj`, `switch_loop_break.pj`, `two_replicated_alts.pj`, `types_mix.pj` | no deadlock, terminates | does not build | not built |
+| test/differential/: `alt_per_par_branch.pj`, `barrier_enroll.pj`, `both_ends_to_proc.pj`, `break_after_for_nonyield.pj`, `break_after_nested_while.pj`, `break_after_par.pj`, `break_before_nested_for.pj`, `break_in_inner_for.pj`, `break_in_plain_while.pj`, `breaks_that_work.pj`, `const_from_channel_read.pj`, `const_from_variable_in_main.pj`, `extended_rendezvous.pj`, `forwarded_end.pj`, `loop_reader.pj`, `nested_par.pj`, `null_compare.pj`, `par_for_body_statements.pj`, `par_for_shared_even.pj`, `par_loop_in_own_proc.pj`, `pri_alt_precondition.pj`, `proc_only_calls.pj`, `replicated_alt.pj`, `sequential_pars.pj`, `shared_writers_locked.pj`, `switch_break_after_for.pj`, `timeout_is_a_deadline.pj`, `timer_arith.pj`, `two_alts_one_process.pj`, `while_true_with_break.pj` | no deadlock, terminates | finishes | CONFIRMED |
+| test/differential/: `alt_timeout_channel_read.pj`, `break_in_par.pj`, `chan_of_string.pj`, `channel_array.pj`, `channel_array_read_in_expression.pj`, `const_from_variable_in_method.pj`, `negated_condition.pj`, `nonvoid_yielding.pj`, `null_assign.pj`, `par_for_twice.pj`, `read_as_array_size.pj`, `read_then_field.pj`, `record_literal_assigned.pj`, `shared_read_param.pj`, `switch_loop_break.pj`, `two_replicated_alts.pj`, `types_mix.pj` | no deadlock, terminates | does not build | not built |
 | test/differential/: `array_long_index.pj` | - | - | no main |
-| examples/: `clean_pipeline.pj`, `const_from_variable.pj`, `par_for_body.pj`, `parallel_usage.pj`, `timer_deadline.pj`, `yield_through_calls.pj` | no deadlock, terminates | finishes | CONFIRMED |
+| examples/: `channel_array_pipeline.pj`, `clean_pipeline.pj`, `const_from_variable.pj`, `par_for_body.pj`, `parallel_usage.pj`, `timer_deadline.pj`, `yield_through_calls.pj` | no deadlock, terminates | finishes | CONFIRMED |
 | examples/: `overloads.pj`, `read_placement.pj`, `typos.pj`, `use_import.pj` | no deadlock, terminates | does not build | not built |
+| test/fixtures/fifo/: `blocks.pj` | no deadlock, terminates | finishes | CONFIRMED |
 
 Every verdict that differs from the run says why in its report. FDR finds a
 deadlock in five programs that really finish: three where an alt takes its
@@ -1442,3 +1750,21 @@ in which the consumer has ended and the producer waits to write; for
 `starving_loop.pj` (`pj/starving-loop`: the scheduler freezes every process,
 where the model has one loop running forever) the report says the compiled
 program differs from the model, so the hang may have another cause.
+
+`node scripts/fdr-validate.js --procedures [dirs or files]` checks every
+procedure with a body (but `main`) on its own instead, as Check with FDR on that
+procedure does, and prints a row per procedure: each check's verdict (`RANGE`
+where it leaves the modelled integers), not modelled with the reason, FDR
+rejecting the model (a translator bug, as is a crash; the exit code is then 1)
+or no answer in time, with the arguments a procedure was checked with when its
+arguments decide its network. Over `test/fixtures/processj`,
+`test/differential`, `examples` and the FIFO coursework (`blocks.pj`), 167
+procedures (6 more files do not parse), the latest run (60 s per procedure)
+gave 158 verdicts, 0 models FDR rejects, 5 with no answer in time
+(`fibonacci.pj`'s `fib`, and the gate and adder procedures of `fullAdder.pj`:
+their open environments give FDR too many states; see `//@csp compress` above)
+and 4 not modelled, each a
+construct the model does not express: channels carrying arrays (`arr.pj`'s
+`reader` and `writer`), an array data parameter, which cannot be given every
+value (`array_long_index.pj`'s `get`; it is checked through its caller), and
+`claim` (`claim_shared.pj`'s `writer`).

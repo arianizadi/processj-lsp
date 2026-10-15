@@ -1,0 +1,13 @@
+-- A vending machine that may refuse to serve tea: it fails the
+-- specification that always offers both drinks, and it is nondeterministic.
+channel coin, tea, coffee
+
+SPEC = coin -> (tea -> SPEC [] coffee -> SPEC)
+VM = coin -> (tea -> VM |~| coffee -> VM)
+CUSTOMER = coin -> tea -> CUSTOMER
+SYSTEM = VM [| {| coin, tea, coffee |} |] CUSTOMER
+
+assert SPEC [F= VM
+assert SPEC [T= VM
+assert VM :[deterministic [F]]
+assert SYSTEM :[deadlock free [F]]

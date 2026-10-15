@@ -1,7 +1,7 @@
 {
   "name": "processj-lsp-vscode",
   "displayName": "ProcessJ",
-  "description": "ProcessJ language support with causal concurrency diagnostics, graphs, protocol and effect analysis, safe refactors, formatting, navigation and run-from-editor.",
+  "description": "ProcessJ language support with causal concurrency diagnostics, graphs, protocol and effect analysis, safe refactors, formatting, navigation and run-from-editor; the process graph and FDR checks for CSPm (.csp) files too.",
   "version": "0.1.5",
   "publisher": "arianizadi",
   "license": "Apache-2.0",
@@ -23,6 +23,7 @@
   "main": "./out/extension.js",
   "activationEvents": [
     "onLanguage:processj",
+    "onLanguage:cspm",
     "onCommand:processj.runCurrentFile",
     "onCommand:processj.buildCurrentFile",
     "onCommand:processj.showConcurrencyGraph",
@@ -46,6 +47,17 @@
           ".pj"
         ],
         "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "cspm",
+        "aliases": [
+          "CSPm",
+          "cspm"
+        ],
+        "extensions": [
+          ".csp"
+        ],
+        "configuration": "./cspm-language-configuration.json"
       }
     ],
     "grammars": [
@@ -53,6 +65,11 @@
         "language": "processj",
         "scopeName": "source.processj",
         "path": "./syntaxes/processj.tmLanguage.json"
+      },
+      {
+        "language": "cspm",
+        "scopeName": "source.cspm",
+        "path": "./syntaxes/cspm.tmLanguage.json"
       }
     ],
     "commands": [
@@ -75,14 +92,14 @@
         "title": "Show Concurrency Graph",
         "category": "ProcessJ",
         "icon": "$(type-hierarchy)",
-        "enablement": "editorLangId == processj"
+        "enablement": "editorLangId == processj || editorLangId == cspm"
       },
       {
         "command": "processj.exportConcurrencyGraphFiles",
         "title": "Export Concurrency Graph",
         "category": "ProcessJ",
         "icon": "$(export)",
-        "enablement": "editorLangId == processj"
+        "enablement": "editorLangId == processj || editorLangId == cspm"
       },
       {
         "command": "processj.showProtocolFlow",
@@ -110,7 +127,7 @@
         "title": "Check with FDR",
         "category": "ProcessJ",
         "icon": "$(debug-alt)",
-        "enablement": "editorLangId == processj"
+        "enablement": "editorLangId == processj || editorLangId == cspm"
       },
       {
         "command": "processj.cancelFdrCheck",
@@ -140,19 +157,19 @@
         },
         {
           "command": "processj.showConcurrencyGraph",
-          "when": "editorLangId == processj",
+          "when": "editorLangId == processj || editorLangId == cspm",
           "group": "navigation@2"
         }
       ],
       "editor/context": [
         {
           "command": "processj.showConcurrencyGraph",
-          "when": "editorLangId == processj",
+          "when": "editorLangId == processj || editorLangId == cspm",
           "group": "navigation@10"
         },
         {
           "command": "processj.exportConcurrencyGraphFiles",
-          "when": "editorLangId == processj",
+          "when": "editorLangId == processj || editorLangId == cspm",
           "group": "navigation@10"
         },
         {
@@ -172,7 +189,7 @@
         },
         {
           "command": "processj.checkCurrentFileWithFdr",
-          "when": "editorLangId == processj",
+          "when": "editorLangId == processj || editorLangId == cspm",
           "group": "navigation@14"
         }
       ]
@@ -266,16 +283,16 @@
         "processj.fdrShowGraph": {
           "type": "string",
           "enum": [
-            "onFailure",
             "always",
+            "onFailure",
             "never"
           ],
           "enumDescriptions": [
-            "Open the graph on the result when a check fails, finds a partial deadlock or a runtime error; otherwise open the text report.",
-            "Open the graph on the result after every check.",
+            "Open the graph on the result after every check (the default).",
+            "Open the graph on the result only when a check fails, finds a partial deadlock or a runtime error; otherwise open the text report.",
             "Never open the graph: open the text report instead."
           ],
-          "default": "onFailure",
+          "default": "always",
           "description": "After ProcessJ: Check with FDR, open the concurrency graph panel on the result, with the stuck processes and the run that leads there marked. The text report (.pjreport) is always written, and opened when the graph is not."
         },
         "processj.serverPath": {

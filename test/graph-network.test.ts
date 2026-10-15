@@ -297,8 +297,11 @@ test('a par for body is exact only when the par for has an iteration', () => {
   ].join('\n');
   const { model } = analyzeSource(source, '/virtual/par-for-count.pj');
   const view = programView(model);
-  assert.deepEqual(view.nodes.filter((node) => node.replicated).map((node) => `${node.label} ${node.replicated!.text} ${node.confidence}`), ['a.write(i) ×0 conditional', 'b.write(i) ×3 exact', 'out.write(i) ×N conditional']);
-  assert.deepEqual(arrowConfidence(view), { a: 'conditional', b: 'exact', c: 'conditional' });
+  // fan's n is the call's argument: 2 iterations, exactly.
+  assert.deepEqual(view.nodes.filter((node) => node.replicated).map((node) => `${node.label} ${node.replicated!.text} ${node.confidence}`), ['a.write(i) ×0 conditional', 'b.write(i) ×3 exact', 'out.write(i) ×2 exact']);
+  assert.deepEqual(arrowConfidence(view), { a: 'conditional', b: 'exact', c: 'exact' });
+  // In fan's own view n is any value.
+  assert.deepEqual(viewOf(model, 'fan').nodes.filter((node) => node.replicated).map((node) => `${node.label} ${node.replicated!.text} ${node.confidence}`), ['out.write(i) ×N conditional']);
   // The parameter is a shared writing end: only its writing side is shared.
   assert.deepEqual(viewOf(model, 'fan').channels[0].shared, { read: false, write: true });
 });

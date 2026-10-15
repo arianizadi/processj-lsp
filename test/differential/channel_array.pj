@@ -1,4 +1,5 @@
 // outcome: compiler-limit
+// The array builds; the read inside println(...) is what javac rejects (see channel_array_read_in_expression.pj).
 import std.*;
 const int N = 3;
 public void producer(chan<int>.write out, int id) { out.write(id * 10); }

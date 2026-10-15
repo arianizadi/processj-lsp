@@ -116,6 +116,8 @@ export function svgStyle(mode: 'plain' | 'themed' = 'plain'): string {
 .pj-edge-unknown .pj-edge-line { stroke-dasharray: 2 4; stroke: ${c('faint')}; }
 .pj-edge-barrier .pj-edge-line { stroke: ${c('barrier')}; stroke-dasharray: 3 3; stroke-width: 1.4; }
 .pj-edge-dangling .pj-edge-line { stroke: ${c('faint')}; }
+.pj-edge-hidden .pj-edge-line { stroke-opacity: 0.5; }
+.pj-edge-hidden .pj-arrow { fill-opacity: 0.5; }
 .pj-arrow { fill: ${c('edge')}; }
 .pj-edge-unknown .pj-arrow, .pj-edge-dangling .pj-arrow { fill: ${c('faint')}; }
 .pj-edge-label-box { fill: ${c('label-fill')}; stroke: ${c('label-stroke')}; }
@@ -282,6 +284,10 @@ export function wrapLines(text: string, size: number, width: number): string[] {
 
 /** `process network · 6 processes · 4 channels`: processes, not boxes (a par for box counts each iteration). */
 export function networkSubtitle(view: NetworkView): string {
+  if (view.language === 'cspm') {
+    const links = new Set(view.edges.map((edge) => edge.channel)).size;
+    return `process network · ${countText(viewProcesses(view))} · ${links} link${links === 1 ? '' : 's'}`;
+  }
   const channels = new Set(view.edges.filter((edge) => edge.kind === 'channel').map((edge) => edge.channel)).size;
   return `process network · ${countText(viewProcesses(view))} · ${channels} channel${channels === 1 ? '' : 's'}`;
 }
@@ -451,12 +457,14 @@ function renderProcess(node: NetNode, box: Box): string {
 function renderEdge(edge: NetEdge, points: readonly Point[], byId: Map<string, NetNode>, prefix: string): string {
   const target = byId.get(edge.to);
   // Lines into a junction merge there; the arrow is drawn once, at the reader.
-  const arrow = edge.kind === 'channel' && target?.kind !== 'junction'
+  // A CSPm synchronisation with no data direction is a plain line.
+  const arrow = edge.kind === 'channel' && target?.kind !== 'junction' && !edge.tags.includes('undirected')
     ? ` marker-end="url(#${prefix}-arrow${edge.confidence === 'unknown' || edge.role === 'dangling' ? '-faint' : ''})"`
     : '';
   const classes = ['pj-edge', `pj-edge-${edge.kind === 'barrier' ? 'barrier' : edge.confidence}`];
   if (edge.role === 'dangling') classes.push('pj-edge-dangling');
   if (edge.tags.includes('not enrolled')) classes.push('pj-edge-unenrolled');
+  if (edge.tags.includes('hidden')) classes.push('pj-edge-hidden');
   return `<g class="${classes.join(' ')}" data-id="${escapeXml(edge.id)}" data-channel="${escapeXml(edge.channel)}" data-from="${escapeXml(edge.from)}" data-to="${escapeXml(edge.to)}"><path class="pj-edge-line" d="${roundedPath(points)}"${arrow}/></g>`;
 }
 
@@ -738,7 +746,11 @@ export function placeOverlay(view: NetworkView, layout: ViewLayout, overlay: Ove
     // Where a nondeterministic result turns: the process whose internal step decides what the outside sees.
     if (overlay.choice?.node === id) badgeQueue.push({ node: id, text: `the choice (step ${overlay.choice.step + 1})`, tone: 'choice', title: `${overlay.choice.description}: what the outside can see next depends on it` });
     if (diverging.length) badgeQueue.push({ node: id, text: counted(diverging, 'diverge', 'diverges'), tone: 'loop', title: title(diverging) });
-    if (running.length) badgeQueue.push({ node: id, text: counted(running, 'running', 'running'), tone: 'info', title: title(running) });
+    // A running process the producer says more about (it can perform the event a specification refuses) shows that.
+    const marked = running.filter((process) => process.badge !== 'running');
+    const plain = running.filter((process) => process.badge === 'running');
+    if (marked.length) badgeQueue.push({ node: id, text: counted(marked, 'running'), tone: 'fail', title: title(marked) });
+    if (plain.length) badgeQueue.push({ node: id, text: counted(plain, 'running', 'running'), tone: 'info', title: title(plain) });
     if (done.length) badgeQueue.push({ node: id, text: counted(done, 'done', 'done'), tone: 'done', title: title(done) });
   }
 
@@ -784,7 +796,7 @@ export function placeOverlay(view: NetworkView, layout: ViewLayout, overlay: Ove
     const width = reasonWidth(text);
     // Nearest free spot around the marker: above and below first, then beside it.
     const candidates: Box[] = [];
-    for (const distance of [12, 30, 52, 76]) {
+    for (const distance of [12, 30, 52, 76, 104, 136]) {
       for (const shift of [0, -0.35, 0.35, -0.6, 0.6]) {
         candidates.push(
           { x: marker.x - width / 2 + shift * width, y: marker.y - distance - REASON_HEIGHT, width, height: REASON_HEIGHT },
@@ -1062,20 +1074,20 @@ export interface LegendEntry {
 /** The keys for what this view (and result) actually draws. */
 export function legendEntries(view: NetworkView, overlay?: OverlayModel, placement?: OverlayPlacement): LegendEntry[] {
   const has = (kind: NetNode['kind']): boolean => view.nodes.some((node) => node.kind === kind);
-  const items: LegendItem[] = [
+  const items: LegendItem[] = view.language === 'cspm' ? cspmLegend(view) : [
     { label: 'process', width: 26, draw: (x) => `<rect class="pj-box" x="${x}" y="4" width="22" height="14" rx="4"/>` },
     { label: 'par', width: 26, draw: (x) => `<g class="pj-group-par"><rect class="pj-group-box" x="${x}" y="3" width="22" height="16" rx="5"/></g>` },
   ];
-  if (view.nodes.some((node) => node.replicated)) items.push({ label: 'par for (×N processes)', width: 30, draw: (x) => `<rect class="pj-stack" x="${x + 6}" y="6" width="22" height="13" rx="4"/><rect class="pj-box" x="${x}" y="2" width="22" height="13" rx="4"/>` });
-  items.push(
+  if (view.language !== 'cspm' && view.nodes.some((node) => node.replicated)) items.push({ label: 'par for (×N processes)', width: 30, draw: (x) => `<rect class="pj-stack" x="${x + 6}" y="6" width="22" height="13" rx="4"/><rect class="pj-box" x="${x}" y="2" width="22" height="13" rx="4"/>` });
+  if (view.language !== 'cspm') items.push(
     { label: 'channel (writer → reader)', width: 30, draw: (x) => `<path class="pj-legend-line" d="M${x},11 H${x + 22}"/><path class="pj-arrow" d="M${x + 20},7 L${x + 28},11 L${x + 20},15 Z"/>` },
     { label: 'conditional', width: 30, draw: (x) => `<path class="pj-legend-line" d="M${x},11 H${x + 28}" stroke-dasharray="7 4"/>` },
     { label: 'unknown', width: 30, draw: (x) => `<path class="pj-legend-line pj-legend-faint" d="M${x},11 H${x + 28}" stroke-dasharray="2 4"/>` },
   );
-  if (has('junction')) items.push({ label: 'shared side', width: 14, draw: (x) => `<circle class="pj-junction" cx="${x + 6}" cy="11" r="5"/>` });
-  if (has('barrier')) items.push({ label: 'barrier', width: 26, draw: (x) => `<rect class="pj-barrier-box" x="${x}" y="4" width="22" height="14" rx="7"/>` });
+  if (view.language !== 'cspm' && has('junction')) items.push({ label: 'shared side', width: 14, draw: (x) => `<circle class="pj-junction" cx="${x + 6}" cy="11" r="5"/>` });
+  if (view.language !== 'cspm' && has('barrier')) items.push({ label: 'barrier', width: 26, draw: (x) => `<rect class="pj-barrier-box" x="${x}" y="4" width="22" height="14" rx="7"/>` });
   if (view.edges.some((edge) => edge.tags.includes('not enrolled'))) items.push({ label: 'syncs, not enrolled', width: 30, draw: (x) => `<path class="pj-legend-unenrolled" d="M${x},11 H${x + 28}"/>` });
-  if (has('port')) items.push({ label: 'parameter (the caller)', width: 26, draw: (x) => `<path class="pj-port-box" d="M${x + 3},4 H${x + 17} L${x + 23},11 L${x + 17},18 H${x + 3} Q${x},18 ${x},15 V7 Q${x},4 ${x + 3},4 Z"/>` });
+  if (view.language !== 'cspm' && has('port')) items.push({ label: 'parameter (the caller)', width: 26, draw: (x) => `<path class="pj-port-box" d="M${x + 3},4 H${x + 17} L${x + 23},11 L${x + 17},18 H${x + 3} Q${x},18 ${x},15 V7 Q${x},4 ${x + 3},4 Z"/>` });
   if (has('stub')) items.push({ label: 'no writer / no reader drawn', width: 26, draw: (x) => `<rect class="pj-stub-box" x="${x}" y="4" width="22" height="14" rx="7"/>` });
   if (overlay) {
     const tones = new Set(placement?.outlines.map((outline) => outline.tone) ?? ['root', 'done']);
@@ -1095,6 +1107,24 @@ export function legendEntries(view: NetworkView, overlay?: OverlayModel, placeme
     if (placement?.callouts.some((callout) => callout.tone === 'loop')) items.push({ label: 'repeats forever', width: 30, draw: (x) => `<path class="pj-legend-loop" d="M${x},11 H${x + 28}"/>` });
   }
   return items.map((item) => ({ svg: `${item.draw(0)}<text class="pj-legend-text" x="${num(item.width + 6)}" y="15">${escapeXml(item.label)}</text>`, width: item.width + 6 + textWidth(item.label, 11) + 18 }));
+}
+
+/** The keys of a CSPm file's network: processes, compositions and the events they share. */
+function cspmLegend(view: NetworkView): LegendItem[] {
+  const has = (kind: NetNode['kind']): boolean => view.nodes.some((node) => node.kind === kind);
+  const tagged = (tag: string): boolean => view.edges.some((edge) => edge.tags.includes(tag));
+  const items: LegendItem[] = [
+    { label: 'process', width: 26, draw: (x) => `<rect class="pj-box" x="${x}" y="4" width="22" height="14" rx="4"/>` },
+    { label: 'composition', width: 26, draw: (x) => `<g class="pj-group-par"><rect class="pj-group-box" x="${x}" y="3" width="22" height="16" rx="5"/></g>` },
+  ];
+  if (view.nodes.some((node) => node.replicated)) items.push({ label: 'replicated (×N processes)', width: 30, draw: (x) => `<rect class="pj-stack" x="${x + 6}" y="6" width="22" height="13" rx="4"/><rect class="pj-box" x="${x}" y="2" width="22" height="13" rx="4"/>` });
+  if (view.edges.some((edge) => edge.kind === 'channel' && !edge.tags.includes('undirected'))) items.push({ label: 'output ! → input ?', width: 30, draw: (x) => `<path class="pj-legend-line" d="M${x},11 H${x + 22}"/><path class="pj-arrow" d="M${x + 20},7 L${x + 28},11 L${x + 20},15 Z"/>` });
+  if (tagged('undirected')) items.push({ label: 'synchronise', width: 30, draw: (x) => `<path class="pj-legend-line" d="M${x},11 H${x + 28}"/>` });
+  if (tagged('hidden')) items.push({ label: 'hidden (internal)', width: 30, draw: (x) => `<path class="pj-legend-line" d="M${x},11 H${x + 28}" stroke-opacity="0.5"/>` });
+  if (view.edges.some((edge) => edge.confidence === 'conditional')) items.push({ label: 'not certain', width: 30, draw: (x) => `<path class="pj-legend-line" d="M${x},11 H${x + 28}" stroke-dasharray="7 4"/>` });
+  if (has('barrier')) items.push({ label: '3+ take part together', width: 26, draw: (x) => `<rect class="pj-barrier-box" x="${x}" y="4" width="22" height="14" rx="7"/>` });
+  if (has('port')) items.push({ label: 'the environment', width: 26, draw: (x) => `<path class="pj-port-box" d="M${x + 3},4 H${x + 17} L${x + 23},11 L${x + 17},18 H${x + 3} Q${x},18 ${x},15 V7 Q${x},4 ${x + 3},4 Z"/>` });
+  return items;
 }
 
 /** Legend entries wrapped into rows that fit `width`. */

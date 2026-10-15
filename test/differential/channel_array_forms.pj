@@ -1,0 +1,37 @@
+// outcome: runs
+import std.*;
+// Every channel-array form this ProcessJ build compiles and runs correctly: a declaration
+// with 'new chan<T>[n]' (Java or C style), ends of elements passed as arguments, whole
+// arrays passed as 'chan<T>[]' parameters, direct writes, reads stored with a plain
+// assignment, alt guards on elements, two-dimensional arrays and array literals.
+void w(chan<int>.write o, int v) { o.write(v); }
+void r(chan<int>.read i) { int x; x = i.read(); println(x); }
+void wr(chan<int>[] cs, int n) { for (int k = 0; k < n; k++) cs[k].write(k + 100); }
+void rd(chan<int>[] cs, int k) { int x; x = cs[k].read(); println(x); }
+public void main(string[] args) {
+    chan<int>[] cs = new chan<int>[3];
+    chan<int> ds[] = new chan<int>[2];
+    chan<int>[][] grid = new chan<int>[2][2];
+    chan<int> a, b;
+    chan<int>[] lit = { a, b };
+    int x;
+    int k = 1;
+    par {
+        wr(cs, 3);
+        rd(cs, 0);
+        r(cs[1].read);
+        rd(cs, 2);
+    }
+    par {
+        par for (int i = 0; i < 2; i++) w(ds[i].write, i);
+        par for (int j = 0; j < 2; j++) r(ds[j].read);
+    }
+    par { ds[k].write(5); x = ds[1].read(); }
+    println(x);
+    par { w(grid[1][0].write, 4); r(grid[1][0].read); }
+    par { w(lit[1].write, 6); r(b.read); }
+    par {
+        w(cs[1].write, 9);
+        alt { x = cs[0].read() : println(x); x = cs[1].read() : println(x); }
+    }
+}

@@ -13,8 +13,9 @@
  * network leaf is which process instance (src/verification.ts identities),
  * which channel is which declaration and which assertion is which check.
  */
-export { translateProgram, translateProcedure, type CspUnit, type TranslateInput } from './translate';
+export { drawnArguments, translateProgram, translateProcedure, type CspUnit, type TranslateInput } from './translate';
 export type {
+  CheckedWith,
   CspAssertion,
   CspChannelInfo,
   CspConstructor,

@@ -1,0 +1,132 @@
+/**
+ * FDR on a CSPm file as it is: `refines --format=framed_json --divide` on a
+ * private copy of the buffer (so unsaved edits are what is checked, and an
+ * `include` still finds the files next to the original), then the answers
+ * explained onto the drawn network (src/cspm/explain.ts). Also FDR's own
+ * type check, for diagnostics. Independent of the LSP connection.
+ */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { makePrivateDir, removePrivateDir } from '../compiler';
+import { absoluteIncludes } from '../csp/check';
+import { findRefines, refinesNotFoundMessage, runRefines, type FdrResult, type FdrRun } from '../csp/fdr';
+import type { Span } from '../parser/ast';
+import type { VerificationReport } from '../verification';
+import type { CspmDocument } from './document';
+import { assertionKey, cspmAssertions, explainCspm } from './explain';
+
+export interface CspmCheckRequest {
+  document: CspmDocument;
+  refines?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  memoryLimit?: number;
+  workers?: number;
+  /** Where to write the copy FDR runs (kept); a private temporary directory otherwise. */
+  cspFile?: string;
+  onProgress?: (done: number, total: number, label: string, result: FdrResult) => void;
+}
+
+export interface CspmCheck {
+  report: VerificationReport;
+  run?: FdrRun;
+  /** The copy FDR ran, when it was kept. */
+  cspFile?: string;
+}
+
+/** The directory of the document on disk (for its includes), if it has one. */
+export function documentDirectory(uri: string): string | undefined {
+  try {
+    return path.dirname(fileURLToPath(uri));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Check a CSPm document's own assertions with FDR and explain the answers. */
+export async function checkCspmWithFdr(req: CspmCheckRequest): Promise<CspmCheck> {
+  const doc = req.document;
+  const explainOf = (run: FdrRun | undefined, notRun?: string): VerificationReport => explainCspm({
+    uri: doc.uri,
+    ...(doc.version !== undefined ? { documentVersion: doc.version } : {}),
+    text: doc.text,
+    file: doc.file,
+    globals: doc.globals,
+    viewFor: (assertion) => doc.viewForAssertion(assertion),
+    ...(run ? { run } : {}),
+    ...(notRun ? { notRun } : {}),
+  });
+  const refines = req.refines ?? findRefines();
+  if (!refines) return { report: explainOf(undefined, refinesNotFoundMessage()) };
+  const temp = req.cspFile ? undefined : makePrivateDir('processj-fdr-csp-');
+  const file = req.cspFile ?? path.join(temp!, safeName(doc.title));
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const base = documentDirectory(doc.uri);
+    fs.writeFileSync(file, base ? absoluteIncludes(doc.text, base) : doc.text);
+    const assertions = cspmAssertions(doc.file);
+    let done = 0;
+    const run = await runRefines(refines, file, {
+      timeoutMs: req.timeoutMs,
+      signal: req.signal,
+      memoryLimit: req.memoryLimit,
+      workers: req.workers,
+      onResult: (_index, result) => {
+        const a = assertions.find((x) => assertionKey(x.text) === assertionKey(result.assertion));
+        if (a) req.onProgress?.(++done, assertions.length, a.text, result);
+      },
+    });
+    return { report: explainOf(run), run, ...(temp ? {} : { cspFile: file }) };
+  } finally {
+    if (temp) removePrivateDir(temp, true);
+  }
+}
+
+/** FDR's type check of a document: its errors, each at a span of the document when FDR names one in it. */
+export async function typecheckCspm(document: CspmDocument, refines: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<Array<{ message: string; span?: Span; file?: string }>> {
+  const temp = makePrivateDir('processj-fdr-tc-');
+  try {
+    const file = path.join(temp, safeName(document.title));
+    const base = documentDirectory(document.uri);
+    fs.writeFileSync(file, base ? absoluteIncludes(document.text, base) : document.text);
+    const run = await runRefines(refines, file, { typecheckOnly: true, timeoutMs: opts.timeoutMs ?? 20_000, signal: opts.signal });
+    if (run.aborted) return [];
+    return fdrErrors([...run.errors, ...run.results.flatMap((result) => result.errors)], path.basename(file));
+  } finally {
+    removePrivateDir(temp, true);
+  }
+}
+
+/**
+ * FDR's error messages with their locations: `model.csp:3:5-6: b is not in
+ * scope` is at line 3, columns 5 to 6 of the file named; a message about
+ * another file (an include) keeps the file's name.
+ */
+export function fdrErrors(errors: readonly string[], ownName: string): Array<{ message: string; span?: Span; file?: string }> {
+  const out: Array<{ message: string; span?: Span; file?: string }> = [];
+  // One string can hold several errors, each starting on a line of its own with its location.
+  const split = errors.flatMap((raw) => raw.split(/\n(?=[^\n:]*\.csp:\d+:\d+)/));
+  for (const raw of split) {
+    const text = raw.replace(/\s*Lexical call stack:[\s\S]*$/, '').trim();
+    if (!text) continue;
+    const m = /^(?:\.\/)?(.+?\.csp):(\d+):(\d+)(?:-(\d+)(?::(\d+))?)?:\s*([\s\S]*)$/.exec(text);
+    if (!m) {
+      out.push({ message: text.replace(/^<unknown location>:\s*/, '').replace(/\s+/g, ' ') });
+      continue;
+    }
+    const message = m[6].replace(/\s+/g, ' ').trim();
+    const line = Number(m[2]) - 1;
+    const col = Number(m[3]) - 1;
+    // `3:5-6` ends on the same line; `3:5-4:2` on another.
+    const end = m[5] !== undefined ? { line: Number(m[4]) - 1, col: Number(m[5]) - 1 } : { line, col: m[4] !== undefined ? Number(m[4]) - 1 : col + 1 };
+    const span = { start: { line, col }, end: end.line > line || end.col > col ? end : { line, col: col + 1 } };
+    out.push(path.basename(m[1]) === ownName ? { message, span } : { message, file: m[1], span });
+  }
+  return out;
+}
+
+function safeName(title: string): string {
+  const base = path.basename(title).replace(/[^A-Za-z0-9_.-]/g, '_');
+  return base.endsWith('.csp') ? base : `${base || 'model'}.csp`;
+}

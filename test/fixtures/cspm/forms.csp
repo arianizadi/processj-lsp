@@ -1,0 +1,17 @@
+-- Assertion forms FDR prints back differently from how they are written.
+channel a, b, c
+channel d : {0..1}
+
+P = a -> b -> P
+R(i) = d.i -> R(i)
+T = a -> b -> STOP [] a -> c -> STOP
+
+assert P :[livelock free]
+assert P :[divergence-free]
+assert P :[has trace [T]]: <a,b>
+assert STOP [T= ||| i : {0..1} @ R(i)
+assert P {- a comment -} [F= P
+assert not P [T= STOP
+assert not STOP [T= P
+assert T :[has trace [T]]: <a, c>
+assert T :[has trace]: <a, c>

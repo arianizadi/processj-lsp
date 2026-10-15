@@ -37,7 +37,7 @@ export interface Settings {
 }
 
 export type FdrShowGraph = 'onFailure' | 'always' | 'never';
-const FDR_SHOW_GRAPH: readonly FdrShowGraph[] = ['onFailure', 'always', 'never'];
+const FDR_SHOW_GRAPH: readonly FdrShowGraph[] = ['always', 'onFailure', 'never'];
 
 export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   installDir: undefined,
@@ -53,7 +53,7 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = Object.freeze({
   fdrTimeoutMs: 120_000,
   fdrMemoryMb: 0,
   fdrWorkers: 1,
-  fdrShowGraph: 'onFailure',
+  fdrShowGraph: 'always',
 });
 
 export function normalizeSettings(value: unknown): Settings {

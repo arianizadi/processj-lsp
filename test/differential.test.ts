@@ -4,6 +4,9 @@ import * as path from 'node:path';
 import { test } from 'node:test';
 import { check } from '../src/checker/checker';
 import { DeclIndex } from '../src/checker/index';
+import { translateProgram } from '../src/csp/index';
+import { COMPILED_DIFFERS } from '../src/csp/explain';
+import { loadProgram } from '../src/csp/load';
 import { parse } from '../src/parser/parser';
 
 const DIR = path.join(__dirname, '..', '..', 'test', 'differential');
@@ -16,7 +19,7 @@ const MAY_DEADLOCK = new Set(['pj/shared-unlocked-end']);
  * Each program records what the real compiler and runtime did with it: `// outcome: runs` (built and
  * finished), `runs-wrong` (builds and runs, but wrong; kept as a corpus, no claim is checked), `error`
  * (does not build: an error must say so), `compiler-limit` (crashes the compiler: a limit note must say
- * so), or `deadlocks` (builds but never finishes: a blocking or may-deadlock warning must say so). The checker must never claim that a program that runs
+ * so), or `deadlocks` (builds but never finishes: a blocking or may-deadlock warning must say so, or the translation names the miscompilation). The checker must never claim that a program that runs
  * blocks or has an error. `npm run validate test/differential` re-derives the outcomes.
  */
 test('the checker never contradicts a program that really runs', () => {
@@ -42,7 +45,9 @@ test('the checker never contradicts a program that really runs', () => {
     if (outcome === 'runs' && claims.length) problems.push(`${f} runs, but the checker says: ${claims.map((d) => `L${d.line + 1} ${d.code}`).join(', ')}`);
     if (outcome === 'compiler-limit' && !r.diagnostics.some((d) => d.code === 'pj/compiler-limit')) problems.push(`${f} cannot be built by this compiler, but nothing in the file says so`);
     if (outcome === 'error' && !r.diagnostics.some((d) => d.severity === 'error')) problems.push(`${f} does not build, but the checker reports no error`);
-    if (outcome === 'deadlocks' && !r.diagnostics.some((d) => BLOCKING.has(d.code ?? '') || MAY_DEADLOCK.has(d.code ?? ''))) problems.push(`${f} builds but never finishes, and nothing in the file warns about it`);
+    // A hang only elaboration can see (`compiler/empty-par-for`) is named by the translation instead.
+    const named = (): boolean => translateProgram((({ units, index: ix }) => ({ units, index: ix }))(loadProgram(path.join(DIR, f), INCLUDE, src))).warnings.some((w) => w.code?.startsWith('compiler/') && COMPILED_DIFFERS.has(w.code));
+    if (outcome === 'deadlocks' && !r.diagnostics.some((d) => BLOCKING.has(d.code ?? '') || MAY_DEADLOCK.has(d.code ?? '')) && !named()) problems.push(`${f} builds but never finishes, and nothing in the file or its translation warns about it`);
   }
   assert.deepEqual(problems, []);
 });

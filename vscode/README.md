@@ -31,9 +31,9 @@ Open a `.pj` file and use any of:
 - **ProcessJ: Show Protocol Flow** for inheritance, case coverage and observed message producers/consumers
 - **ProcessJ: Show Procedure Effects** for direct and transitive channel, blocking, parallel, timer and mobile effects
 - **ProcessJ: Convert to CSP** to write the program (or one procedure) as CSPm next to the file, for FDR
-- **ProcessJ: Check with FDR** (or the **FDR: check** lens) to have FDR check deadlock freedom, runtime errors and
-  termination: when a check fails the graph panel opens on the counterexample (`processj.fdrShowGraph`:
-  `onFailure`, `always` or `never`; otherwise a report tells it step by step), stuck statements get diagnostics
+- **ProcessJ: Check with FDR** (or the **FDR: check & show graph** lens) to have FDR check deadlock freedom, runtime errors and
+  termination: the graph panel opens on the result, with the stuck processes marked (`processj.fdrShowGraph`:
+  `always`, `onFailure` or `never`; a report also tells it step by step), stuck statements get diagnostics
   saying who could have answered them (also a write that waits forever while the rest of the program keeps
   running), hovering one explains it, and its **Quick Fix…** menu has **Show in graph**. The lens then shows the
   verdict (`FDR: deadlock (4 steps)`, or `FDR: no deadlock, 11 states; the compiled program may differ`) and opens
@@ -41,6 +41,11 @@ Open a `.pj` file and use any of:
   relies on what the model abstracts says so in the panel. The check's notification has a **Cancel** button
   (or use **ProcessJ: Cancel FDR Check**). Needs [FDR4](https://cocotec.io/fdr/); set `processj.fdrPath` if it is
   not found
+- open a `.csp` file (language **CSPm**, highlighted by a small grammar), hand-written or made by Convert to CSP:
+  **ProcessJ: Show Concurrency Graph** draws its process network (the operands of each parallel composition, and
+  the events they share), and **ProcessJ: Check with FDR** (or the lens on an `assert`) runs the file's own
+  assertions and shows the result on that network, as diagnostics and as the lens's verdict. No ProcessJ analysis
+  runs on a `.csp` file
 - channel inlay hints and effect/protocol code lenses; hover any procedure or channel for the detailed summary
 - **Quick Fix…** on a diagnostic, or a selection, for conservative channel repairs, procedure extraction and safe `par` conversion
 - the ProcessJ language-status entry to see whether the server is ready and open its output

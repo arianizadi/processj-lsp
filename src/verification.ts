@@ -53,6 +53,12 @@ export interface ProcessRef {
    * `reindeer(1, …)`): the name the producer's own sentences use.
    */
   name?: string;
+  /**
+   * What the canvas calls the process next to an arrow, where room is short,
+   * when the producer knows better than shortening its label (a CSPm process
+   * keeps its arguments: `PHIL(2)`, not `PHIL`).
+   */
+  short?: string;
 }
 
 export interface ChannelRef {
@@ -64,6 +70,11 @@ export interface ChannelRef {
   owner: ProcessPath;
   /** Which user of a shared side took part, when the producer distinguishes them. */
   user?: string;
+  /**
+   * An element of an array of channels: its index. `name` then names the
+   * element (`chans[2]`) and `declaration` is the array's declarator.
+   */
+  index?: number;
 }
 
 /** One operation a process is stuck on. An alt waits on several at once. */
@@ -89,6 +100,12 @@ export interface ProcessSnapshot {
   at?: SourceRef;
   waits?: WaitInfo[];
   description: string;
+  /**
+   * What the canvas shows on the box, when the status alone says too little
+   * (a CSPm process that can perform the event a specification refuses:
+   * `can do left.1`). The description says it in full.
+   */
+  badge?: string;
   /**
    * The producer's own names for the states the process went through, in
    * order, when it has them (FDR: the model's per-blocking-point
@@ -162,8 +179,12 @@ export interface CheckOutcome {
   property: CheckProperty;
   /** `Deadlock freedom`, `No runtime errors`, `Terminates`, or the user's assertion. */
   label: string;
-  /** A whole program (`main`) or one procedure checked on its own. */
-  target: { kind: 'program' | 'procedure'; name: string; at?: SourceRef };
+  /**
+   * A whole program (`main`) or one procedure checked on its own. `arguments`:
+   * a procedure whose data parameters decide its network is checked with the
+   * values its calls give (`size = 6 (the call at line 75)`).
+   */
+  target: { kind: 'program' | 'procedure'; name: string; at?: SourceRef; arguments?: string };
   status: 'passed' | 'failed' | 'error' | 'timeout' | 'cancelled' | 'skipped';
   /** How a failure should be presented: termination and determinism are informational, not defects. */
   severity: 'error' | 'warning' | 'info';

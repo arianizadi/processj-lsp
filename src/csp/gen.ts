@@ -49,6 +49,11 @@ export interface GenOptions {
   reach?(proc: ProcIR): Reach | undefined;
 }
 
+/** The CSPm set of what a fork carries after the instance, per instance when it is instanced (translate.ts). */
+export function forkSetName(fork: string): string {
+  return fork.replace(/^pj_fork_/, 'pj_forkset_');
+}
+
 /** A bookkeeping channel a procedure needs declared: fork or join of a par branch, with its payload. */
 export interface ForkChannel {
   name: string;
@@ -66,6 +71,8 @@ export interface ForkChannel {
   payload: DType[];
   /** ProcessJ names of the payload fields (`l`; `first iteration`, `last iteration` for a par for's computed bounds). */
   fields: string[];
+  /** For a fork: the CSPm variables the payload carries, in order (after the bounds). */
+  vars?: string[];
   instanced: boolean;
 }
 
@@ -439,7 +446,7 @@ class Generator implements PreparedProc {
             const used = callee ? this.opts.calleeUses?.(callee) : undefined;
             n.call.args.forEach((a, i) => {
               if (used && !used.has(i)) return;
-              for (const e of [a.value, a.barrier, a.chan?.ch, a.chan?.ack]) if (e) for (const v of freeVars(e)) li.add(v);
+              for (const e of [a.value, a.barrier, a.chan?.ch, a.chan?.ack, a.chan?.len]) if (e) for (const v of freeVars(e)) li.add(v);
             });
             for (const v of lo) if (v !== n.ret) li.add(v);
             if (callee && this.opts.needsInstance(callee)) {
@@ -709,6 +716,7 @@ class Generator implements PreparedProc {
       bounds: bounded ? [rangeText(lo, hi + 1), rangeText(lo - 1, hi)] : undefined,
       payload: payload.map((v) => this.typeOfVar(v)),
       fields: [...(bounded ? ['first iteration', 'last iteration'] : []), ...payload.map((v) => this.varName(v))],
+      vars: payload,
       instanced: this.instanced,
     });
     if (par.kind === 'par') {
@@ -832,7 +840,11 @@ class Generator implements PreparedProc {
     const join = this.joinName(par, branch);
     const bounds = par.kind === 'par-for' && par.iter && !par.iter.values ? ['pj_lo', 'pj_hi'] : [];
     // The fork carries what every branch needs: this one binds its own and ignores the rest.
-    const inputs = [...bounds, ...payload.map((v) => (ins.includes(v) ? v : '_'))].map((v) => `?${v}`).join('');
+    // It takes only what its parent can send in this instance (translate.ts declares forkSetName):
+    // FDR compiles a slot on its own for every value its input allows, and a value no parent sends
+    // could reach an inner fork or instance function elaboration never prepared.
+    const fields = [...bounds, ...payload.map((v) => (ins.includes(v) ? v : '_'))];
+    const inputs = fields.length ? `?${fields.join('.')}:${forkSetName(fork)}${this.instanced ? '(pj_h)' : ''}` : '';
     const env = identity([...params, ...ins]);
     const bounded = bounds.length > 0 && !!par.iter;
     const run = this.recording(name, () => this.along({ ops: [{ kind: 'fork', at: this.ref(par.stmt.span) }] }, () => {
@@ -1152,7 +1164,7 @@ class Generator implements PreparedProc {
     // Arguments in the order of the callee's entry definition (dead parameters are not passed).
     const checks: Array<{ value: Ex; err: string }> = [];
     for (const name of this.opts.entryParams(callee)) {
-      const i = callee.params.findIndex((p) => p.cspm === name || p.ack === name || p.take === name || p.done === name);
+      const i = callee.params.findIndex((p) => p.cspm === name || p.ack === name || p.take === name || p.done === name || p.len === name);
       const p = callee.params[i];
       const a = n.call.args[i];
       if (!p || !a) {
@@ -1161,8 +1173,9 @@ class Generator implements PreparedProc {
       }
       if (p.role === 'channel') {
         const c = a.chan;
-        const part = p.ack === name ? c?.ack : p.take === name ? c?.take : p.done === name ? c?.done : c?.ch;
-        args.push(val(part ?? c?.ch ?? E.any));
+        // A channel array's length is data: it goes through the length check like any integer argument.
+        const part = p.ack === name ? c?.ack : p.take === name ? c?.take : p.done === name ? c?.done : p.len === name ? c?.len : c?.ch;
+        args.push(val(part ?? (p.len === name ? E.any : c?.ch) ?? E.any));
       }
       else if (p.role === 'barrier') args.push(val(a.barrier ?? E.any));
       else {

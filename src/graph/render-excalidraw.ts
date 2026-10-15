@@ -121,7 +121,7 @@ export function excalidrawInput(view: NetworkView, layout: ViewLayout, options: 
       points: laid.points.map((point): [number, number] => [point.x, point.y]),
       label: edge.label && laid.label ? { text: edge.label, ...laid.label } : undefined,
       style: edge.kind === 'barrier' || edge.confidence === 'conditional' ? 'dashed' : edge.confidence === 'unknown' ? 'dotted' : 'solid',
-      arrow: edge.kind === 'channel' && target?.kind !== 'junction',
+      arrow: edge.kind === 'channel' && target?.kind !== 'junction' && !edge.tags.includes('undirected'),
       barrier: edge.kind === 'barrier',
       warn: edge.tags.includes('not enrolled'),
       state: edgeState.get(edge.id),

@@ -33,9 +33,9 @@ test('initialization settings use safe defaults and bounded numeric values', () 
     fdrTimeoutMs: 1_000,
     fdrMemoryMb: 0,
     fdrWorkers: 2,
-    fdrShowGraph: 'onFailure',
+    fdrShowGraph: 'always',
   });
   assert.equal(normalizeSettings({ liveViewer: false }).liveViewer, false);
   // When Check with FDR opens the graph: one of three words, anything else is the default.
-  assert.deepEqual(['always', 'never', 'onFailure', 'Always', 1].map((value) => normalizeSettings({ fdrShowGraph: value }).fdrShowGraph), ['always', 'never', 'onFailure', 'onFailure', 'onFailure']);
+  assert.deepEqual(['always', 'never', 'onFailure', 'Always', 1].map((value) => normalizeSettings({ fdrShowGraph: value }).fdrShowGraph), ['always', 'never', 'onFailure', 'always', 'always']);
 });

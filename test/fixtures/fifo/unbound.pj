@@ -1,0 +1,48 @@
+import std.*;
+// Procedures whose arguments decide their network, and no call from main fixes them: checked
+// on their own with every modelled value that elaborates, or with what a //@csp check names.
+
+public void id(chan<int>.read in, chan<int>.write out) {
+    int v = in.read();
+    out.write(v);
+}
+
+// Every size elaborates: 0 and 1 are one stage, 2 is two.
+public void chain(int size, chan<int>.read in, chan<int>.write out) {
+    if (size <= 1)
+        id(in, out);
+    else {
+        chan<int> middle;
+        par {
+            id(in, middle.write);
+            chain(size - 1, middle.read, out);
+        }
+    }
+}
+
+// Never stops calling itself: no value elaborates.
+public void grow(int n, chan<int>.read in, chan<int>.write out) {
+    chan<int> middle;
+    par {
+        id(in, middle.write);
+        grow(n + 1, middle.read, out);
+    }
+}
+
+// An array of channels no call gives: every length that elaborates.
+public void stages(chan<int>[] cs, chan<int>.read in) {
+    par for (int i = 0; i < cs.size; i++) {
+        {
+            int v = in.read();
+            cs[i].write(v);
+        }
+    }
+}
+
+//@csp check named(3)
+public void named(int size, chan<int>.read in, chan<int>.write out) {
+    chain(size, in, out);
+}
+
+public void main(string[] args) {
+}

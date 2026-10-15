@@ -28,11 +28,12 @@
 import type * as A from '../parser/ast';
 import type { EffectAnalysis } from '../checker/effects';
 import type { ChannelRef, ProcessPath, ProcessRef, SourceRef, SpawnSite } from '../verification';
-import { show, type Ex } from './cspm';
+import { E, show, type Ex } from './cspm';
 import type { GeneratedProc } from './gen';
-import type { ChanUse, LocalResource, Node, ParIR, ProcIR, Region } from './lower';
+import { nodeSuccessors, type ChanUse, type LocalResource, type Node, type ParIR, type ProcIR, type Region } from './lower';
 import type { CspNetworkNode, CspProcessInfo, CspUse } from './model';
 import { siteKey } from './reach';
+import { fixedParams } from './structure';
 
 /** What a static variable (channel, ack, barrier parameter) of a procedure instance is bound to. */
 export interface Binding {
@@ -41,7 +42,21 @@ export interface Binding {
   /** Profile key of the resource (channels only). */
   resource?: string;
   ref?: ChannelRef;
+  /**
+   * A whole array of channels: the resource key and identity of the array
+   * declaration instance, and its length when elaboration knows it.
+   */
+  array?: { resource: string; ref: ChannelRef; size?: number };
+  /** An element of an array of channels: its index (the CSPm event is `value.k`). */
+  element?: number;
+  /** A channel with an identity of its own under its event prefix (an element, a recursive procedure instance's channel). */
+  part?: boolean;
+  /** An element whose index is only known at runtime: any of these. */
+  alts?: Binding[];
 }
+
+/** A value elaboration knows for a variable of a procedure instance (a parameter no statement changes, a loop variable of a par for). */
+type Known = ReadonlyMap<string, number | boolean>;
 
 export interface Instance {
   proc: ProcIR;
@@ -49,6 +64,8 @@ export interface Instance {
   bindings: Map<string, Binding>;
   /** Path of the procedure instance: owner of its locals, prefix of its slots. */
   path: ProcessPath;
+  /** Data parameters whose value is known here (the call's arguments were). */
+  values?: Known;
 }
 
 export interface Leaf {
@@ -59,6 +76,8 @@ export interface Leaf {
   barrier?: ChannelRef;
   /** For servers: the resource key of what they serve. */
   resource?: string;
+  /** The known arguments of the call this process runs (`size = 4`; CspProcessInfo.known). */
+  known?: string;
   channels: Map<string, ChannelRef>;
   reads: Set<string>;
   writes: Set<string>;
@@ -107,6 +126,17 @@ export interface NetworkInput {
   /** Bindings of the root's static parameters (procedure checks) and text of its data arguments. */
   rootBindings: Map<string, Binding>;
   rootArgs: string[];
+  /**
+   * A checked procedure whose data parameters decide its network (recursion
+   * depth, array lengths, par for counts) is elaborated once per argument
+   * tuple: each instance is a network of its own (`PJ_NET_1`, ...), with the
+   * values elaboration knows for its root (by CSPm name, a channel array's
+   * length included), bindings of its own (channel-array parameters) and the
+   * data arguments it still takes (its definition's parameters).
+   */
+  rootInstances?: RootInstance[];
+  /** Called at every call elaboration unfolds, with the arguments it knows there (call sites of a checked procedure). */
+  observe?: (call: ObservedCall) => void;
   /** What the root does when its procedure returns (default `pj_end -> STOP`). */
   rootContinuation?: string;
   rootLabel: string;
@@ -122,6 +152,34 @@ export interface NetworkInput {
   /** Servers the translator composes around the network (a checked procedure's barrier parameters). */
   serversOutside?: boolean;
   sourceText(proc: ProcIR, span: A.Span): string | undefined;
+}
+
+export interface RootInstance {
+  values: ReadonlyMap<string, number | boolean>;
+  bindings?: ReadonlyMap<string, Binding>;
+  /** Data arguments left to the harness (`pj_call?x`): the CSPm names of the root definition's parameters. */
+  args: string[];
+  /** The text of the root's arguments, by CSPm name, for parameters fixed in this instance. */
+  fixed?: ReadonlyMap<string, string>;
+}
+
+export interface ObservedCall {
+  caller: ProcIR;
+  callee: ProcIR;
+  site: A.Invocation;
+  /** Arguments elaboration knows, by callee parameter index; a channel array's length under its parameter. */
+  values: Map<number, number | boolean>;
+  /** The call runs inside an instance of the callee (a recursive call): not a call site from outside. */
+  nested: boolean;
+}
+
+/** One elaborated root of a network (several for a procedure checked per argument tuple). */
+export interface NetworkInstance {
+  root: string;
+  params: string[];
+  tree: CspNetworkNode;
+  processes: CspProcessInfo[];
+  endsItself: boolean;
 }
 
 export interface Network {
@@ -143,12 +201,34 @@ export interface Network {
   barrierMax: number;
   /** `resources`: the channel resources involved, so the translator can retry with mediated channels. */
   unsupported: Array<{ message: string; proc: ProcIR; at: A.Span; resources?: string[] }>;
+  /** `code`: where this ProcessJ build does not do what the language says and the model follows the language (explain.ts COMPILED_DIFFERS). */
+  warnings: Array<{ message: string; proc: ProcIR; at: A.Span; code: string }>;
+  /** Arrays of channels: the largest length any instance gives each declaration (its CSPm index set). */
+  arraySizes: Map<LocalResource, number>;
+  /**
+   * Per par, per field of its fork event after the instance (a par for's
+   * computed bounds, then the payload): every value a parent sends there,
+   * when elaboration knows them all (undefined: any value of its type). FDR
+   * compiles each slot on its own for every value its fork channel allows,
+   * so the translator declares the fork channel with just these.
+   */
+  forkDomains: Map<ParIR, Array<Set<number | boolean> | undefined>>;
+  /**
+   * Per par, per instance of its procedure (0 when it is not instanced):
+   * every tuple of fork fields a parent there sends, a field elaboration
+   * does not know undefined (any value of its type). A slot takes only
+   * these (gen.ts forkSetName): the product of forkDomains' fields holds
+   * combinations no parent sends, for which nothing inside was elaborated.
+   */
+  forkTuples: Map<ParIR, Map<number, Array<Array<number | boolean | undefined>>>>;
   /**
    * The network is one process that ends by itself (its root ends in SKIP).
    * Otherwise nothing in it terminates and the program ends on the root's
    * `pj_end` (translate.ts wraps it in `[| {pj_end} |> SKIP`).
    */
   endsItself: boolean;
+  /** Every elaborated root, the first one also in `root`, `tree`, `processes` and `endsItself`. */
+  roots: NetworkInstance[];
 }
 
 export function buildNetwork(input: NetworkInput): Network {
@@ -159,21 +239,61 @@ class Builder {
   private readonly counts = new Map<ProcIR, number>();
   private readonly instanceClauses = new Map<string, string[]>();
   private readonly unsupported: Network['unsupported'] = [];
+  private readonly warnings: Network['warnings'] = [];
   private leaves = 0;
   private maxEnroll = 1;
   private barrierMax = 2;
   private readonly defs: string[] = [];
-  private readonly processes: CspProcessInfo[] = [];
+  /** The processes of the root instance being elaborated (each instance has its own). */
+  private processes: CspProcessInfo[] = [];
   private readonly defNames = new Set<string>();
+  private readonly arraySizes = new Map<LocalResource, number>();
+  private readonly forkDomains = new Map<ParIR, Array<Set<number | boolean> | undefined>>();
+  private readonly forkTuples = new Map<ParIR, Map<number, Array<Array<number | boolean | undefined>>>>();
+  private readonly unknownSizes = new Set<LocalResource>();
+  /** Recursive procedure instances being unfolded, innermost last (procedure and known arguments). */
+  private readonly unfolding: string[] = [];
+  private readonly fixedCache = new Map<ProcIR, Set<string>>();
 
   constructor(private readonly input: NetworkInput) {}
 
   build(): Network {
+    const specs: RootInstance[] = this.input.rootInstances?.length ? this.input.rootInstances : [{ values: new Map(), args: this.input.rootArgs }];
+    const built: NetworkInstance[] = specs.map((spec, k) => this.buildInstance(spec, specs.length > 1 ? `PJ_NET_${k + 1}` : 'PJ_NET'));
+    const instanceFunctions: string[] = [];
+    for (const [fn, clauses] of this.instanceClauses) instanceFunctions.push(...(clauses.length ? clauses : [`${fn}(_) = 0`]));
+    const first = built[0];
+    return {
+      definitions: this.defs,
+      root: first.root,
+      rootParams: first.params,
+      tree: first.tree,
+      processes: first.processes,
+      instanceFunctions,
+      instances: this.counts,
+      maxEnroll: this.maxEnroll,
+      barrierMax: this.barrierMax,
+      unsupported: this.unsupported,
+      warnings: this.warnings,
+      arraySizes: this.arraySizes,
+      forkDomains: this.forkDomains,
+      forkTuples: this.forkTuples,
+      endsItself: first.endsItself,
+      roots: built,
+    };
+  }
+
+  /** Elaborate the root once (with what this instance fixes) and compose its network under `rootName`. */
+  private buildInstance(spec: RootInstance, rootName: string): NetworkInstance {
     const { root } = this.input;
+    this.processes = [];
+    this.leafOf.clear();
     const h = this.alloc(root);
-    const instance: Instance = { proc: root, h, bindings: this.input.rootBindings, path: [] };
+    const bindings = new Map(this.input.rootBindings);
+    for (const [k, v] of spec.bindings ?? []) bindings.set(k, v);
+    const instance: Instance = { proc: root, h, bindings, path: [], ...(spec.values.size ? { values: spec.values } : {}) };
     const gen = this.input.generated.get(root)!;
-    const args = [...(this.input.needsInstance(root) ? [String(h)] : []), ...this.rootEntryArgs(gen), this.input.rootContinuation ?? 'pj_end -> STOP'];
+    const args = [...(this.input.needsInstance(root) ? [String(h)] : []), ...this.rootEntryArgs(gen, bindings, spec), this.input.rootContinuation ?? 'pj_end -> STOP'];
     const leaf = this.leaf('root', gen.entry, args, { path: [], label: this.input.rootLabel, procedure: root.decl.name.name });
     this.runRegion(leaf, instance, root.thread, [], []);
     const composed = this.compose(leaf, []);
@@ -190,40 +310,28 @@ class Builder {
       info.leaf = `${info.definition}(${leaf.args.join(', ')})`;
       text = info.leaf;
     }
-    const rootName = 'PJ_NET';
-    const params = this.input.rootArgs;
+    const params = spec.args;
     this.defs.push(`${rootName}${params.length ? `(${params.join(', ')})` : ''} = ${text}`);
-    const instanceFunctions: string[] = [];
-    for (const [fn, clauses] of this.instanceClauses) instanceFunctions.push(...(clauses.length ? clauses : [`${fn}(_) = 0`]));
     const full: CspNetworkNode = { kind: 'named', name: rootName, child: tree };
-    this.assignPositions(full, []);
-    return {
-      definitions: this.defs,
-      root: rootName,
-      rootParams: params,
-      tree: full,
-      processes: this.processes,
-      instanceFunctions,
-      instances: this.counts,
-      maxEnroll: this.maxEnroll,
-      barrierMax: this.barrierMax,
-      unsupported: this.unsupported,
-      endsItself,
-    };
+    const processes = this.processes;
+    assignPositions(processes, full, []);
+    return { root: rootName, params, tree: full, processes, endsItself };
   }
 
-  private assignPositions(node: CspNetworkNode, position: number[]): void {
-    assignPositions(this.processes, node, position);
-  }
-
-  private rootEntryArgs(gen: GeneratedProc): string[] {
+  private rootEntryArgs(gen: GeneratedProc, bindings: ReadonlyMap<string, Binding>, spec: RootInstance): string[] {
     const root = this.input.root;
     let data = 0;
+    const free = this.input.rootArgs;
     return gen.entryParams.map((p) => {
-      const b = this.input.rootBindings.get(p);
+      const b = bindings.get(p);
       if (b) return show(b.value);
+      const fixed = spec.fixed?.get(p);
+      if (fixed !== undefined) {
+        if (root.params.some((x) => x.cspm === p && x.role === 'value')) data++;
+        return fixed;
+      }
       const param = root.params.find((x) => x.cspm === p);
-      if (param && param.role === 'value') return this.input.rootArgs[data++] ?? p;
+      if (param && param.role === 'value') return free[data++] ?? p;
       return p;
     });
   }
@@ -235,7 +343,7 @@ class Builder {
   }
 
   private leaf(kind: Leaf['kind'], definition: string, args: string[], process?: ProcessRef): Leaf {
-    if (++this.leaves > this.input.maxProcesses) throw new TooBig(this.input.maxProcesses);
+    if (++this.leaves > this.input.maxProcesses) throw new TooBig(this.input.maxProcesses, this.unfolding.length ? this.unfolding[0].split('|')[0] : undefined);
     const leaf: Leaf = { kind, definition, args, process, channels: new Map(), reads: new Set(), writes: new Set(), events: new Map(), pars: [], servers: [], ownEvents: [], own: new Set(), paired: new Set(), subtree: [], declared: new Set(), size: 1, uses: [], enrolled: [] };
     leaf.subtree.push(leaf);
     return leaf;
@@ -250,12 +358,26 @@ class Builder {
    * uses, the pars it starts (their slots become children) and the calls it
    * makes (a callee that runs a par gets an instance whose code runs here).
    */
-  private runRegion(leaf: Leaf, inst: Instance, region: Region, prefix: ProcessPath, iterations: number[], stack: ProcIR[] = [], iterValues: ReadonlyMap<string, number> = new Map()): void {
+  private runRegion(leaf: Leaf, inst: Instance, region: Region, prefix: ProcessPath, iterations: number[], stack: ProcIR[] = [], outerValues: ReadonlyMap<string, number> = new Map()): void {
     const proc = inst.proc;
     const gen = this.input.generated.get(proc)!;
+    const iterValues = new Map(outerValues);
+    // Arrays of channels declared here: elaboration needs their length (which elements exist).
+    for (const local of proc.locals) {
+      if (local.region !== region || !local.array) continue;
+      leaf.declared.add(local.cspm);
+      const size = evaluate(local.array.size, this.known(inst, iterValues), this.input.intRange);
+      if (typeof size === 'number' && size >= 0) {
+        iterValues.set(local.array.len, size);
+        this.arraySizes.set(local, Math.max(size, this.arraySizes.get(local) ?? 0));
+      } else if (!this.unknownSizes.has(local)) {
+        this.unknownSizes.add(local);
+        this.unsupported.push({ message: `the length of the channel array '${local.name}' is not known before the program runs (it must follow from constants and from arguments known where the procedure is called): its channels cannot be laid out, so it is not modelled`, proc, at: local.ident.span });
+      }
+    }
     // Barriers and mediated channels declared by this code: their server lives at this process.
     for (const local of proc.locals) {
-      if (local.region !== region) continue;
+      if (local.region !== region || local.array) continue;
       if (local.kind === 'channel') for (const n of [local.cspm, local.ack, local.mediated?.take, local.mediated?.done]) if (n) leaf.declared.add(n);
       const ref = this.localRef(local, inst);
       const resource = this.resourceKey(local, inst, iterValues);
@@ -273,8 +395,10 @@ class Builder {
         leaf.servers.push({ kind: 'channel', events: names, args: names, ref, leaf: server });
       }
     }
+    // Code a condition elaboration can decide never runs here (the other side of `if (i == 0)` in iteration 0).
+    const live = this.liveNodes(proc, region, this.known(inst, iterValues));
     for (const n of proc.nodes) {
-      if (n.region !== region) continue;
+      if (n.region !== region || (live && !live.has(n.id))) continue;
       this.useNode(leaf, inst, n, iterValues);
       if (n.k === 'par') this.runPar(leaf, inst, n.par, gen, prefix, iterations, stack, iterValues);
       if (n.k === 'call') this.runCall(leaf, inst, n, prefix, iterations, stack, iterValues);
@@ -286,12 +410,15 @@ class Builder {
     const here: SourceRef | undefined = span ? { uri: inst.proc.unit.uri, span } : undefined;
     const site = siteKey(inst.proc, n.id);
     const use = (value: Ex, op: CspUse['op'], b: Binding, at: SourceRef | undefined, ack = false): void => {
-      leaf.uses.push({ channel: channelName(value), op, at, procedure: inst.proc.decl.name.name, ref: b.ref, ...(b.resource ? { resource: b.resource } : {}), site, ...(ack ? { ack } : {}) });
+      leaf.uses.push({ channel: b.part && value === b.value ? bindingKey(b) : channelName(value), op, at, procedure: inst.proc.decl.name.name, ref: b.ref, ...(b.resource ? { resource: b.resource } : {}), site, ...(ack ? { ack } : {}) });
     };
     const chan = (c: ChanUse, dir: 'read' | 'write', at = here): void => {
-      const b = this.bind(inst, c.ch, iters);
-      if (!b) return;
-      if (b.ref) leaf.channels.set(channelName(b.value), b.ref);
+      const bound = this.bind(inst, c.ch, iters);
+      // An element whose index is only known at runtime may be any of them.
+      for (const b of bound?.alts ?? (bound ? [bound] : [])) one(c, b, dir, at);
+    };
+    const one = (c: ChanUse, b: Binding, dir: 'read' | 'write', at: SourceRef | undefined): void => {
+      if (b.ref) leaf.channels.set(bindingKey(b), b.ref);
       // A mediated channel's readers take the value from its server.
       const taken = dir === 'read' && c.take ? this.bind(inst, c.take, iters) : undefined;
       use(taken?.value ?? b.value, dir, b, at);
@@ -341,6 +468,7 @@ class Builder {
     const proc = inst.proc;
     const slots = gen.slots.get(par) ?? [];
     const node: ParNode = { par, instance: inst, slots: [], shared: [] };
+    this.noteFork(inst, par, gen, iterValues);
     const hSuffix = this.input.needsInstance(proc) ? `.${inst.h}` : '';
     const label = (r: Region): { label: string; procedure?: string } => {
       const stmt = r.stmt;
@@ -358,7 +486,7 @@ class Builder {
         if (!slot) return;
         const site: SpawnSite = { kind: 'branch', site: { uri: proc.unit.uri, span: r.stmt!.span }, index: i + 1 };
         const path = [...prefix, site];
-        const args = [...(hSuffix ? [String(inst.h)] : []), ...slot.statics.map((v) => this.staticArg(inst, v, iterValues))];
+        const args = [...(hSuffix ? [String(inst.h)] : []), ...slot.statics.map((v) => this.staticArg(inst, v, iterValues, par))];
         const child = this.leaf('branch', slot.definition, args, { path, ...label(r) });
         leaf.ownEvents.push(`${slot.fork}${hSuffix}`, `${slot.join}${hSuffix}`);
         this.runRegion(child, inst, r, path, iterations, stack, iterValues);
@@ -370,7 +498,7 @@ class Builder {
       const r = par.regions[0];
       const slot = slots[0];
       const iter = par.iter!;
-      const values = iter.values ?? range(this.input.intRange.lo, this.input.intRange.hi);
+      const values = iter.values ?? this.knownIterations(iter, this.known(inst, iterValues)) ?? range(this.input.intRange.lo, this.input.intRange.hi);
       this.maxEnroll = Math.max(this.maxEnroll, values.length);
       const stmt = par.stmt as A.ForStmt;
       for (const v of values) {
@@ -380,7 +508,7 @@ class Builder {
         const call = body?.kind === 'ExprStmt' && body.expr.kind === 'Invocation' ? body.expr : undefined;
         const callText = call ? (this.input.sourceText(proc, call.span) ?? call.name.name).replace(/\s+/g, ' ') : undefined;
         const values = new Map(iterValues).set(iter.v, v);
-        const args = [...(hSuffix ? [String(inst.h)] : []), show({ k: 'int', v }), ...slot.statics.map((s) => this.staticArg(inst, s, values))];
+        const args = [...(hSuffix ? [String(inst.h)] : []), show({ k: 'int', v }), ...slot.statics.map((s) => this.staticArg(inst, s, values, par))];
         const child = this.leaf('iteration', slot.definition, args, {
           path,
           label: `${callText ?? 'iteration'} [${iter.variable} = ${v}]`,
@@ -388,6 +516,19 @@ class Builder {
         });
         this.runRegion(child, inst, r, path, [...iterations, v], stack, values);
         node.slots.push(child);
+      }
+      // No iteration runs in this instance (elaboration knows the bounds): the parent forks and joins alone,
+      // as the language says. This build's par for waits for good when it starts no process.
+      if (!node.slots.length) {
+        if (!this.warnings.some((w) => w.code === 'compiler/empty-par-for' && w.at === stmt.span)) {
+          this.warnings.push({
+            message: `no iteration of this par for runs${this.input.needsInstance(proc) || inst.values?.size ? ` in ${proc.decl.name.name}${inst.values?.size ? ` (${[...inst.values].map(([k, v]) => `${proc.vars.get(k)?.name ?? k} = ${v}`).join(', ')})` : ''}` : ''} — the model lets it end at once, as the language says; this ProcessJ build never ends a par for that starts no process: it waits for one to finish, and the program hangs here (test/differential/par_for_empty.pj)`,
+            proc,
+            at: stmt.span,
+            code: 'compiler/empty-par-for',
+          });
+        }
+        return;
       }
       node.shared.push(`${slot.fork}${hSuffix}`, `${slot.join}${hSuffix}`);
       leaf.ownEvents.push(`${slot.fork}${hSuffix}`, `${slot.join}${hSuffix}`);
@@ -409,13 +550,18 @@ class Builder {
     if (!callee) return;
     // Channel traffic of the callee, through its effect summary (covers callees without an instance).
     const summary = this.input.effects.get(n.call.callee);
+    const instanced = this.input.needsInstance(callee);
+    const recursive = stack.includes(callee) || callee === inst.proc;
     if (summary) {
       const mark = (indices: ReadonlySet<number>, dir: 'read' | 'write'): void => {
         for (const i of indices) {
           const a = n.call.args[i];
           if (!a?.chan || a.chan.take) continue;
-          const b = this.bind(inst, a.chan.ch, iters);
-          if (!b?.resource) continue;
+          const bound = this.bind(inst, a.chan.ch, iters);
+          // A whole array: the walk of the callee below finds the elements it uses, unless it is not walked.
+          const all = bound?.array ? (recursive && !instanced ? this.elements(bound) : []) : bound?.alts ?? (bound ? [bound] : []);
+          for (const b of all) {
+          if (!b.resource) continue;
           (dir === 'read' ? leaf.reads : leaf.writes).add(b.resource);
           leaf.own.add(b.resource);
           const events = [show(b.value)];
@@ -424,24 +570,48 @@ class Builder {
             if (ack) events.push(show(ack.value));
           }
           leaf.events.set(b.resource, events);
-          if (b.ref) leaf.channels.set(channelName(b.value), b.ref);
+          if (b.ref) leaf.channels.set(bindingKey(b), b.ref);
+          }
         }
       };
       mark(summary.transitive.channelReads, 'read');
       mark(summary.transitive.channelWrites, 'write');
     }
-    const instanced = this.input.needsInstance(callee);
-    const recursive = stack.includes(callee) || callee === inst.proc;
+    const values = this.calleeValues(inst, n, callee, iters);
+    if (this.input.observe) {
+      const byIndex = new Map<number, number | boolean>();
+      callee.params.forEach((p, i) => {
+        const v = values.get(p.len ?? p.cspm);
+        if (v !== undefined && (p.role === 'value' || p.len)) byIndex.set(i, v);
+      });
+      this.input.observe({ caller: inst.proc, callee, site: n.call.site, values: byIndex, nested: recursive });
+    }
+    let unfold: string | undefined;
     if (recursive) {
       // A callee that runs no par runs in this process: its operations are recorded already.
-      if (instanced) this.unsupported.push({ message: `'${callee.decl.name.name}' calls itself on the way to a par: recursion through par has unboundedly many processes and is not modelled`, proc: inst.proc, at: n.call.site.span });
-      return;
+      if (!instanced) return;
+      // Recursion through par is unfolded when elaboration knows every argument: it ends where a
+      // condition on them stops calling (altFIFO(1) runs no par), within the process budget.
+      const name = callee.decl.name.name;
+      const unknown = callee.params.filter((p) => p.role === 'value' && (p.type.k === 'int' || p.type.k === 'bool') && !values.has(p.cspm)).map((p) => p.name);
+      unfold = `${callee.name}|${[...values].map(([k, v]) => `${k}=${v}`).sort().join(',')}`;
+      const why = unknown.length
+        ? `with ${unknown.length === 1 ? 'an argument' : 'arguments'} (${unknown.join(', ')}) that elaboration cannot compute (not known before the program runs, or outside the modelled integers ${this.input.intRange.lo}..${this.input.intRange.hi})`
+        : this.unfolding.includes(unfold)
+          ? `with the same arguments again (${[...values].map(([k, v]) => `${callee.vars.get(k)?.name ?? k} = ${v}`).join(', ') || 'none'}), so the arguments do not tell how many levels run (whether it stops depends on what happens at run time, or it never does)`
+          : this.unfolding.length >= MAX_UNFOLDING
+            ? `more than ${MAX_UNFOLDING} levels deep`
+            : undefined;
+      if (why) {
+        this.unsupported.push({ message: `'${name}' calls itself on the way to a par ${why}: recursion through par is modelled only when it stops after a number of steps known from the arguments`, proc: inst.proc, at: n.call.site.span });
+        return;
+      }
     }
     const bindings = this.calleeBindings(inst, n, callee, iters);
     if (!instanced) {
       // The callee runs inside this process. Walk its code for the operations it performs, its own
       // local channels included: with no par below, nothing can ever be their partner, so they block.
-      this.runRegion(leaf, { proc: callee, h: 0, bindings, path: prefix }, callee.thread, prefix, iterations, [...stack, inst.proc]);
+      this.runRegion(leaf, { proc: callee, h: 0, bindings, path: prefix, values }, callee.thread, prefix, iterations, [...stack, inst.proc]);
       return;
     }
     const h = this.alloc(callee);
@@ -451,8 +621,147 @@ class Builder {
     clauses.push(`${fn}(${key}) = ${h}`);
     this.instanceClauses.set(fn, clauses);
     const path = this.input.leadsToPar(callee) ? [...prefix, { kind: 'call' as const, site: { uri: inst.proc.unit.uri, span: n.call.site.span } }] : prefix;
-    const calleeInst: Instance = { proc: callee, h, bindings, path };
-    this.runRegion(leaf, calleeInst, callee.thread, path, [], [...stack, inst.proc]);
+    const calleeInst: Instance = { proc: callee, h, bindings, path, values };
+    // The process that is this call: its known arguments name it apart from other instances (explain.ts processNames).
+    const shown = callee.params.filter((p) => p.role === 'value' && values.has(p.cspm)).map((p) => `${p.name} = ${String(values.get(p.cspm))}`);
+    if (shown.length && !leaf.known && leaf.process?.procedure === callee.decl.name.name && leaf.process.path.length === prefix.length) leaf.known = shown.join(', ');
+    if (unfold) this.unfolding.push(unfold);
+    try {
+      this.runRegion(leaf, calleeInst, callee.thread, path, [], [...stack, inst.proc]);
+    } finally {
+      if (unfold) this.unfolding.pop();
+    }
+  }
+
+  /**
+   * The data parameters of a callee elaboration knows at this call: an
+   * argument computed from what is known here, for a parameter the callee
+   * never changes (`FIFO(6, ...)`: size is 6 in that instance).
+   */
+  private calleeValues(inst: Instance, n: Extract<Node, { k: 'call' }>, callee: ProcIR, iters: ReadonlyMap<string, number>): Map<string, number | boolean> {
+    const out = new Map<string, number | boolean>();
+    const env = this.known(inst, iters);
+    const fixed = this.fixed(callee);
+    callee.params.forEach((p, i) => {
+      const a = n.call.args[i];
+      if (!a) return;
+      if (p.role === 'value' && a.value && fixed.has(p.cspm)) {
+        const v = evaluate(a.value, env, this.input.intRange);
+        if (v !== undefined) out.set(p.cspm, v);
+      }
+      if (p.len && a.chan?.len) {
+        const v = evaluate(a.chan.len, env, this.input.intRange);
+        if (v !== undefined) out.set(p.len, v);
+      }
+    });
+    return out;
+  }
+
+  /** Parameters no statement of the procedure assigns: their value is the call's argument throughout. */
+  private fixed(proc: ProcIR): Set<string> {
+    const known = this.fixedCache.get(proc);
+    if (known) return known;
+    const out = fixedParams(proc);
+    this.fixedCache.set(proc, out);
+    return out;
+  }
+
+  /** What elaboration knows in an instance: its fixed parameters, the par for iterations and channel-array lengths around the code. */
+  private known(inst: Instance, iters: ReadonlyMap<string, number>): Known {
+    if (!inst.values?.size) return iters;
+    return new Map<string, number | boolean>([...inst.values, ...iters]);
+  }
+
+  /**
+   * The nodes of a region that can run when the known values decide some of
+   * its conditions; undefined when they decide none (every node can run).
+   */
+  private liveNodes(proc: ProcIR, region: Region, env: Known): Set<number> | undefined {
+    if (!env.size) return undefined;
+    let pruned = false;
+    const seen = new Set<number>();
+    const work = [region.entry];
+    while (work.length) {
+      const id = work.pop()!;
+      if (id < 0 || seen.has(id)) continue;
+      const n = proc.nodes[id];
+      if (!n) continue;
+      seen.add(id);
+      if (n.k === 'branch') {
+        const c = evaluate(n.c, env, this.input.intRange);
+        if (typeof c === 'boolean') {
+          pruned = true;
+          work.push(c ? n.t : n.f);
+          continue;
+        }
+      }
+      if (n.k === 'check' && evaluate(n.ok, env, this.input.intRange) === false) {
+        // A runtime error happens here for certain: nothing after it runs.
+        pruned = true;
+        continue;
+      }
+      work.push(...nodeSuccessors(n));
+    }
+    return pruned ? seen : undefined;
+  }
+
+  /**
+   * The iterations of a par for with computed bounds, when elaboration knows
+   * them (`i < size` with size known in this instance): one slot per
+   * iteration that runs, not one per modelled integer. They stay within the
+   * modelled integers, where the generated range check lets a run go on.
+   */
+  private knownIterations(iter: NonNullable<ParIR['iter']>, env: Known): number[] | undefined {
+    if (!iter.lo || !iter.hi) return undefined;
+    const lo = evaluate(iter.lo, env, this.input.intRange);
+    const hi = evaluate(iter.hi, env, this.input.intRange);
+    if (typeof lo !== 'number' || typeof hi !== 'number') return undefined;
+    const { lo: L, hi: H } = this.input.intRange;
+    return range(Math.max(lo, L), Math.min(hi, H));
+  }
+
+  /** Record what this instance's fork of `par` carries (Network.forkDomains). */
+  private noteFork(inst: Instance, par: ParIR, gen: GeneratedProc, iterValues: ReadonlyMap<string, number>): void {
+    const fork = gen.channels.find((c) => c.role === 'fork' && c.par === par);
+    if (!fork) return;
+    const env = this.known(inst, iterValues);
+    const { lo: L, hi: H } = this.input.intRange;
+    const inRange = (v: number | boolean | undefined): number | boolean | undefined => (typeof v === 'number' && (v < L || v > H) ? undefined : v);
+    const values: Array<number | boolean | undefined> = [];
+    if (fork.bounds && par.iter?.lo && par.iter.hi) {
+      const lo = evaluate(par.iter.lo, env, this.input.intRange);
+      const hi = evaluate(par.iter.hi, env, this.input.intRange);
+      // As gen.ts clamps them to the slots.
+      values.push(typeof lo === 'number' ? Math.min(Math.max(lo, L), H + 1) : undefined, typeof hi === 'number' ? Math.min(Math.max(hi, L - 1), H) : undefined);
+    }
+    for (const v of fork.vars ?? []) values.push(inRange(env.get(v)));
+    const known = this.forkDomains.get(par);
+    const fields = values.map((v, i) => {
+      if (known && !known[i]) return undefined;
+      if (v === undefined) return undefined;
+      const set = known?.[i] ?? new Set<number | boolean>();
+      set.add(v);
+      return set;
+    });
+    this.forkDomains.set(par, fields);
+    const h = fork.instanced ? inst.h : 0;
+    const perInstance = this.forkTuples.get(par) ?? new Map<number, Array<Array<number | boolean | undefined>>>();
+    const tuples = perInstance.get(h) ?? [];
+    if (!tuples.some((t) => t.every((v, i) => v === values[i]))) tuples.push(values);
+    perInstance.set(h, tuples);
+    this.forkTuples.set(par, perInstance);
+  }
+
+  /** Every element of an array binding, when its length is known. */
+  private elements(b: Binding): Binding[] {
+    const size = b.array?.size;
+    if (!b.array || size === undefined) return [];
+    return Array.from({ length: size }, (_, k) => this.element(b, k));
+  }
+
+  private element(arr: Binding, k: number): Binding {
+    const a = arr.array!;
+    return { value: E.dot(arr.value, E.int(k)), resource: `${a.resource}[${k}]`, ref: { ...a.ref, name: `${a.ref.name}[${k}]`, index: k }, element: k, part: true };
   }
 
   /** What a callee's channel and barrier parameters are bound to at a call. */
@@ -493,15 +802,35 @@ class Builder {
     if (e.k === 'name') {
       const local = inst.proc.locals.find((l) => l.cspm === e.name || l.ack === e.name);
       if (!local) return { value: e };
+      if (local.array) {
+        const size = iters.get(local.array.len);
+        return { value: e, array: { resource: this.resourceKey(local, inst, iters), ref: this.localRef(local, inst), ...(size !== undefined ? { size } : {}) } };
+      }
       const ref = this.localRef(local, inst);
       const isAck = local.ack === e.name;
       return { value: e, resource: this.resourceKey(local, inst, iters), ref: isAck ? { ...ref } : ref };
+    }
+    const last = e.k === 'dot' ? e.fields[e.fields.length - 1] : undefined;
+    if (e.k === 'dot' && last && !(last.k === 'var' && last.name === 'pj_h')) {
+      // An element of an array of channels: known index, or any element.
+      const arr = this.bind(inst, E.dot(e.head, ...e.fields.slice(0, -1)), iters);
+      if (arr?.array) {
+        if (arr.array.size === undefined) return undefined;
+        const k = evaluate(last, this.known(inst, iters), this.input.intRange);
+        if (typeof k === 'number') return k >= 0 && k < arr.array.size ? this.element(arr, k) : undefined;
+        const alts = this.elements(arr);
+        return alts.length ? { value: e, alts } : undefined;
+      }
     }
     if (e.k === 'dot' && e.head.k === 'name' && e.fields.length === 1 && e.fields[0].k === 'var' && e.fields[0].name === 'pj_h') {
       const name = e.head.name;
       const local = inst.proc.locals.find((l) => l.cspm === name || l.ack === name || l.mediated?.take === name || l.mediated?.done === name);
       const value: Ex = { k: 'dot', head: e.head, fields: [{ k: 'int', v: inst.h }] };
-      return { value, ref: local ? this.localRef(local, inst) : undefined, ...(local ? { resource: this.resourceKey(local, inst, iters) } : {}) };
+      if (local?.array) {
+        const size = iters.get(local.array.len);
+        return { value, array: { resource: this.resourceKey(local, inst, iters), ref: this.localRef(local, inst), ...(size !== undefined ? { size } : {}) } };
+      }
+      return { value, ref: local ? this.localRef(local, inst) : undefined, ...(local ? { resource: this.resourceKey(local, inst, iters) } : {}), ...(local?.instanced ? { part: true } : {}) };
     }
     return undefined;
   }
@@ -519,10 +848,13 @@ class Builder {
     return `${local.cspm}#${inst.proc.name}#${inst.h}#${pathKey(inst.path)}${iterations.length ? `#${iterations.join(',')}` : ''}`;
   }
 
-  private staticArg(inst: Instance, v: string, iterValues: ReadonlyMap<string, number>): string {
+  private staticArg(inst: Instance, v: string, iterValues: ReadonlyMap<string, number>, par: ParIR): string {
     const it = iterValues.get(v);
     if (it !== undefined) return show({ k: 'int', v: it });
     const b = this.bind(inst, { k: 'var', name: v });
+    if (b?.alts) {
+      this.unsupported.push({ message: `a par branch here uses '${inst.proc.vars.get(v)?.name ?? v}', an element of a channel array whose index is only known at runtime; a process is given its channels before it starts, so this is not modelled`, proc: inst.proc, at: par.stmt.span });
+    }
     return b ? show(b.value) : v;
   }
 
@@ -665,6 +997,7 @@ class Builder {
       process: leaf.process,
       barrier: leaf.barrier,
       ...(leaf.resource ? { resource: leaf.resource } : {}),
+      ...(leaf.known ? { known: leaf.known } : {}),
       channels: Object.fromEntries(leaf.channels),
       uses: leaf.uses,
       enrolled: leaf.enrolled,
@@ -788,9 +1121,12 @@ class Builder {
   }
 }
 
+/** Deepest recursion through par the network unfolds (each level is at least one more process). */
+const MAX_UNFOLDING = 200;
+
 class TooBig extends Error {
-  constructor(readonly max: number) {
-    super(`the program has more than ${max} processes`);
+  constructor(readonly max: number, readonly recursion?: string) {
+    super(`the program has more than ${max} processes${recursion ? ` (unfolding the recursion of '${recursion}' through par)` : ''}`);
   }
 }
 
@@ -823,6 +1159,85 @@ export function assignPositions(processes: CspProcessInfo[], node: CspNetworkNod
 
 export function instanceFunctionName(proc: ProcIR, callId: number): string {
   return `pj_inst_${proc.name}_${callId + 1}`;
+}
+
+/** The key a leaf's channel map and uses give a channel: `chans.2` for an element of an array, else the CSPm channel. */
+function bindingKey(b: Binding): string {
+  return b.part ? show(b.value) : channelName(b.value);
+}
+
+/**
+ * The value of an expression from what elaboration knows, or undefined.
+ * Integers follow Java (division truncates); a saturated integer is known
+ * only while it is inside the modelled range.
+ */
+export function evaluate(e: Ex, env: Known, range: { lo: number; hi: number }): number | boolean | undefined {
+  const num = (x: Ex): number | undefined => {
+    const v = evaluate(x, env, range);
+    return typeof v === 'number' ? v : undefined;
+  };
+  switch (e.k) {
+    case 'int':
+    case 'bool':
+      return e.v;
+    case 'var':
+      return env.get(e.name);
+    case 'not': {
+      const v = evaluate(e.e, env, range);
+      return typeof v === 'boolean' ? !v : undefined;
+    }
+    case 'neg': {
+      const v = num(e.e);
+      return v === undefined ? undefined : -v;
+    }
+    case 'if': {
+      const c = evaluate(e.c, env, range);
+      return typeof c === 'boolean' ? evaluate(c ? e.t : e.e, env, range) : undefined;
+    }
+    case 'sat': {
+      const v = num(e.e);
+      return v !== undefined && v >= e.lo && v <= e.hi ? v : undefined;
+    }
+    case 'call': {
+      if ((e.fn === 'pj_div' || e.fn === 'pj_mod') && e.args.length === 2) {
+        const a = num(e.args[0]);
+        const b = num(e.args[1]);
+        if (a === undefined || b === undefined || b === 0) return undefined;
+        return e.fn === 'pj_div' ? Math.trunc(a / b) : a % b;
+      }
+      return undefined;
+    }
+    case 'bin': {
+      if (e.op === 'and' || e.op === 'or') {
+        const l = evaluate(e.l, env, range);
+        if (typeof l === 'boolean' && (e.op === 'and' ? !l : l)) return l;
+        const r = evaluate(e.r, env, range);
+        if (typeof l === 'boolean' && typeof r === 'boolean') return r;
+        return typeof r === 'boolean' && (e.op === 'and' ? !r : r) ? r : undefined;
+      }
+      const l = evaluate(e.l, env, range);
+      const r = evaluate(e.r, env, range);
+      if (l === undefined || r === undefined) return undefined;
+      if (typeof l === 'boolean' || typeof r === 'boolean') {
+        if (typeof l !== typeof r) return undefined;
+        return e.op === '==' ? l === r : e.op === '!=' ? l !== r : undefined;
+      }
+      switch (e.op) {
+        case '+': return l + r;
+        case '-': return l - r;
+        case '*': return l * r;
+        case '==': return l === r;
+        case '!=': return l !== r;
+        case '<': return l < r;
+        case '<=': return l <= r;
+        case '>': return l > r;
+        case '>=': return l >= r;
+      }
+      return undefined;
+    }
+    default:
+      return undefined;
+  }
 }
 
 function channelName(e: Ex): string {

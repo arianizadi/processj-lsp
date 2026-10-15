@@ -1,0 +1,14 @@
+-- Three clients share one server: each request is answered on the
+-- client's own reply channel. The clients interleave.
+CLIENTS = {0..2}
+channel request, reply : CLIENTS
+channel work
+
+CLIENT(c) = request.c -> reply.c -> work -> CLIENT(c)
+SERVER = request?c -> reply!c -> SERVER
+
+SYSTEM = (||| c : CLIENTS @ CLIENT(c)) [| {| request, reply |} |] SERVER
+
+assert SYSTEM :[deadlock free]
+assert SYSTEM :[divergence free]
+assert SYSTEM \ {| request, reply |} :[deterministic [F]]

@@ -217,6 +217,8 @@ class Checker {
   private parDepth = 0;
   /** >0 while checking a read guard of an alt that has other guards: such a read does not block by itself. */
   private inChoiceGuard = 0;
+  /** The read the current statement stores with a plain `=` (or an alt guard's read): the compiler casts it. */
+  private castedRead: A.ChanRead | undefined;
   /** Name expressions that are the target of `.read` / `.write` / `.read()` / `.write(v)`: not "bare" uses of the channel. */
   private readonly endTargets = new WeakSet<A.Expr>();
   private readonly yields: YieldAnalysis;
@@ -306,12 +308,12 @@ class Checker {
   }
 
   /**
-   * Features this ProcessJ build does not compile (verified by building them): arrays of
-   * channels, variables holding a channel end. The program is not wrong; it just cannot be
-   * built with this compiler, and the warning says so where the feature is used.
+   * Types this ProcessJ build does not compile (verified by building them). The program is
+   * not wrong; it just cannot be built with this compiler, and the warning says so where the
+   * feature is used. Arrays of channels do build: only a read of an element outside a plain
+   * assignment (`chanArrayRead`) and an array created by a later assignment fail.
    */
   private checkCompilable(node: A.TypeNode): void {
-    if (node.kind === 'ArrayType' && node.elem.kind === 'ChanType') this.report(node.span, 'warning', 'pj/compiler-limit', 'Arrays of channels cannot be compiled by this ProcessJ build; use separate channels');
     if (node.kind === 'ChanType' && node.elem.kind === 'PrimitiveType' && node.elem.name === 'string') {
       this.report(node.span, 'warning', 'pj/compiler-limit', "A channel carrying 'string' cannot be compiled by this ProcessJ build: its code generator has no wrapper type for string and throws while generating the channel. Send the value as a 'chan<int>' code or a 'chan<char>' sequence instead.");
     }
@@ -713,9 +715,15 @@ class Checker {
         return;
       case 'LocalDecl':
         return this.localDecl(s);
-      case 'ExprStmt':
+      case 'ExprStmt': {
+        // `x = cs[i].read();` is the one statement form in which the compiler casts a read of a channel-array element.
+        const value = s.expr.kind === 'AssignExpr' && s.expr.op === '=' ? stripParens(s.expr.value) : undefined;
+        const saved = this.castedRead;
+        if (value?.kind === 'ChanRead') this.castedRead = value;
         this.expr(s.expr);
+        this.castedRead = saved;
         return;
+      }
       case 'IfStmt': {
         this.condition(s.cond, 'if');
         const narrowed = this.narrowing(s.cond);
@@ -1102,7 +1110,10 @@ class Checker {
             break;
           case 'ReadGuard': {
             if (s.cases.length > 1) this.inChoiceGuard++;
+            const savedRead = this.castedRead;
+            this.castedRead = c.guard.read;
             const vt = this.chanRead(c.guard.read);
+            this.castedRead = savedRead;
             if (s.cases.length > 1) this.inChoiceGuard--;
             const lt = this.lvalue(c.guard.target);
             if (!this.assignableExpr(lt, vt, c.guard.read)) this.error(c.guard.span, 'pj/type/assign', `Cannot store a ${typeStr(vt)} read from the channel in '${exprText(c.guard.target)}' (${typeStr(lt)})`);
@@ -1839,6 +1850,9 @@ class Checker {
     if (isLenient(t)) return T.unknown;
     if (t.k !== 'chan') return this.error(e.target.span, 'pj/type/channel', `${exprText(e.target)} is ${typeStr(t)}, not a channel; '.read()' needs a channel or a read end`);
     if (t.end === 'write') return this.error(e.span, 'pj/channel-direction', `'${exprText(e.target)}' is a write end (${typeStr(t)}); it cannot read`);
+    if (stripParens(e.target).kind === 'ArrayAccess' && e !== this.castedRead) {
+      this.report(e.span, 'warning', 'pj/compiler-limit', "A read of a channel-array element cannot be compiled here by this ProcessJ build: the generated Java keeps the value as Object and javac rejects it. Read it as a statement of its own ('v = cs[i].read();', then use v), or pass the element's read end ('cs[i].read') to a procedure.");
+    }
     if (t.end === 'read' && t.shared) {
       this.report(e.span, 'warning', 'pj/compiler-limit', `Reading through '${typeStr(t)}' cannot be compiled by this ProcessJ build: its code generator throws on the shared-read template. Give the reader a plain '${typeStr({ ...t, shared: false })}' parameter (one reader process), or read the channel where it is declared.`);
     }
@@ -1939,6 +1953,9 @@ class Checker {
     }
     if (e.value.kind === 'RecordLiteral' || e.value.kind === 'ProtocolLiteral') {
       this.report(e.value.span, 'warning', 'pj/compiler-limit', 'A record or protocol literal can only be compiled as the initialiser of a declaration in this ProcessJ build; declare the variable together with the literal, then assign that variable');
+    }
+    if (e.value.kind === 'NewArray' && e.value.elem.kind === 'ChanType') {
+      this.report(e.value.span, 'warning', 'pj/compiler-limit', `This ProcessJ build creates the channels of an array only in a declaration's initialiser: assigned later, every element of '${exprText(e.target)}' stays null and the first use throws NullPointerException. Create the array where it is declared ('chan<T>[] cs = new chan<T>[n];').`);
     }
     if (e.value.kind === 'ArrayLiteral') {
       this.arrayLiteral(e.value, lt, exprText(e.target));
@@ -2164,6 +2181,11 @@ interface Op {
   kind: 'read' | 'write';
   chan: VarInfo;
   span: A.Span;
+}
+
+function stripParens(e: A.Expr): A.Expr {
+  while (e.kind === 'ParenExpr') e = e.expr;
+  return e;
 }
 
 function isTrueLiteral(e: A.Expr): boolean {

@@ -114,7 +114,7 @@ export const E = {
   not: (e: Ex): Ex => (e.k === 'bool' ? { k: 'bool', v: !e.v } : e.k === 'not' ? e.e : { k: 'not', e }),
   bin: (op: BinOp, l: Ex, r: Ex): Ex => fold({ k: 'bin', op, l, r }),
   call: (fn: string, ...args: Ex[]): Ex => ({ k: 'call', fn, args }),
-  dot: (head: Ex, ...fields: Ex[]): Ex => (fields.length ? { k: 'dot', head, fields } : head),
+  dot: (head: Ex, ...fields: Ex[]): Ex => (!fields.length ? head : head.k === 'dot' ? { k: 'dot', head: head.head, fields: [...head.fields, ...fields] } : { k: 'dot', head, fields }),
   and: (l: Ex, r: Ex): Ex => fold({ k: 'bin', op: 'and', l, r }),
   or: (l: Ex, r: Ex): Ex => fold({ k: 'bin', op: 'or', l, r }),
   if: (c: Ex, t: Ex, e: Ex): Ex => (c.k === 'bool' ? (c.v ? t : e) : { k: 'if', c, t, e }),
@@ -348,7 +348,7 @@ export function show(e: Ex): string {
     case 'if':
       return `if ${show(e.c)} then ${operand(e.t)} else ${operand(e.e)}`;
     case 'dot':
-      return [atom(e.head), ...e.fields.map(atom)].join('.');
+      return [e.head.k === 'dot' ? show(e.head) : atom(e.head), ...e.fields.map(atom)].join('.');
     case 'seq':
       return `<${e.items.map(show).join(', ')}>`;
     case 'set':

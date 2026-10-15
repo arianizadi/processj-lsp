@@ -1,0 +1,15 @@
+-- A token ring: node i passes the token to node i+1, each node sharing
+-- exactly its two links with its neighbours (an alphabetized parallel).
+N = 4
+NODES = {0..N-1}
+channel pass : NODES
+
+NODE(i) = pass.i -> pass.((i+1)%N) -> NODE(i)
+START = pass.0 -> NODE(0)
+
+A(i) = {pass.i, pass.((i+1)%N)}
+
+RING = || i : NODES @ [A(i)] (if i == 0 then pass.((i+1)%N) -> NODE(0) else NODE(i))
+
+assert RING :[deadlock free [F]]
+assert RING :[divergence free]

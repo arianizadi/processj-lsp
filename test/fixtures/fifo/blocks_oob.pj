@@ -1,0 +1,78 @@
+// blocks.pj, broken: the last stage reads chans[size - 1], one past the end of the array.
+import std.*;
+
+// Forward the end marker (-1) before stopping. It is not ordinary data.
+public void id(chan<int>.read in, chan<int>.write out) {
+    int v = 0;
+    while (v != -1) {
+        v = in.read();
+        out.write(v);
+    }
+}
+
+void producer(chan<int>.write out, int limit) {
+    for (int x = 0; x < limit; x++) {
+        out.write(x);
+    }
+    out.write(-1);
+}
+
+void consumer(chan<int>.read in) {
+    int x = 0;
+    while (x != -1) {
+        x = in.read();
+        if (x != -1)
+            println(x);
+    }
+}
+
+// FIFO calls this helper only when size >= 2.
+public void foo(int i, chan<int>[] chans, int size, chan<int>.read in, chan<int>.write out) {
+    if (i == 0)
+        id(in, chans[0].write);
+    else if (i == size - 1)
+        id(chans[size - 1].read, out);
+    else
+        id(chans[i - 1].read, chans[i].write);
+}
+
+public void FIFO(int size, chan<int>.read in, chan<int>.write out) {
+    if (size <= 1)
+        id(in, out);
+    else {
+        chan<int> chans[] = new chan<int>[size - 1];
+        par for (int i = 0; i < size; i++) {
+            foo(i, chans, size, in, out);
+        }
+    }
+}
+
+// One forwarding stage runs alongside the remaining stages.
+public void altFIFO(int size, chan<int>.read in, chan<int>.write out) {
+    if (size <= 1)
+        id(in, out);
+    else {
+        chan<int> middle;
+        par {
+            id(in, middle.write);
+            altFIFO(size - 1, middle.read, out);
+        }
+    }
+}
+
+public void main(string[] args) {
+    int limit = 20;
+    chan<int> d1, d2, d3, d4;
+    println("FIFO:");
+    par {
+        producer(d1.write, limit);
+        consumer(d2.read);
+        FIFO(6, d1.read, d2.write);
+    }
+    println("altFIFO:");
+    par {
+        producer(d3.write, limit);
+        consumer(d4.read);
+        altFIFO(6, d3.read, d4.write);
+    }
+}

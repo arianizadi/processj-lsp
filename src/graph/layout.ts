@@ -346,7 +346,9 @@ export function edgeLabelText(edge: NetEdge): string {
   const how = edge.tags.includes('alt') ? ' · in an alt' : edge.tags.includes('extended') ? ' · extended' : '';
   // Next to a parameter's port the name is on the port: the arrow says the type.
   if (edge.tags.includes('port')) return `${edge.label.split(' : ')[1] ?? edge.label}${shared}${how}`;
-  return `${edge.label}${shared}${how}`;
+  // Events a hiding makes internal (a CSPm file).
+  const hidden = edge.tags.includes('hidden') ? ' · hidden' : '';
+  return `${edge.label}${shared}${how}${hidden}`;
 }
 
 function collect(view: NetworkView, result: ElkNode, depth: Map<string, number>, reversed: ReadonlySet<string>): ViewLayout {

@@ -11,12 +11,13 @@ import type { CheckResult, VarInfo } from '../checker/checker';
 import { analyzeProcedureEffects } from '../checker/effects';
 import type { DeclIndex } from '../checker/index';
 import type { ChannelRef, CheckProperty, SourceRef } from '../verification';
-import { commentText, E, mangle, NameTable, rangeText, type Ex } from './cspm';
+import { commentText, E, mangle, NameTable, rangeText, show, type Ex } from './cspm';
 import { ARRAY_HELPERS, D, DataModel, describe, inferRange, INT_HELPERS, type DType } from './data';
-import { prepareProc, type GeneratedProc, type PreparedProc } from './gen';
+import { forkSetName, prepareProc, type ForkChannel, type GeneratedProc, type PreparedProc } from './gen';
 import { charCode, forEachChildExpr, forEachChildStmt, forEachExprInStmt, parseIntLiteral, startProcedure, type ChannelKind, type LocalResource, type LowerContext, type ProcIR, type UnitIR } from './lower';
-import { STANDARD_CHECKS, type CspAssertion, type CspChannelInfo, type CspDefinitionInfo, type CspDiagnostic, type CspModel, type CspNetworkNode, type CspProcessInfo, type CspSourceMap, type CspTransition, type TranslateOptions } from './model';
-import { assignPositions, buildNetwork, instanceFunctionName, isTooBig, type Binding } from './network';
+import { STANDARD_CHECKS, type CheckedWith, type CspAssertion, type CspChannelInfo, type CspDefinitionInfo, type CspDiagnostic, type CspModel, type CspNetworkNode, type CspProcessInfo, type CspSourceMap, type CspTransition, type TranslateOptions } from './model';
+import { assignPositions, buildNetwork, instanceFunctionName, isTooBig, type Binding, type NetworkInput, type ObservedCall, type RootInstance } from './network';
+import { fixedParams, structuralParams } from './structure';
 import { miscompilations } from './miscompile';
 import { reachability } from './reach';
 import { saturate, type Saturation } from './relevance';
@@ -54,6 +55,28 @@ export function translateProcedure(input: TranslateInput, name: string, at?: A.P
 }
 
 /**
+ * What a procedure's own graph view is drawn with (graph/network.ts
+ * procedureArguments): the arguments every instance of its check shares, a
+ * channel-array parameter by its length. Undefined when it is checked with
+ * every value.
+ */
+export function drawnArguments(model: Pick<CspModel, 'checkedWith'>): { values: Record<string, number | boolean>; arrays: Record<string, number>; text: string } | undefined {
+  const instances = model.checkedWith?.instances;
+  if (!instances?.length) return undefined;
+  const common = <T>(of: (i: CheckedWith['instances'][number]) => Record<string, T>): Record<string, T> => {
+    const out: Record<string, T> = {};
+    for (const [name, v] of Object.entries(of(instances[0]))) if (instances.every((i) => Object.prototype.hasOwnProperty.call(of(i), name) && of(i)[name] === v)) out[name] = v;
+    return out;
+  };
+  const values = common((i) => i.values);
+  const arrays = common((i) => i.arrays);
+  const parts = [...Object.entries(arrays).map(([n, v]) => `${n} of length ${v}`), ...Object.entries(values).map(([n, v]) => `${n} = ${v}`)];
+  if (!parts.length) return undefined;
+  const differ = [...new Set(instances.flatMap((i) => [...Object.keys(i.values), ...Object.keys(i.arrays)]))].filter((n) => !(n in values) && !(n in arrays));
+  return { values, arrays, text: `${listText(parts)}${differ.length ? ` (${listText(differ)} ${differ.length === 1 ? 'differs' : 'differ'} between the instances checked, so ${differ.length === 1 ? 'it is' : 'they are'} not fixed here)` : ''}` };
+}
+
+/**
  * Channels whose users a par cannot compose with plain synchronisation (a
  * branch that both writes and reads a channel others use too) become
  * mediated: a server process takes each written value and hands it to one
@@ -62,14 +85,43 @@ export function translateProcedure(input: TranslateInput, name: string, at?: A.P
  */
 function translate(input: TranslateInput, target: Target): CspModel {
   const mediated = new Set<string>();
+  // A checked procedure whose data parameters decide its network is translated again with the
+  // arguments it is checked with (their values widen the inferred integers).
+  let plan: InstancePlan | undefined;
   for (let round = 0; ; round++) {
-    const t = new Translation(input, target, mediated);
+    const t = new Translation(input, target, mediated, plan);
     const model = t.run();
+    if (!plan && t.plan) {
+      plan = t.plan;
+      round--;
+      continue;
+    }
     const more = t.retry.filter((slot) => !mediated.has(slot));
     if (more.length === 0 || round >= 3) return model;
     for (const slot of more) mediated.add(slot);
   }
 }
+
+/**
+ * The arguments a procedure checked on its own is elaborated with, when some
+ * of its data parameters decide its network (structure.ts): one tuple per
+ * distinct set of values its calls from the program give (or a //@csp check
+ * directive names); a parameter no tuple fixes takes every modelled value for
+ * which the network is finite, each value an instance of its own.
+ */
+interface InstancePlan {
+  /** Parameter indices each instance fixes: data parameters, and channel-array parameters by their length. */
+  params: number[];
+  source: 'calls' | 'directive' | 'range';
+  tuples: Array<{ values: Map<number, number | boolean>; sites: SourceRef[] }>;
+  /** Integers the tuples use: the inferred range must hold them. */
+  literals: number[];
+  /** Said while planning (a //@csp check that is ignored): the translation with the plan reports them. */
+  warnings: CspDiagnostic[];
+}
+
+/** At most this many instances of a checked procedure (argument tuples). */
+const MAX_INSTANCES = 64;
 
 const LINTS = new Map<string, string>([
   ['pj/par-for-body', 'the model runs each par for iteration as one process (the language), while this ProcessJ build runs every statement of the body as its own process'],
@@ -109,6 +161,8 @@ class Translation {
   private readonly extended = new Set<string>();
   private readonly procIds = new Map<A.ProcDecl, number>();
   private readonly localNames = new Map<A.Ident, string>();
+  /** Procedures that call themselves, directly or through others. */
+  private readonly recursive = new Set<A.ProcDecl>();
   private readonly baseNames = new Map<A.ProcDecl, string>();
   private root!: A.ProcDecl;
   private rootUnit!: UnitIR;
@@ -118,12 +172,20 @@ class Translation {
   /** Channel groups (union-find slots) the network could not compose: the next round mediates them. */
   readonly retry: string[] = [];
 
+  /** Set when a procedure check needs a second translation with the arguments it is checked with (translate()). */
+  plan?: InstancePlan;
+  private checkedWith?: CheckedWith;
+
   constructor(
     private readonly input: TranslateInput,
     private readonly target: Target,
     private readonly mediatedSlots: ReadonlySet<string> = new Set(),
+    private readonly planned?: InstancePlan,
+    /** A program translation that collects the calls elaboration unfolds (call sites of a checked procedure). */
+    private readonly observe?: (call: ObservedCall) => void,
   ) {
     this.units = input.units.map((u) => ({ program: u.program, checked: u.checked, file: u.file, uri: u.uri, text: u.text }));
+    if (planned) this.warnings.push(...planned.warnings);
     for (const u of this.units) for (const d of u.program.decls) if (d.kind === 'ProcDecl' && !this.unitOf.has(d)) this.unitOf.set(d, u);
   }
 
@@ -141,6 +203,9 @@ class Translation {
     this.root = root;
 
     const directives = this.directives(rootUnit, this.input.units[0]?.comments);
+    for (const c of directives.checks) {
+      if (!procedures.some((p) => p.name.name === c.name)) this.warnings.push({ message: `//@csp check names '${c.name}', which is not a procedure with a body in this file; ignored`, at: c.at });
+    }
     const reachable = this.reachable(root);
     // Integers.
     const options = this.input.options ?? {};
@@ -157,6 +222,12 @@ class Translation {
       const inferred = inferRange(literals.values, options.maxInferredValues ?? 64);
       lo = inferred.lo;
       hi = inferred.hi;
+      // The arguments a checked procedure is elaborated with are values its code computes with: the
+      // range holds them exactly (no margin: they are given, not counted up to).
+      for (const v of this.planned?.literals ?? []) {
+        if (v < lo && hi - v + 1 <= (options.maxInferredValues ?? 64)) lo = v;
+        if (v > hi && v - lo + 1 <= (options.maxInferredValues ?? 64)) hi = v;
+      }
       if (inferred.dropped.length) {
         const shown = inferred.dropped.slice(0, 6).join(', ');
         this.warnings.push({
@@ -170,6 +241,7 @@ class Translation {
     for (const name of this.input.index.protocols.keys()) this.data.family('protocol', name);
     this.nameProcedures(reachable);
     this.channelKinds(reachable);
+    this.findRecursion(reachable);
     if (this.target.kind === 'procedure') {
       // Harness channels and barriers are named after the parameters. They are global CSPm names,
       // and a parameter named like a channel would be a pattern: reserve them before any variable is named.
@@ -177,7 +249,7 @@ class Translation {
       const vars = new Map(unit.checked.vars.map((v) => [v.decl, v]));
       for (const p of root.params) {
         const t = vars.get(p.name)?.type;
-        if (t && (t.k === 'chan' || (t.k === 'prim' && t.name === 'barrier'))) this.harnessNames.set(p.name, this.names.fresh(mangle(p.name.name)));
+        if (t && (t.k === 'chan' || (t.k === 'prim' && t.name === 'barrier') || isChanArray(t))) this.harnessNames.set(p.name, this.names.fresh(mangle(p.name.name)));
       }
     }
 
@@ -196,6 +268,22 @@ class Translation {
     const effects = analyzeProcedureEffects(this.units.map((u) => ({ program: u.program, checked: u.checked, file: u.file })));
     const instanced = this.instanceAnalysis();
     const rootIr = this.procs.get(root)!;
+    // Arguments from calls or a directive: translated again with them (translate()), this model is never shown.
+    // With neither, the model with every value for every data parameter stands when it is complete
+    // (a par for with computed bounds covers every value as well); it is checked per value only when it is not.
+    let unplanned: InstancePlan | undefined;
+    if (this.target.kind === 'procedure' && !this.planned) {
+      const plan = this.planInstances(rootIr, instanced, directives);
+      if (plan && plan.source !== 'range') {
+        this.plan = plan;
+        return fail('translated again with the arguments it is checked with');
+      }
+      unplanned = plan;
+    }
+    const fallback = (model: CspModel): CspModel => {
+      if (unplanned && model.unsupported.length) this.plan = unplanned;
+      return model;
+    };
     const gens = new Map<ProcIR, GeneratedProc>();
     const prepared = new Map<ProcIR, PreparedProc>();
     // What each process may still do from each point (explain.ts: who can still answer a stuck operation).
@@ -220,7 +308,7 @@ class Translation {
       const next = new Map<ProcIR, Set<number>>();
       for (const [ir, prep] of prepared) {
         const entry = new Set(prep.entryParams);
-        next.set(ir, new Set(ir.params.flatMap((p, i) => (entry.has(p.cspm) || (p.ack && entry.has(p.ack)) ? [i] : []))));
+        next.set(ir, new Set(ir.params.flatMap((p, i) => (entry.has(p.cspm) || (p.ack && entry.has(p.ack)) || (p.len && entry.has(p.len)) ? [i] : []))));
       }
       const settled = round > 0 && [...next].every(([ir, set]) => sameNumbers(set, used.get(ir)));
       used = next;
@@ -230,9 +318,7 @@ class Translation {
 
     // The root and its harness.
     const harness = this.harness(rootIr, gens.get(rootIr)!);
-    let network;
-    try {
-      network = buildNetwork({
+    const networkInput = (rootInstances?: RootInstance[]): NetworkInput => ({
         procs: this.procs,
         generated: gens,
         effects,
@@ -249,10 +335,22 @@ class Translation {
         intRange: { lo: this.data.lo, hi: this.data.hi },
         serversOutside: harness.barriers.length > 0 || this.harnessChannels.some((h) => h.mediated),
         sourceText: (p, span) => sourceText(p.unit.text, span),
-      });
+        rootInstances,
+        observe: this.observe,
+    });
+    const roots = this.planned ? this.instances(rootIr, harness, networkInput) : undefined;
+    if (typeof roots === 'string') return fail(roots);
+    let network;
+    try {
+      network = buildNetwork(networkInput(roots));
     } catch (e) {
-      if (isTooBig(e)) return fail(`${e.message}: the model would be too large for FDR. Check one procedure at a time, or lower the par for bounds`);
+      if (isTooBig(e) && e.recursion) return fallback(fail(`'${e.recursion}' calls itself on the way to a par and does not stop within ${e.max} processes: recursion through par is modelled only when it stops after a number of steps known from the arguments`));
+      if (isTooBig(e)) return fallback(fail(`${e.message}: the model would be too large for FDR. Check one procedure at a time, or lower the par for bounds`));
       throw e;
+    }
+    for (const w of network.warnings) {
+      const at = this.ref(w.proc, w.at);
+      if (!this.warnings.some((x) => x.code === w.code && x.message === w.message)) this.warnings.push({ message: w.message, at, code: w.code });
     }
     for (const u of network.unsupported) {
       const slots = (u.resources ?? []).map((r) => this.slotOfResource(r)).filter((x): x is string => !!x);
@@ -260,7 +358,7 @@ class Translation {
       if (fresh.length) this.retry.push(...fresh);
       else this.unsupported.push({ message: u.message, at: this.ref(u.proc, u.at) });
     }
-    return this.assemble(rootIr, gens, network, harness, directives);
+    return fallback(this.assemble(rootIr, gens, network, harness, directives, roots));
   }
 
   private failed(message: string): CspModel {
@@ -288,8 +386,8 @@ class Translation {
   // Directives: //@csp int lo..hi, //@csp assert ..., /*@csp ... */
   // -------------------------------------------------------------------------
 
-  private directives(unit: UnitIR, comments: readonly CommentToken[] | undefined): { range?: { lo: number; hi: number }; compress?: boolean; asserts: Array<{ text: string; at: SourceRef }>; blocks: Array<{ text: string; at: SourceRef; sourceLine: number }> } {
-    const out: ReturnType<Translation['directives']> = { asserts: [], blocks: [] };
+  private directives(unit: UnitIR, comments: readonly CommentToken[] | undefined): { range?: { lo: number; hi: number }; compress?: boolean; asserts: Array<{ text: string; at: SourceRef }>; blocks: Array<{ text: string; at: SourceRef; sourceLine: number }>; checks: Array<{ name: string; args: string[]; at: SourceRef }> } {
+    const out: ReturnType<Translation['directives']> = { asserts: [], blocks: [], checks: [] };
     for (const c of comments ?? []) {
       const at: SourceRef = { uri: unit.uri, span: { start: { line: c.line, col: c.col }, end: { line: c.endLine, col: c.endCol } } };
       if (c.kind === 'line') {
@@ -308,8 +406,14 @@ class Translation {
           out.compress = true;
           continue;
         }
+        // `check altFIFO(6)`: the arguments a procedure checked on its own is elaborated with.
+        const check = /^check\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*$/.exec(body);
+        if (check) {
+          out.checks.push({ name: check[1], args: check[2].trim() ? check[2].split(',').map((a) => a.trim()) : [], at });
+          continue;
+        }
         if (/^assert\b/.test(body)) out.asserts.push({ text: body, at });
-        else this.warnings.push({ message: `unknown //@csp directive '${body}' (expected 'int lo..hi', 'compress' or 'assert ...')`, at });
+        else this.warnings.push({ message: `unknown //@csp directive '${body}' (expected 'int lo..hi', 'compress', 'check proc(arguments)' or 'assert ...')`, at });
       } else {
         const m = /^\/\*@csp\b([\s\S]*?)\*\/$/.exec(c.text.trim());
         if (!m) continue;
@@ -366,7 +470,7 @@ class Translation {
         if (s.kind === 'LocalDecl') {
           for (const decl of s.declarators) {
             const v = vars.get(decl.name);
-            if (!v || (v.type.k !== 'chan' && !(v.type.k === 'prim' && v.type.name === 'barrier'))) continue;
+            if (!v || (v.type.k !== 'chan' && !(v.type.k === 'prim' && v.type.name === 'barrier') && !isChanArray(v.type))) continue;
             const base = d === this.root ? mangle(decl.name.name) : `${this.baseNames.get(d)}_${mangle(decl.name.name)}`;
             this.localNames.set(decl.name, this.names.fresh(base));
           }
@@ -434,6 +538,21 @@ class Translation {
         forEachChildExpr(e, (x) => visit(x, str));
       };
       forEachExprInStmt(d.body, (e) => visit(e, false));
+      // A loop that counts down to a bound (`for (k = n - 1; k >= 0; k--)`) leaves its variable one
+      // below it: the value is stored, so it must be a modelled integer.
+      const countDown = (s: A.Stmt | undefined): void => {
+        if (!s) return;
+        if (s.kind === 'ForStmt' && !s.isPar && s.cond?.kind === 'BinaryExpr' && (s.cond.op === '>=' || s.cond.op === '<=')) {
+          const c = s.cond;
+          const [variable, bound] = c.op === '>=' ? [c.left, c.right] : [c.right, c.left];
+          const lit = bound.kind === 'Literal' && bound.litKind === 'int' ? parseIntLiteral(bound.text) : bound.kind === 'UnaryExpr' && bound.op === '-' && bound.operand.kind === 'Literal' && bound.operand.litKind === 'int' ? -(parseIntLiteral(bound.operand.text) ?? NaN) : undefined;
+          const name = variable.kind === 'NameExpr' ? variable.name.name : undefined;
+          const decrements = s.update.some((u) => (u.kind === 'UnaryExpr' && u.op === '--' && u.operand.kind === 'NameExpr' && u.operand.name.name === name) || (u.kind === 'AssignExpr' && u.op === '-=' && u.target.kind === 'NameExpr' && u.target.name.name === name));
+          if (name && lit !== undefined && !Number.isNaN(lit) && decrements) add(lit - 1, { uri: unit.uri, span: bound.span });
+        }
+        forEachChildStmt(s, countDown);
+      };
+      countDown(d.body);
     }
     return { values, at };
   }
@@ -496,7 +615,8 @@ class Translation {
     for (const d of reachable) {
       const unit = this.unitOf.get(d)!;
       const slotOf = (e: A.Expr): string | undefined => {
-        while (e.kind === 'ParenExpr' || e.kind === 'ChanEnd') e = e.kind === 'ParenExpr' ? e.expr : e.target;
+        // An element of a channel array is in its array's group: all of an array's channels are of one kind.
+        while (e.kind === 'ParenExpr' || e.kind === 'ChanEnd' || e.kind === 'ArrayAccess') e = e.kind === 'ParenExpr' ? e.expr : e.target;
         if (e.kind !== 'NameExpr') return undefined;
         const v = unit.checked.resolutions.get(e);
         if (!v) return undefined;
@@ -529,6 +649,40 @@ class Translation {
     for (const r of roots) this.extended.add(r);
   }
 
+  /** Procedures on a cycle of the call graph (an instance of one can run inside another instance of it). */
+  private findRecursion(reachable: A.ProcDecl[]): void {
+    const callees = new Map<A.ProcDecl, Set<A.ProcDecl>>();
+    for (const d of reachable) {
+      const unit = this.unitOf.get(d)!;
+      const out = new Set<A.ProcDecl>();
+      forEachExprInStmt(d.body, (e) => {
+        const visit = (x: A.Expr): void => {
+          if (x.kind === 'Invocation') {
+            const callee = unit.checked.calls.get(x)?.decl;
+            if (callee?.body && this.unitOf.has(callee)) out.add(callee);
+          }
+          forEachChildExpr(x, visit);
+        };
+        visit(e);
+      });
+      callees.set(d, out);
+    }
+    for (const d of reachable) {
+      const seen = new Set<A.ProcDecl>();
+      const work = [...(callees.get(d) ?? [])];
+      while (work.length) {
+        const x = work.pop()!;
+        if (x === d) {
+          this.recursive.add(d);
+          break;
+        }
+        if (seen.has(x)) continue;
+        seen.add(x);
+        work.push(...(callees.get(x) ?? []));
+      }
+    }
+  }
+
   /** The kind of the channel group a slot belongs to. */
   private kindOf(slot: string): ChannelKind {
     const root = this.ackSlots.find(slot);
@@ -539,7 +693,8 @@ class Translation {
   /** The union-find slot of a network resource key (a local channel instance or a harness channel). */
   private slotOfResource(resource: string): string | undefined {
     if (resource.startsWith('harness:')) {
-      const name = resource.slice('harness:'.length);
+      // An element of a channel-array parameter (`harness:chans[2]`) is in its array's group.
+      const name = resource.slice('harness:'.length).replace(/\[\d+\]$/, '');
       const index = this.harnessChannels.findIndex((h) => h.name === name);
       const id = this.procIds.get(this.root);
       const param = this.harnessChannels[index]?.param;
@@ -572,6 +727,7 @@ class Translation {
       constValue: (name, unit) => this.constValue(name, unit),
       locals: this.localResources,
       localName: (_proc, ident, kind) => this.localNames.get(ident) ?? this.names.fresh(`${kind}_${mangle(ident.name)}`),
+      recursive: (decl) => this.recursive.has(decl),
       isMain: (decl) => decl === this.root,
     };
   }
@@ -594,7 +750,7 @@ class Translation {
     const needs = new Set<ProcIR>();
     for (const ir of this.procs.values()) {
       if (ir.pars.length) par.add(ir);
-      if (ir.pars.length || ir.locals.some((l) => l.kind === 'barrier' || l.mediated)) needs.add(ir);
+      if (ir.pars.length || ir.locals.some((l) => l.kind === 'barrier' || l.mediated || l.instanced)) needs.add(ir);
     }
     let changed = true;
     while (changed) {
@@ -684,6 +840,20 @@ class Translation {
     for (const p of root.params) {
       // Every channel and barrier parameter gets its own: par branches use them even when the body's start does not.
       const span = p.info?.decl.span ?? root.decl.name.span;
+      if (p.role === 'channel' && p.array) {
+        if (!this.planned) {
+          // Checked per length instead (instances()), when this model is incomplete.
+          this.unsupported.push({ message: `parameter '${p.name}' is an array of channels: a procedure checked on its own is given one of the length its calls give, and no call fixes it here`, at: this.ref(root, span) });
+          continue;
+        }
+        // Fresh channels of the length each instance is checked with (instances()).
+        const elem = p.type.k === 'array' && p.type.elem.k === 'chan' ? p.type.elem.elem : D.any;
+        const name = (p.info && this.harnessNames.get(p.info.decl)) ?? this.names.fresh(p.cspm);
+        const ref: ChannelRef = { name: p.name, kind: 'channel', declaration: this.ref(root, span), owner: [] };
+        channels.push(name);
+        this.harnessChannels.push({ name, type: elem, ack: false, mediated: false, ref, elem: p.info ? typeText(p.info.type) : '?', param: root.params.indexOf(p), array: 0 });
+        continue;
+      }
       if (p.role === 'channel') {
         const name = (p.info && this.harnessNames.get(p.info.decl)) ?? this.names.fresh(p.cspm);
         const ref: ChannelRef = { name: p.name, kind: 'channel', declaration: this.ref(root, span), owner: [] };
@@ -715,8 +885,219 @@ class Translation {
   private readonly localResources = new Map<VarInfo, LocalResource>();
   /** Harness channel names, reserved per parameter before lowering. */
   private readonly harnessNames = new Map<A.Ident, string>();
-  private readonly harnessChannels: Array<{ name: string; type: DType; ack: boolean; mediated: boolean; ref: ChannelRef; elem: string; param: number }> = [];
+  /** `array`: a channel-array parameter, its longest length in the checked instances. */
+  private readonly harnessChannels: Array<{ name: string; type: DType; ack: boolean; mediated: boolean; ref: ChannelRef; elem: string; param: number; array?: number }> = [];
   private readonly harnessBarriers: Array<{ name: string; ref: ChannelRef }> = [];
+
+  // -------------------------------------------------------------------------
+  // Instances: the arguments a procedure checked on its own is elaborated with
+  // -------------------------------------------------------------------------
+
+  /**
+   * The plan for a checked procedure some of whose data parameters decide its
+   * network (structure.ts), or undefined when none does: the tuples a
+   * `//@csp check` directive names, else those its calls from the program
+   * give, else every modelled value (each tuple checked as an instance).
+   */
+  private planInstances(root: ProcIR, instanced: { par: Set<ProcIR> }, directives: ReturnType<Translation['directives']>): InstancePlan | undefined {
+    const structural = structuralParams(this.procs.values(), (d) => this.procs.get(d), (p) => instanced.par.has(p), (p) => this.recursive.has(p.decl)).get(root) ?? new Set<string>();
+    const params = root.params.flatMap((p, i) => ((p.array && p.len) || (p.role === 'value' && structural.has(p.cspm)) ? [i] : []));
+    if (!params.length) return undefined;
+    const literals = (tuples: InstancePlan['tuples']): number[] => [...new Set(tuples.flatMap((t) => [...t.values].flatMap(([i, v]) => (typeof v === 'number' && !root.params[i].array ? [v] : []))))];
+    const merge = (tuples: InstancePlan['tuples']): InstancePlan['tuples'] => {
+      const byKey = new Map<string, InstancePlan['tuples'][number]>();
+      for (const t of tuples) {
+        const key = params.map((i) => String(t.values.get(i) ?? '?')).join(',');
+        const known = byKey.get(key);
+        if (!known) byKey.set(key, { values: t.values, sites: [...t.sites] });
+        else for (const site of t.sites) if (!known.sites.some((x) => x.uri === site.uri && x.span.start.line === site.span.start.line && x.span.start.col === site.span.start.col)) known.sites.push(site);
+      }
+      return [...byKey.values()];
+    };
+    const before = this.warnings.length;
+    const mine = directives.checks.filter((c) => c.name === root.decl.name.name);
+    const named = mine.flatMap((c) => {
+      const values = this.checkArguments(c, root, params);
+      return values ? [{ values, sites: [c.at] }] : [];
+    });
+    const warnings = this.warnings.slice(before);
+    if (named.length) return { params, source: 'directive', tuples: merge(named), literals: literals(named), warnings };
+    const calls = merge(this.callSites(root.decl).map((c) => ({ values: new Map([...c.values].filter(([i]) => params.includes(i))), sites: [c.site] })));
+    // Calls that fix none of them are no better than every value.
+    if (calls.some((c) => c.values.size)) return { params, source: 'calls', tuples: calls, literals: literals(calls), warnings };
+    return { params, source: 'range', tuples: [{ values: new Map(), sites: [] }], literals: [], warnings };
+  }
+
+  /** `//@csp check foo(0, 5, 6)` or `foo(i = 0, chans = 5, size = 6)`: data parameters in order, a channel array by its length. */
+  private checkArguments(c: { name: string; args: string[]; at: SourceRef }, root: ProcIR, params: number[]): Map<number, number | boolean> | undefined {
+    const data = root.params.flatMap((p, i) => (p.role === 'value' || p.array ? [i] : []));
+    const values = new Map<number, number | boolean>();
+    const value = (text: string): number | boolean | undefined => (text === 'true' ? true : text === 'false' ? false : /^-?\d+$/.test(text) ? Number(text) : undefined);
+    const usage = `//@csp check ${root.decl.name.name}(${data.map((i) => root.params[i].name).join(', ')})`;
+    for (const [k, arg] of c.args.entries()) {
+      const m = /^([A-Za-z_$][\w$]*)\s*=\s*(.+)$/.exec(arg);
+      const index = m ? root.params.findIndex((p) => p.name === m[1]) : data[k];
+      const v = value((m ? m[2] : arg).trim());
+      if (index === undefined || index < 0 || !data.includes(index) || v === undefined || (root.params[index].array && (typeof v !== 'number' || v < 0))) {
+        this.warnings.push({ message: `//@csp check: '${arg}' is not an argument of ${usage} (a whole number or true/false per data parameter, a channel array by its length); ignored`, at: c.at });
+        return undefined;
+      }
+      values.set(index, v);
+    }
+    const missing = params.filter((i) => !values.has(i));
+    if (missing.length) this.warnings.push({ message: `//@csp check names no value for ${missing.map((i) => root.params[i].name).join(', ')}: ${missing.length === 1 ? 'it takes' : 'they take'} every modelled value for which the network is finite`, at: c.at });
+    return new Map([...values].filter(([i]) => params.includes(i)));
+  }
+
+  /** Every call of `decl` from outside it that elaboration of the program (from main) unfolds, with the arguments it knows there. */
+  private callSites(decl: A.ProcDecl): Array<{ values: Map<number, number | boolean>; site: SourceRef }> {
+    const found: Array<{ values: Map<number, number | boolean>; site: SourceRef }> = [];
+    try {
+      new Translation(this.input, { kind: 'program' }, new Set(), undefined, (call) => {
+        if (call.callee.decl === decl && !call.nested) found.push({ values: call.values, site: { uri: call.caller.unit.uri, span: call.site.span } });
+      }).run();
+    } catch (e) {
+      // A program elaboration gives up (too many processes): the calls it reached still count.
+      if (!isTooBig(e)) throw e;
+    }
+    return found;
+  }
+
+  /**
+   * The root instances of a planned procedure check: each tuple of the plan,
+   * a parameter it leaves open taking every modelled value whose network is
+   * finite. A string says why there is none (not modelled).
+   */
+  private instances(root: ProcIR, harness: ReturnType<Translation['harness']>, networkInput: (roots?: RootInstance[]) => NetworkInput): RootInstance[] | string {
+    const plan = this.planned!;
+    const { lo, hi } = this.data;
+    const proc = root.decl.name.name;
+    const names = (indices: number[]): string => listText(indices.map((i) => root.params[i].name));
+    const domain = (i: number): Array<number | boolean> | undefined => {
+      const p = root.params[i];
+      // An array of no channels gives no network to check (and this ProcessJ build hangs on its empty par for).
+      if (p.array) return range(1, Math.max(1, hi));
+      if (p.type.k === 'bool') return [false, true];
+      return p.type.k === 'int' ? range(lo, hi) : undefined;
+    };
+    const fixed = fixedParams(root);
+    const modelled = (indices: number[]): string => {
+      const values = indices.some((i) => !root.params[i].array) ? [`${lo}..${hi}`] : [];
+      return [...values, ...(indices.some((i) => root.params[i].array) ? [`lengths 1..${Math.max(1, hi)}`] : [])].join(', ');
+    };
+    const spec = (values: Map<number, number | boolean>): RootInstance => {
+      const byName = new Map<string, number | boolean>();
+      const text = new Map<string, string>();
+      const bindings = new Map<string, Binding>();
+      for (const [i, v] of values) {
+        const p = root.params[i];
+        const shown = typeof v === 'number' ? show(E.int(v)) : String(v);
+        if (p.array && p.len) {
+          byName.set(p.len, v);
+          text.set(p.len, shown);
+          const h = this.harnessChannels.find((x) => x.param === i)!;
+          bindings.set(p.cspm, { value: E.n(h.name), array: { resource: `harness:${h.name}`, ref: h.ref, size: Number(v) } });
+        } else {
+          if (fixed.has(p.cspm)) byName.set(p.cspm, v);
+          text.set(p.cspm, shown);
+        }
+      }
+      return { values: byName, fixed: text, bindings, args: harness.args.filter((a) => !text.has(a.name)).map((a) => a.name) };
+    };
+    const finite = (s: RootInstance): string | undefined => {
+      try {
+        // A composition a channel server fixes (the next round mediates it) is not about the arguments.
+        const n = buildNetwork(networkInput([s]));
+        return n.unsupported.find((u) => !u.resources?.length)?.message;
+      } catch (e) {
+        if (isTooBig(e)) return e.message;
+        throw e;
+      }
+    };
+    const kept: Array<{ values: Map<number, number | boolean>; sites: SourceRef[] }> = [];
+    const dropped: Array<{ values: Map<number, number | boolean>; why: string }> = [];
+    const opened = new Set<number>();
+    const outsideRange: string[] = [];
+    for (const t of plan.tuples) {
+      // A value outside the modelled integers (set with //@csp int or the settings) cannot be checked.
+      const outside = [...t.values].filter(([i, v]) => typeof v === 'number' && !root.params[i].array && (v < lo || v > hi));
+      if (outside.length) {
+        outsideRange.push(...outside.map(([i, v]) => `${root.params[i].name} = ${v}`));
+        this.warnings.push({ message: `${proc} is not checked with ${outside.map(([i, v]) => `${root.params[i].name} = ${v}`).join(', ')}${t.sites.length ? ` (${where(t.sites[0], this.rootUnit.uri)})` : ''}: outside the modelled integers ${lo}..${hi}`, at: t.sites[0] });
+        continue;
+      }
+      const open = plan.params.filter((i) => !t.values.has(i));
+      for (const i of open) opened.add(i);
+      let combos: Array<Map<number, number | boolean>> = [new Map(t.values)];
+      for (const i of open) {
+        const values = domain(i);
+        if (!values) return `'${proc}' on its own: its parameter '${root.params[i].name}' decides its network and no call fixes it; values of its type cannot be enumerated. Call ${proc} from main with a concrete argument, or name one with //@csp check ${proc}(...)`;
+        combos = combos.flatMap((c) => values.map((v) => new Map(c).set(i, v)));
+        if (combos.length > MAX_INSTANCES * 4) break;
+      }
+      if (combos.length > MAX_INSTANCES * 4) return `'${proc}' on its own: ${names(open)} decide its network and no call fixes them; every modelled combination (${lo}..${hi}) is too many instances to check. Call ${proc} from main with concrete arguments, or name them with //@csp check ${proc}(...)`;
+      for (const values of combos) {
+        const why = open.length ? finite(spec(values)) : undefined;
+        if (why) dropped.push({ values, why });
+        else kept.push({ values, sites: t.sites });
+      }
+    }
+    const label = (values: Map<number, number | boolean>): string => plan.params.filter((i) => values.has(i)).map((i) => (root.params[i].array ? `${root.params[i].name} of length ${values.get(i)}` : `${root.params[i].name} = ${values.get(i)}`)).join(', ');
+    const data = root.params.flatMap((p, i) => (p.role === 'value' || p.array ? [i] : []));
+    const example = data.every((i) => plan.params.includes(i))
+      ? `//@csp check ${proc}(${data.map((i) => `<${root.params[i].name}>`).join(', ')})`
+      : `//@csp check ${proc}(${plan.params.map((i) => `${root.params[i].name} = <${root.params[i].name}>`).join(', ')})`;
+    if (!kept.length && outsideRange.length && !dropped.length) {
+      return `'${proc}' on its own: ${plan.source === 'directive' ? '//@csp check gives' : 'its calls give'} ${listText([...new Set(outsideRange)])}, outside the modelled integers ${lo}..${hi}. Widen the range with //@csp int, or name smaller arguments above the procedure with ${example}`;
+    }
+    if (!kept.length) {
+      const why = dropped[0]?.why;
+      const one = plan.params.length === 1;
+      return `'${proc}' on its own: ${names(plan.params)} ${one ? 'decides' : 'decide'} its network, no call in the program fixes ${one ? 'it' : 'them'}, and for no modelled value (${lo}..${hi}) does elaboration end${why ? ` (${lowerFirst(why)})` : ''}. If it ends for some ${one ? 'argument' : 'arguments'}, call ${proc} from main with ${one ? 'it' : 'them'}, or name ${one ? 'it' : 'them'} above the procedure with ${example}`;
+    }
+    if (kept.length > MAX_INSTANCES) return `'${proc}' on its own: ${kept.length} argument tuples (${names(plan.params)}) would each be an instance to check, more than ${MAX_INSTANCES}. Name the ones to check with ${example}`;
+    const specs = kept.map((k) => spec(k.values));
+    // A channel-array parameter's CSPm channel holds the longest instance's channels.
+    for (const k of kept) {
+      for (const [i, v] of k.values) {
+        const h = root.params[i].array ? this.harnessChannels.find((x) => x.param === i) : undefined;
+        if (h) h.array = Math.max(h.array ?? 0, Number(v));
+      }
+    }
+    // What the report says it was checked with.
+    const short = plan.params.map((i) => {
+      const p = root.params[i];
+      const vs = [...new Set(kept.map((k) => k.values.get(i)))].filter((v) => v !== undefined) as Array<number | boolean>;
+      const sorted = vs.every((v) => typeof v === 'number') ? (vs as number[]).sort((a, b) => a - b) : vs;
+      const consecutive = sorted.length > 2 && sorted.every((v, k) => typeof v === 'number' && (k === 0 || v === (sorted[k - 1] as number) + 1));
+      const text = consecutive ? `${sorted[0]}..${sorted[sorted.length - 1]}` : sorted.join(', ');
+      return p.array ? `${p.name} of length ${text}` : `${p.name} = ${text}`;
+    }).join(', ');
+    const sites = kept.flatMap((k) => k.sites).filter((x, n, all) => all.findIndex((y) => y.uri === x.uri && y.span.start.line === x.span.start.line) === n);
+    const lines = sites.map((x) => where(x, this.rootUnit.uri).replace(/^line /, ''));
+    const count = kept.length > 1 ? `${kept.length} instances, each checked; ` : '';
+    const from = plan.source === 'directive'
+      ? `from //@csp check at ${sites.length === 1 ? 'line' : 'lines'} ${listText(lines)}`
+      : plan.source === 'calls'
+        ? `${sites.length === 1 ? 'the call' : 'the calls'} at ${sites.length === 1 ? 'line' : 'lines'} ${listText(lines)}`
+        : `no call in the program fixes ${names(plan.params)}: every modelled value (${modelled(plan.params)}) for which the network is finite`;
+    const leftOpen = plan.source !== 'range' && opened.size ? `; ${names([...opened])} ${opened.size === 1 ? 'takes' : 'take'} every modelled value (${modelled([...opened])}) for which the network is finite, as not every call fixes ${opened.size === 1 ? 'it' : 'them'}` : '';
+    const notChecked = dropped.length ? `; not checked with ${listText(dropped.slice(0, 4).map((d) => label(d.values)))}${dropped.length > 4 ? ' and others' : ''} (${lowerFirst(dropped[0].why)})` : '';
+    const detail = `${short} (${count}${from}${leftOpen}${notChecked})`;
+    this.checkedWith = {
+      text: `${proc} checked with ${detail}`,
+      detail,
+      short,
+      source: plan.source,
+      instances: kept.map((k) => ({
+        label: label(k.values),
+        values: Object.fromEntries([...k.values].filter(([i]) => !root.params[i].array).map(([i, v]) => [root.params[i].name, v])),
+        arrays: Object.fromEntries([...k.values].filter(([i]) => root.params[i].array).map(([i, v]) => [root.params[i].name, Number(v)])),
+        sites: k.sites,
+      })),
+    };
+    return specs;
+  }
 
   // -------------------------------------------------------------------------
   // The file
@@ -728,8 +1109,11 @@ class Translation {
     network: ReturnType<typeof buildNetwork>,
     harness: ReturnType<Translation['harness']>,
     directives: ReturnType<Translation['directives']>,
+    /** The root instances of a procedure checked per argument tuple (instances()). */
+    specs?: RootInstance[],
   ): CspModel {
     const unit = this.rootUnit;
+    const allProcesses = network.roots.flatMap((r) => r.processes);
     const fileName = unit.file ? path.basename(unit.file) : 'buffer.pj';
     const program = this.target.kind === 'program';
     // A checked procedure's process is named after it (its definitions all have a `__` suffix).
@@ -757,10 +1141,14 @@ class Translation {
     // Header and summary.
     lines.push(`-- Generated by processj-lsp from ${fileName}. Regenerated by Convert to CSP and by Check with FDR; edit the ProcessJ source, not this file.`);
     lines.push('--');
-    lines.push(program ? '-- Target: the whole program, from main (MAIN).' : `-- Target: procedure ${root.decl.name.name} on its own (${rootName}), called with every value for its data parameters (pj_call).`);
+    lines.push(program
+      ? '-- Target: the whole program, from main (MAIN).'
+      : this.checkedWith
+        ? `-- Target: procedure ${root.decl.name.name} on its own (${rootName}): ${commentText(this.checkedWith.text)}${harness.args.some((a) => !specs?.every((x) => x.fixed?.has(a.name))) ? '; its other data parameters take every value (pj_call)' : ''}.`
+        : `-- Target: procedure ${root.decl.name.name} on its own (${rootName}), called with every value for its data parameters (pj_call).`);
     lines.push(`-- Integers: byte, short, char, int and long range over Int_t = ${rangeText(this.data.lo, this.data.hi)} (${this.intSource === 'comment' ? 'from //@csp int' : this.intSource === 'option' ? 'from the settings' : 'inferred from the literals'}).`);
     const assumptions = this.assumptions();
-    for (const a of assumptions.slice(1)) lines.push(`-- ${commentText(a)}`);
+    for (const a of assumptions.slice(1)) if (!this.checkedWith || !a.startsWith(this.checkedWith.text)) lines.push(`-- ${commentText(a)}`);
     if (this.warnings.length) {
       lines.push('-- Warnings:');
       for (const w of this.warnings) lines.push(`--   ${w.at ? `${fileName}:${w.at.span.start.line + 1}: ` : ''}${commentText(w.message)}`);
@@ -789,6 +1177,19 @@ class Translation {
     const ackMeaning = 'the reader finished with the value (after its extended rendezvous block): the writer goes on';
     for (const h of this.harnessChannels) {
       const domain = this.data.domain(h.type) ?? 'PJ_Any';
+      if (h.array !== undefined) {
+        // A channel-array parameter: fresh channels, as many as the longest instance is given; the
+        // index field covers every index a length in Int_t allows (as for an array declared here).
+        const size = Math.max(1, h.array);
+        declareChannel(h.name, `${rangeText(0, Math.max(size - 1, this.data.hi))}.${domain}`, { name: h.name, role: 'channel', ref: h.ref, elementType: h.elem, hidden: false, harness: true, array: size });
+        for (const p of allProcesses) {
+          for (const [key, ref] of Object.entries(p.channels)) {
+            if (!key.startsWith(`${h.name}.`) || channels[key]) continue;
+            channels[key] = { name: key, role: 'channel', ref, elementType: h.elem, hidden: false, harness: true, part: { channel: h.name, index: Number(key.slice(h.name.length + 1)) } };
+          }
+        }
+        continue;
+      }
       declareChannel(h.name, domain, { name: h.name, role: 'channel', ref: h.ref, elementType: h.elem, hidden: false, harness: true });
       if (h.ack) declareChannel(`${h.name}__ack`, undefined, { name: `${h.name}__ack`, role: 'ack', of: h.name, hidden: true, meaning: ackMeaning });
       if (h.mediated) {
@@ -801,6 +1202,28 @@ class Translation {
       for (const local of ir.locals) {
         if (local.kind !== 'channel') continue;
         const domain = local.elem ? this.data.domain(local.elem) : undefined;
+        if (local.array || (local.instanced && !local.mediated)) {
+          // One CSPm channel for an array, its first field the element (as many as the longest instance has);
+          // a recursive procedure's channel carries the procedure instance first.
+          const size = Math.max(1, network.arraySizes.get(local) ?? 1);
+          const fallback: ChannelRef = { name: local.name, kind: 'channel', declaration: this.ref(ir, local.ident.span), owner: [] };
+          // The index field covers every index a length in Int_t allows: FDR compiles each process on its
+          // own, for every length its parent could hand it, and the bounds check only rules out indices past that length.
+          const index = local.array ? `${rangeText(0, Math.max(size - 1, this.data.hi))}.` : '';
+          const inst = local.instanced ? `${rangeText(1, Math.max(1, count))}.` : '';
+          declareChannel(local.cspm, `${inst}${index}${domain ?? 'PJ_Any'}`, { name: local.cspm, role: 'channel', ref: fallback, elementType: local.elemText, hidden: ir !== root, ...(local.array ? { array: size } : {}), ...(local.instanced ? { instanced: true } : {}) });
+          if (local.ack) declareChannel(local.ack, inst ? inst.slice(0, -1) : undefined, { name: local.ack, role: 'ack', of: local.cspm, ref: fallback, hidden: true, meaning: ackMeaning, ...(inst ? { instanced: true } : {}) });
+          // Each channel the network gave an identity of its own (an element, an instance's channel): an entry per event prefix.
+          for (const p of allProcesses) {
+            for (const [key, ref] of Object.entries(p.channels)) {
+              if (!key.startsWith(`${local.cspm}.`) || channels[key]) continue;
+              const rest = key.slice(local.cspm.length + 1).split('.').map(Number);
+              const part = { channel: local.cspm, ...(local.instanced ? { instance: rest[0] } : {}), ...(local.array ? { index: rest[local.instanced ? 1 : 0] } : {}) };
+              channels[key] = { name: key, role: 'channel', ref, elementType: local.elemText, hidden: ir !== root, part };
+            }
+          }
+          continue;
+        }
         const ref = this.channelRef(local, ir, network);
         // A mediated channel's events carry the procedure instance, like a barrier's.
         const inst = local.mediated ? `${rangeText(1, Math.max(1, count))}.` : '';
@@ -859,7 +1282,15 @@ class Translation {
       const count = network.instances.get(ir) ?? 0;
       lines.push(`PJInst_${ir.name} = ${rangeText(1, Math.max(1, count))}`);
       for (const c of gens.get(ir)!.channels) {
-        const fields = [...(c.instanced ? [`PJInst_${ir.name}`] : []), ...(c.bounds ?? []), ...c.payload.map((t) => this.data.domain(t) ?? 'PJ_Any')];
+        // A fork carries only what elaboration found every parent sends (network.ts forkDomains).
+        const known = c.role === 'fork' ? network.forkDomains.get(c.par) : undefined;
+        const field = (i: number, full: string): string => {
+          const set = known?.[i];
+          return set ? `{ ${[...set].sort((a, b) => Number(a) - Number(b)).map(String).join(', ')} }` : full;
+        };
+        const bounds = (c.bounds ?? []).map((b, i) => field(i, b));
+        const fields = [...(c.instanced ? [`PJInst_${ir.name}`] : []), ...bounds, ...c.payload.map((t, i) => field(bounds.length + i, this.data.domain(t) ?? 'PJ_Any'))];
+        if (c.role === 'fork' && fields.length > (c.instanced ? 1 : 0)) lines.push(...forkSets(c, fields.slice(c.instanced ? 1 : 0), network.forkTuples.get(c.par), count));
         const where = `${path.basename(ir.unit.file ?? 'buffer')}:${c.par.stmt.span.start.line + 1}`;
         const what = c.par.kind === 'par' ? 'branch' : 'iteration';
         declareChannel(c.name, fields.length ? fields.join('.') : undefined, {
@@ -923,36 +1354,48 @@ class Translation {
     // Network and harness.
     lines.push('-- The process network: every process instance is one leaf (see the source map)');
     lines.push(...network.definitions);
-    const processes = [...network.processes];
-    let tree: CspNetworkNode = network.tree;
     const mediatedHarness = this.harnessChannels.filter((h) => h.mediated);
     const leafInfo = (kind: 'barrier' | 'channel', definition: string, args: string[], ref: ChannelRef, resource: string): CspProcessInfo => ({
       position: [], leaf: `${definition}(${args.join(', ')})`, definition, args, kind, barrier: ref, resource, channels: {}, uses: [], enrolled: [],
     });
-    const servers = [
-      // A barrier parameter of a checked procedure: its counter as if the caller enrolled nobody else.
-      ...this.harnessBarriers.map((b) => ({ info: leafInfo('barrier', 'PJ_BAR', [b.name, String(Math.max(2, network.barrierMax))], b.ref, `harness:${b.name}`), events: [b.name] })),
-      ...mediatedHarness.map((h) => {
-        const names = [h.name, `${h.name}__take`, `${h.name}__done`, `${h.name}__ack`];
-        return { info: leafInfo('channel', 'PJ_MED', names, h.ref, `harness:${h.name}`), events: names };
-      }),
-    ];
-    if (servers.length) {
-      // Servers of the harness, as leaves of their own (explain.ts reads a barrier parameter's counter).
-      let serverText = '';
-      let serverTree: CspNetworkNode | undefined;
-      for (const sv of servers) {
-        processes.push(sv.info);
-        const leaf: CspNetworkNode = { kind: 'leaf', process: processes.length - 1 };
-        serverText = serverTree ? `(${serverText} [| {pj_end} |] ${sv.info.leaf})` : sv.info.leaf;
-        serverTree = serverTree ? { kind: 'parallel', sync: '{pj_end}', left: serverTree, right: leaf } : leaf;
+    // Each root instance (one, unless a checked procedure is checked per argument tuple): its network, with the harness's servers.
+    const many = network.roots.length > 1;
+    const built = network.roots.map((r, k) => {
+      const suffix = many ? `_${k + 1}` : '';
+      const processes = [...r.processes];
+      let tree: CspNetworkNode = r.tree;
+      const servers = [
+        // A barrier parameter of a checked procedure: its counter as if the caller enrolled nobody else.
+        ...this.harnessBarriers.map((b) => ({ info: leafInfo('barrier', 'PJ_BAR', [b.name, String(Math.max(2, network.barrierMax))], b.ref, `harness:${b.name}`), events: [b.name] })),
+        ...mediatedHarness.map((h) => {
+          const names = [h.name, `${h.name}__take`, `${h.name}__done`, `${h.name}__ack`];
+          return { info: leafInfo('channel', 'PJ_MED', names, h.ref, `harness:${h.name}`), events: names };
+        }),
+      ];
+      const args = r.params.length ? `(${r.params.join(', ')})` : '';
+      if (servers.length) {
+        // Servers of the harness, as leaves of their own (explain.ts reads a barrier parameter's counter).
+        let serverText = '';
+        let serverTree: CspNetworkNode | undefined;
+        for (const sv of servers) {
+          processes.push(sv.info);
+          const leaf: CspNetworkNode = { kind: 'leaf', process: processes.length - 1 };
+          serverText = serverTree ? `(${serverText} [| {pj_end} |] ${sv.info.leaf})` : sv.info.leaf;
+          serverTree = serverTree ? { kind: 'parallel', sync: '{pj_end}', left: serverTree, right: leaf } : leaf;
+        }
+        const sync = `{| ${[...servers.flatMap((sv) => sv.events), 'pj_end'].join(', ')} |}`;
+        lines.push(`PJ_NET_B${suffix}${args} = (${r.root}${args} [| ${sync} |] ${serverText})`);
+        tree = { kind: 'named', name: `PJ_NET_B${suffix}`, child: { kind: 'parallel', sync, left: r.tree, right: serverTree! } };
       }
-      const args = harness.args.length ? `(${harness.args.map((a) => a.name).join(', ')})` : '';
-      const sync = `{| ${[...servers.flatMap((sv) => sv.events), 'pj_end'].join(', ')} |}`;
-      lines.push(`PJ_NET_B${args} = (${network.root}${args} [| ${sync} |] ${serverText})`);
-      tree = { kind: 'named', name: 'PJ_NET_B', child: { kind: 'parallel', sync, left: network.tree, right: serverTree! } };
-    }
-    const net = servers.length ? 'PJ_NET_B' : network.root;
+      const net = servers.length ? `PJ_NET_B${suffix}` : r.root;
+      const netCall = r.params.length ? `${net}(${r.params.join(', ')})` : net;
+      // No process of the network terminates on its own (network.ts): the program ends when the root's
+      // pj_end happens, and the exception turns that into SKIP. A network of one process ends by itself.
+      const ending = r.endsItself ? netCall : `(${netCall} [| {pj_end} |> SKIP)`;
+      const top: CspNetworkNode = { kind: 'hide', hidden: 'PJ_HIDDEN', child: r.endsItself ? tree : { kind: 'exception', events: '{pj_end}', child: tree } };
+      assignPositions(processes, top, []);
+      return { suffix, args, ending, processes, top, params: r.params, spec: specs?.[k] };
+    });
     hidden.push('pj_end');
     lines.push(`PJ_HIDDEN = {| ${[...new Set(hidden)].join(', ')} |}`);
     // A checked procedure's own channels and barriers: what its branches say to each other. Visible
@@ -960,22 +1403,38 @@ class Translation {
     // are about what its caller sees.
     const local = program ? [] : root.locals.flatMap((l) => (l.kind === 'barrier' ? [l.cspm] : [l.cspm, ...(l.mediated ? [l.mediated.take] : [])]));
     if (local.length) lines.push(`PJ_LOCAL = {| ${local.join(', ')} |}`);
-    const netCall = harness.args.length ? `${net}(${harness.args.map((a) => a.name).join(', ')})` : net;
-    // No process of the network terminates on its own (network.ts): the program ends when the root's
-    // pj_end happens, and the exception turns that into SKIP. A network of one process ends by itself.
-    const ending = network.endsItself ? netCall : `(${netCall} [| {pj_end} |> SKIP)`;
     // The data arguments of a checked procedure are its first event: every check covers every
     // value, and a counterexample starts with the values it needs (`pj_call.3`). The network
     // under each value is one named definition, which FDR's --divide output shows by name.
     let networkRoot = rootName;
-    if (harness.args.length) {
-      const params = harness.args.map((a) => a.name).join(', ');
-      networkRoot = 'PJ_RUN';
-      lines.push(`${rootName} = pj_call${harness.args.map((a) => `?${a.name}`).join('')} -> PJ_RUN(${params})`);
-      lines.push(`PJ_RUN(${params}) = ${ending} \\ PJ_HIDDEN`);
-      definitions.PJ_RUN = { name: 'PJ_RUN', kind: 'process', params: harness.args.map((a) => ({ name: a.name, role: 'value', variable: a.variable })), procedure: root.decl.name.name, at: this.ref(root, root.decl.name.span) };
+    const runDefinition = (name: string, params: string[]): CspDefinitionInfo => ({ name, kind: 'process', params: params.map((n) => ({ name: n, role: 'value', variable: harness.args.find((a) => a.name === n)?.variable ?? n })), procedure: root.decl.name.name, at: this.ref(root, root.decl.name.span) });
+    const instanceRoots: string[] = [];
+    if (!specs) {
+      const [only] = built;
+      if (harness.args.length) {
+        const params = harness.args.map((a) => a.name).join(', ');
+        networkRoot = 'PJ_RUN';
+        lines.push(`${rootName} = pj_call${harness.args.map((a) => `?${a.name}`).join('')} -> PJ_RUN(${params})`);
+        lines.push(`PJ_RUN(${params}) = ${only.ending} \\ PJ_HIDDEN`);
+        definitions.PJ_RUN = runDefinition('PJ_RUN', harness.args.map((a) => a.name));
+      } else {
+        lines.push(`${rootName} = (${only.ending} \\ PJ_HIDDEN)`);
+      }
+    } else if (!harness.args.length && !many) {
+      lines.push(`${rootName} = (${built[0].ending} \\ PJ_HIDDEN)`);
     } else {
-      lines.push(`${rootName} = (${ending} \\ PJ_HIDDEN)`);
+      // Checked per argument tuple (checkedWith): `pj_call` names the fixed arguments of each instance,
+      // the others are any value as before; the caller chooses which instance it calls.
+      const branches = built.map((b) => {
+        const name = `PJ_RUN${b.suffix}`;
+        instanceRoots.push(name);
+        lines.push(`${name}${b.args} = ${b.ending} \\ PJ_HIDDEN`);
+        definitions[name] = runDefinition(name, b.params);
+        const call = harness.args.length ? `pj_call${harness.args.map((a) => (b.spec?.fixed?.has(a.name) ? `.${b.spec.fixed.get(a.name)}` : `?${a.name}`)).join('')} -> ` : '';
+        return `${call}${name}${b.args}`;
+      });
+      networkRoot = instanceRoots[0];
+      lines.push(`${rootName} = ${branches.length > 1 ? branches.map((x) => `(${x})`).join(' [] ') : branches[0]}`);
     }
     lines.push('PJ_DONE = pj_done -> PJ_DONE');
     lines.push('-- Errors end the program (and are reported by the error check), so they are not deadlocks:');
@@ -984,14 +1443,14 @@ class Translation {
     lines.push('PJ_SAFE = SKIP [] ([] pj_e : diff(Events, {| pj_error |}) @ pj_e -> PJ_SAFE)');
     definitions[rootName] = { name: rootName, kind: 'process', params: [], procedure: root.decl.name.name, at: this.ref(root, root.decl.name.span) };
     lines.push('');
-    const network2: CspNetworkNode = { kind: 'hide', hidden: 'PJ_HIDDEN', child: network.endsItself ? tree : { kind: 'exception', events: '{pj_end}', child: tree } };
-    assignPositions(processes, network2, []);
+    const processes = built[0].processes;
+    const network2 = built[0].top;
 
     // Assertions.
     lines.push('-- Assertions');
     const assertions: CspAssertion[] = [];
     const user: CspSourceMap['user'] = [];
-    const targetInfo = { kind: this.target.kind, name: root.decl.name.name, at: this.ref(root, root.decl.name.span) } as const;
+    const targetInfo = { kind: this.target.kind, name: root.decl.name.name, at: this.ref(root, root.decl.name.span), ...(this.checkedWith ? { arguments: this.checkedWith.short } : {}) };
     const add = (id: string, property: CheckProperty, label: string, severity: CspAssertion['severity'], assertion: string, at?: SourceRef, negated?: boolean): void => {
       assertions.push({ id, index: assertions.length, property, label, severity, target: targetInfo, assertion, at, ...(negated ? { negated } : {}) });
       lines.push(`assert ${assertion}`);
@@ -1039,9 +1498,31 @@ class Translation {
       intRange: { lo: this.data.lo, hi: this.data.hi, source: this.intSource },
       assumptions,
       assertions,
-      sourceMap: { definitions, channels, errors, processes, network: network2, networkRoot, constructors: this.constructors(), user, transitions },
+      sourceMap: {
+        definitions,
+        channels,
+        errors,
+        processes,
+        network: network2,
+        networkRoot,
+        ...(instanceRoots.length > 1
+          ? {
+            instances: built.map((b, k) => ({
+              label: this.checkedWith?.instances[k]?.label ?? `instance ${k + 1}`,
+              networkRoot: instanceRoots[k],
+              network: b.top,
+              processes: b.processes,
+              ...(harness.args.length ? { call: harness.args.map((a) => b.spec?.fixed?.get(a.name)?.replace(/^\((-?\d+)\)$/, '$1')) } : {}),
+            })),
+          }
+          : {}),
+        constructors: this.constructors(),
+        user,
+        transitions,
+      },
       warnings: this.warnings,
       unsupported: this.unsupported,
+      ...(this.checkedWith ? { checkedWith: this.checkedWith } : {}),
     };
   }
 
@@ -1061,7 +1542,7 @@ class Translation {
   }
 
   private channelRef(local: { name: string; kind: 'channel' | 'barrier'; ident: A.Ident }, ir: ProcIR, network: ReturnType<typeof buildNetwork>): ChannelRef {
-    for (const p of network.processes) {
+    for (const p of network.roots.flatMap((r) => r.processes)) {
       const ref = p.channels[this.localNames.get(local.ident) ?? ''];
       if (ref) return ref;
     }
@@ -1086,6 +1567,7 @@ class Translation {
   private assumptions(): string[] {
     return [
       `Integers (byte, short, char, int, long) range over ${this.data.lo}..${this.data.hi}; storing or sending a value outside the range is reported as a runtime error of the model, not wrapped.`,
+      ...(this.checkedWith ? [`${this.checkedWith.text}: its arguments decide its network (how many processes and channels it runs), so it is checked as called, not with every value.`] : []),
       ...(this.data.saturated
         ? [`Integers that never decide anything (no condition, loop, index, divisor or specification depends on them: they are only passed on, kept in variables or printed) are not range-checked: outside ${this.data.lo}..${this.data.hi} they become one value, shown as "a value outside ${this.data.lo}..${this.data.hi}", which cannot change a verdict.${this.saturatedText() ? ` Here: ${this.saturatedText()}.` : ''}`]
         : []),
@@ -1117,6 +1599,50 @@ class UnionFind {
     const rb = this.find(b);
     if (ra !== rb) this.parent.set(ra, rb);
   }
+}
+
+/**
+ * The set a fork's slots take their fields from (gen.ts forkSetName): per
+ * instance, the tuples its parents send (a field elaboration does not know
+ * ranges over its declared set); every declared value for an instance
+ * elaboration never reached.
+ */
+function forkSets(c: ForkChannel, domains: string[], known: ReadonlyMap<number, Array<Array<number | boolean | undefined>>> | undefined, count: number): string[] {
+  const name = forkSetName(c.name);
+  const vars = domains.map((_, i) => `pj_f${i}`);
+  const pattern = vars.join('.');
+  const all = `{ ${pattern} | ${vars.map((v, i) => `${v} <- ${domains[i]}`).join(', ')} }`;
+  const setOf = (tuples: Array<Array<number | boolean | undefined>> | undefined): string => {
+    if (!tuples?.length) return all;
+    const parts = tuples.map((t) => {
+      if (t.every((v) => v !== undefined)) return `{ ${t.map(String).join('.')} }`;
+      const free = vars.filter((_, i) => t[i] === undefined);
+      return `{ ${vars.map((v, i) => (t[i] === undefined ? v : String(t[i]))).join('.')} | ${free.map((v) => `${v} <- ${domains[vars.indexOf(v)]}`).join(', ')} }`;
+    });
+    return parts.length === 1 ? parts[0] : `Union({ ${parts.join(', ')} })`;
+  };
+  if (!c.instanced) return [`${name} = ${setOf(known?.get(0))}`];
+  return Array.from({ length: Math.max(1, count) }, (_, i) => `${name}(${i + 1}) = ${setOf(known?.get(i + 1))}`);
+}
+
+function range(lo: number, hi: number): number[] {
+  const out: number[] = [];
+  for (let i = lo; i <= hi; i++) out.push(i);
+  return out;
+}
+
+/** `a`, `a and b`, `a, b and c`. */
+function listText(items: string[]): string {
+  return items.length <= 1 ? (items[0] ?? '') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
+function lowerFirst(text: string): string {
+  return text.charAt(0).toLowerCase() + text.slice(1);
+}
+
+/** `line 75`, or `line 3 of util.pj` outside the document. */
+function where(ref: SourceRef, documentUri: string): string {
+  return ref.uri === documentUri ? `line ${ref.span.start.line + 1}` : `line ${ref.span.start.line + 1} of ${decodeURIComponent(ref.uri.split('/').pop() ?? ref.uri)}`;
 }
 
 function sameNumbers(a: ReadonlySet<number>, b: ReadonlySet<number> | undefined): boolean {
@@ -1245,4 +1771,10 @@ function typeText(t: { k: string; name?: string; elem?: unknown }): string {
   const x = t as { k: string; name?: string; elem?: { k: string; name?: string } };
   if (x.k === 'chan' && x.elem) return typeText(x.elem);
   return x.name ?? x.k;
+}
+
+function isChanArray(t: { k: string; elem?: unknown }): boolean {
+  let x: { k: string; elem?: unknown } = t;
+  while (x.k === 'array' && x.elem) x = x.elem as { k: string; elem?: unknown };
+  return x !== t && x.k === 'chan';
 }

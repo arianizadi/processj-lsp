@@ -15,7 +15,7 @@ import type { DeclIndex } from '../checker/index';
 import type { VerificationReport } from '../verification';
 import type { ViewLayout } from './layout';
 import { verificationStore, type VerificationStore } from './live';
-import { buildNetwork, networkViewStubs, viewProcesses, type NetworkEffectSummary, type NetworkModel, type NetworkUnit, type NetworkView, type NetworkViewStub, type ProcessTotal } from './network';
+import { buildNetwork, networkViewStubs, viewProcesses, type NetworkEffectSummary, type ProcedureArguments, type NetworkModel, type NetworkUnit, type NetworkView, type NetworkViewStub, type ProcessTotal } from './network';
 import { buildOverlays, preferredView, type OverlayModel } from './overlay';
 import { buildViewerPayload, buildViewerView, DEFAULT_BUDGET, layoutOrFallback, type ViewerFocus, type ViewerPayload, type ViewerView } from './payload';
 import { renderExcalidraw } from './render-excalidraw';
@@ -38,6 +38,8 @@ export interface GraphDocument {
   effects: ReadonlyMap<A.ProcDecl, NetworkEffectSummary>;
   /** Checker results of imported files, to expand a callee declared there. */
   unitFor?: (decl: A.ProcDecl) => NetworkUnit | undefined;
+  /** What a procedure's own view is drawn with (NetworkOptions.procedureArguments). */
+  procedureArguments?: (decl: A.ProcDecl) => ProcedureArguments | undefined;
 }
 
 export type GraphFormat = 'svg' | 'excalidraw' | 'html' | 'json' | 'markdown';
@@ -302,6 +304,7 @@ export class GraphSession {
       effects: document.effects,
       index: document.index,
       unitFor: document.unitFor,
+      procedureArguments: document.procedureArguments,
       only: [...new Set(missing.map((stub) => stub.kind === 'program' ? 'program' : stub.procedure))],
     });
     for (const view of model.views) if (!entry.built.has(view.id)) entry.built.set(view.id, view);

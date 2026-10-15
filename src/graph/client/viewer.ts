@@ -91,6 +91,8 @@ interface VView {
   processes: string;
   legend: LegendEntry[];
   knownUris?: string[];
+  /** The heading the view is listed under (a CSPm file: Asserted, Defined). */
+  section?: string;
 }
 
 interface LegendEntry {
@@ -191,6 +193,10 @@ interface Payload {
   notes: string[];
   machines?: Record<string, Machine | MachineError>;
   focus?: Focus;
+  /** `cspm` for a CSPm file: its views are processes, its results are FDR's on the file's own assertions. */
+  language?: 'processj' | 'cspm';
+  /** A file this one was generated from (a model from Convert to CSP: its ProcessJ source). */
+  related?: { label: string; uri: string; note: string; graph?: string };
 }
 
 /** A check to show, and a process of its result to select (pathKey). */
@@ -403,6 +409,11 @@ function listWords(words: string[]): string {
   return words.length > 1 ? `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}` : words[0] ?? '';
 }
 
+/** A CSPm file's page: processes and events rather than procedures and channels. */
+function isCspm(): boolean {
+  return payload.language === 'cspm';
+}
+
 function plural(count: number, word: string): string {
   return `${count} ${word}${count === 1 ? '' : /(s|x|ch|sh)$/.test(word) ? 'es' : 's'}`;
 }
@@ -415,7 +426,19 @@ function populateViews(): void {
   viewSelect.replaceChildren();
   viewSelect.disabled = !payload.views.length;
   if (!payload.views.length) {
-    viewSelect.append(h('option', { value: '' }, 'no procedure yet'));
+    viewSelect.append(h('option', { value: '' }, isCspm() ? 'no process yet' : 'no procedure yet'));
+    return;
+  }
+  if (payload.views.some((entry) => entry.section)) {
+    // Views listed under their own headings, in order (a CSPm file: the asserted processes, then the others).
+    const sections = new Map<string, VView[]>();
+    for (const entry of payload.views) sections.set(entry.section ?? '', [...(sections.get(entry.section ?? '') ?? []), entry]);
+    for (const [name, entries] of sections) {
+      const group = h('optgroup', { label: name || 'Views' });
+      for (const entry of entries) group.append(h('option', { value: entry.id }, entry.label));
+      viewSelect.append(group);
+    }
+    viewSelect.value = view.id;
     return;
   }
   const program = payload.views.filter((entry) => entry.kind === 'program');
@@ -477,7 +500,7 @@ function showView(id: string, options: { fit?: boolean } = {}): void {
     return;
   }
   stageMessage.hidden = next !== EMPTY_VIEW;
-  if (next === EMPTY_VIEW) stageMessage.textContent = 'This file has no procedure with a body yet. The network appears here as soon as it has one.';
+  if (next === EMPTY_VIEW) stageMessage.textContent = isCspm() ? 'This file defines no process yet. The network appears here as soon as it does.' : 'This file has no procedure with a body yet. The network appears here as soon as it has one.';
   if (view && !view.pending && view !== EMPTY_VIEW) transforms.set(view.id, { ...transform });
   view = next;
   viewSelect.value = view.id;
@@ -547,7 +570,10 @@ function scaleOverlayText(): void {
     const cy = Number(element.dataset.cy);
     // A badge grows no wider than the box it is about, so the box's own name stays readable.
     const limit = Number(element.dataset.limit);
-    const k = Number.isFinite(limit) && limit > 0 ? Math.max(1, Math.min(scale, limit)) : scale;
+    let k = Number.isFinite(limit) && limit > 0 ? Math.max(1, Math.min(scale, limit)) : scale;
+    // A callout (the circular wait) grows no wider than the canvas, so a narrow window still shows all of it.
+    const width = Number(element.dataset.width);
+    if (Number.isFinite(width) && width > 0 && canvas.clientWidth > 0) k = Math.max(1, Math.min(k, (canvas.clientWidth - 24) / (width * transform.k)));
     if (k === 1 || !Number.isFinite(cx) || !Number.isFinite(cy)) element.removeAttribute('transform');
     else element.setAttribute('transform', `translate(${cx} ${cy}) scale(${k.toFixed(3)}) translate(${-cx} ${-cy})`);
   }
@@ -557,6 +583,7 @@ function scaleOverlayText(): void {
 function measureOverlayText(): void {
   for (const element of overlayText) {
     if (element.classList.contains('pj-ov-reason-wrap')) element.dataset.limit = '1.8';
+    if (element.classList.contains('pj-ov-callout-wrap')) element.dataset.width = String(element.getBBox().width);
     if (!element.classList.contains('pj-ov-badge-wrap')) continue;
     const node = element.dataset.node ? nodeById.get(element.dataset.node) : undefined;
     const width = element.getBBox().width;
@@ -1155,12 +1182,21 @@ function nodeDetails(id: string): HTMLElement[] {
 function channelDetails(id: string): HTMLElement[] {
   const channel = channelById.get(id);
   if (!channel) return [];
+  const people = (ids: string[]): HTMLElement => ids.length ? h('div', {}, ...ids.flatMap((peer, index) => [index ? ', ' : '', nodeButton(peer)])) : h('span', { class: 'muted' }, 'none drawn');
+  if (isCspm()) {
+    // Events, not channels: who must take part in them together, and in which direction data flows.
+    const rows: Array<[string, Node | string]> = [['events', channel.name]];
+    if (channel.port) rows.push(['other side', 'the environment (no process of this network)']);
+    const out = [section(channel.kind === 'barrier' ? `events ${channel.name}` : channel.name, table(rows))];
+    if (channel.members.length) out.push(section(channel.kind === 'barrier' ? 'All take part together' : 'Synchronise on them', people(channel.members)));
+    if (channel.writers.length || channel.readers.length) out.push(section('Outputs (!)', people(channel.writers)), section('Inputs (?)', people(channel.readers)));
+    return out;
+  }
   const rows: Array<[string, Node | string]> = [['kind', channel.kind], ['carries', channel.kind === 'barrier' ? '—' : channel.type], ['declared', sourceLink(channel.declaration)]];
   if (channel.shared.read || channel.shared.write) rows.push(['shared', [channel.shared.read ? 'readers' : '', channel.shared.write ? 'writers' : ''].filter(Boolean).join(' and ')]);
   if (channel.port) rows.push(['boundary', 'a parameter of this procedure']);
   if (channel.hazard) rows.push(['proven hazard', channel.hazard.replace('-', ' ')]);
   const out = [section(`${channel.kind} ${channel.name}`, table(rows))];
-  const people = (ids: string[]): HTMLElement => ids.length ? h('div', {}, ...ids.flatMap((peer, index) => [index ? ', ' : '', nodeButton(peer)])) : h('span', { class: 'muted' }, 'none drawn');
   if (channel.kind === 'barrier') {
     out.push(section('Enrolled', people(channel.members.filter((member) => !channel.unenrolled.includes(member)))));
     // The runtime counts enrolled processes: a sync by any other process does not wait for them as written.
@@ -1170,16 +1206,24 @@ function channelDetails(id: string): HTMLElement[] {
 }
 
 function viewSummary(): HTMLElement[] {
-  if (view === EMPTY_VIEW) return [section('No network yet', h('p', { class: 'muted' }, 'This file has no procedure with a body. The page follows the buffer: the network appears as soon as there is one.'))];
+  if (view === EMPTY_VIEW) return [section('No network yet', h('p', { class: 'muted' }, isCspm() ? 'This file defines no process. The page follows the buffer: the network appears as soon as it does.' : 'This file has no procedure with a body. The page follows the buffer: the network appears as soon as there is one.'))];
   const channels = view.channels.filter((channel) => channel.kind === 'channel' && (channel.writers.length || channel.readers.length)).length;
   const barriers = view.channels.filter((channel) => channel.kind === 'barrier').length;
   // Processes, not boxes: a par for box stands for each of its iterations.
-  const out = [section(view.label, h('p', {}, `${view.processes || 'no processes'}, ${plural(channels, 'channel')}${barriers ? `, ${plural(barriers, 'barrier')}` : ''}.`), h('p', { class: 'muted' }, 'Click a box or an arrow for details; drag to pan, scroll or pinch to zoom, 0 fits, / searches.'), sourceLink(view.source))];
+  const counted = isCspm() ? `${plural(new Set(view.edges.map((edge) => edge.channel)).size, 'link')} between them` : `${plural(channels, 'channel')}${barriers ? `, ${plural(barriers, 'barrier')}` : ''}`;
+  const out = [section(view.label, h('p', {}, `${view.processes || 'no processes'}, ${counted}.`), h('p', { class: 'muted' }, 'Click a box or an arrow for details; drag to pan, scroll or pinch to zoom, 0 fits, / searches.'), sourceLink(view.source))];
   const pending = payload.views.filter((entry) => entry.pending).length;
-  const pendingNote = pending ? (MODE === 'file' && !vscode ? `${plural(pending, 'procedure view')} ${pending === 1 ? 'is' : 'are'} not included in this file; open the graph from your editor to see ${pending === 1 ? 'it' : 'them'}.` : `${plural(pending, 'procedure view')} ${pending === 1 ? 'is' : 'are'} laid out when first opened.`) : undefined;
+  const noun = isCspm() ? 'process view' : 'procedure view';
+  const pendingNote = pending ? (MODE === 'file' && !vscode ? `${plural(pending, noun)} ${pending === 1 ? 'is' : 'are'} not included in this file; open the graph from your editor to see ${pending === 1 ? 'it' : 'them'}.` : `${plural(pending, noun)} ${pending === 1 ? 'is' : 'are'} laid out when first opened.`) : undefined;
   const notes = [...payload.notes, ...(pendingNote ? [pendingNote] : []), ...view.notes];
   if (notes.length) out.push(section('Notes', list(notes)));
-  if (!payload.chips.length) out.push(section('Verification', h('p', { class: 'muted' }, 'No verification results yet. The checker found nothing it can prove stuck; that is not a proof of deadlock freedom.')));
+  if (payload.related) {
+    const related = payload.related;
+    const parts: Array<Node | string> = [h('p', {}, related.note), sourceLink({ uri: related.uri, line: 0, col: 0 }, related.label)];
+    if (related.graph) parts.push(' · ', h('a', { href: related.graph, target: '_blank', rel: 'noopener' }, 'its ProcessJ graph'));
+    out.push(section('Generated from', ...parts));
+  }
+  if (!payload.chips.length) out.push(section('Verification', h('p', { class: 'muted' }, isCspm() ? "No FDR result yet. Check with FDR (:ProcessJFdr in Neovim) runs this file's own assertions and shows each result here." : 'No verification results yet. The checker found nothing it can prove stuck; that is not a proof of deadlock freedom.')));
   return out;
 }
 
@@ -1194,7 +1238,7 @@ function table(rows: Array<[string, Node | string]>): HTMLElement {
 function renderVerdicts(): void {
   verdicts.replaceChildren();
   if (!payload.chips.length) {
-    verdicts.append(h('span', { class: 'verdict-empty' }, 'Static analysis: nothing proven stuck (not a proof of deadlock freedom).'));
+    verdicts.append(h('span', { class: 'verdict-empty' }, isCspm() ? 'No FDR result yet: check this file with FDR to see its assertions here.' : 'Static analysis: nothing proven stuck (not a proof of deadlock freedom).'));
     return;
   }
   for (const chip of payload.chips) {
@@ -2046,6 +2090,8 @@ function renderCode(): void {
       else if (process.status === 'error') marks.push({ line: process.at.span.start.line, kind: failure, node: process.node, text: failure === 'warning' ? `${who} leaves the modelled integers here (not an error of the program)` : `${who} stops with a runtime error here` });
       else if (process.status === 'diverging') marks.push({ line: process.at.span.start.line, kind: 'loop', node: process.node, text: `${who} loops here without communicating` });
       else if (told.has(process.at.span.start.line)) continue;
+      // A running process the result is about (it can perform the event a specification refuses) says so.
+      else if (process.status === 'running' && process.badge !== 'running') marks.push({ line: process.at.span.start.line, kind: 'stuck', node: process.node, text: `${who}: ${process.badge}`, root: true });
       else if (process.status === 'running') marks.push({ line: process.at.span.start.line, kind: 'step', node: process.node, text: `${who} is still running here` });
       else if (process.status === 'terminated') marks.push({ line: process.at.span.start.line, kind: 'done', node: process.node, text: `${who} finished` });
     }

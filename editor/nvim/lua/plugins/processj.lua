@@ -6,7 +6,7 @@ return {
   {
     "arianizadi/processj-lsp",
     build = "npm ci && npm run build",
-    ft = "processj",
+    ft = { "processj", "csp" }, -- csp: CSPm files get the process graph and FDR checks
     opts = {
       init_options = {
         checkOnChange = false, -- run the real compiler only on open and save; the checker runs as you type

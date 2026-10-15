@@ -102,6 +102,8 @@ export interface ViewerView {
   legend: LegendEntry[];
   /** URIs this view links to, for a view laid out on demand (the page may reveal them too). */
   knownUris?: string[];
+  /** The heading the page lists the view under (NetworkView.section). */
+  section?: string;
 }
 
 export interface ViewerOverlay extends OverlayModel {
@@ -139,6 +141,10 @@ export interface ViewerPayload {
   machines?: Record<string, ViewerMachine | ViewerMachineError>;
   /** What the page shows first: a check of a report (its id) and a process in it (pathKey). */
   focus?: ViewerFocus;
+  /** `cspm` for a CSPm file (NetworkModel.language); absent for ProcessJ. */
+  language?: 'processj' | 'cspm';
+  /** A file this one was generated from: a model from Convert to CSP links back to its ProcessJ source (and its graph page, when one can be served). */
+  related?: { label: string; uri: string; note: string; graph?: string };
 }
 
 /** A check to open the page on, and optionally a process of its result to select. */
@@ -198,6 +204,8 @@ export interface PayloadInput {
   stubs?: readonly NetworkViewStub[];
   /** What the page opens on (ViewerPayload.focus). */
   focus?: ViewerFocus;
+  /** ViewerPayload.related. */
+  related?: ViewerPayload['related'];
 }
 
 export const DEFAULT_BUDGET = Object.freeze({ views: 40, nodes: 2500 });
@@ -238,7 +246,7 @@ export async function buildViewerPayload(input: PayloadInput): Promise<ViewerPay
     }
     layouts.set(view.id, layout);
   }
-  const knownUris = new Set<string>([model.uri]);
+  const knownUris = new Set<string>([model.uri, ...(input.related ? [input.related.uri] : [])]);
   const built = new Map(model.views.map((view) => [view.id, view]));
   const views: ViewerView[] = (input.stubs ?? model.views).map((stub) => {
     const view = built.get(stub.id);
@@ -282,6 +290,8 @@ export async function buildViewerPayload(input: PayloadInput): Promise<ViewerPay
     knownUris: [...knownUris].sort(),
     notes,
     ...(input.focus ? { focus: input.focus } : {}),
+    ...(model.language ? { language: model.language } : {}),
+    ...(input.related ? { related: input.related } : {}),
   };
 }
 
@@ -328,7 +338,8 @@ export function buildViewerView(model: NetworkModel, view: NetworkView, layout: 
         confidence: node.confidence,
         channel: node.channel,
         operations: node.operations.map((operation) => ({ kind: operation.kind, channel: operation.channel, at: location(operation.at)!, confidence: operation.confidence, via: operation.via ? `${operation.via.procedure}(${operation.via.parameter})` : undefined })),
-        machine: nodeMachine(view, node),
+        // A CSPm file's processes have no state machines of the translator's model.
+        machine: model.language === 'cspm' ? undefined : nodeMachine(view, node),
       };
     }),
     edges: view.edges.map((edge) => ({ id: edge.id, kind: edge.kind, from: edge.from, to: edge.to, channel: edge.channel, role: edge.role, confidence: edge.confidence, label: edge.label, tags: edge.tags })),
@@ -351,6 +362,7 @@ export function buildViewerView(model: NetworkModel, view: NetworkView, layout: 
     subtitle: networkSubtitle(view),
     processes: countText(viewProcesses(view)),
     legend: legendEntries(view),
+    ...(view.section ? { section: view.section } : {}),
   };
 }
 
@@ -375,5 +387,6 @@ function pendingView(view: NetworkViewStub, known: Set<string>): ViewerView {
     subtitle: '',
     processes: '',
     legend: [],
+    ...(view.section ? { section: view.section } : {}),
   };
 }

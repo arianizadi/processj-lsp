@@ -1,0 +1,13 @@
+// outcome: deadlocks
+// A par for that starts no process never ends with this ProcessJ build: it
+// sets the par's count to 0, schedules nothing and waits for a process to end.
+// The language says it does nothing; the model follows the language and names
+// it (compiler/empty-par-for). With one iteration (n = 1) the program finishes.
+import std.*;
+void stages(int n) {
+    par for (int i = 0; i < n - 1; i++) println(i);
+}
+public void main(string[] args) {
+    stages(1);
+    println("done");
+}

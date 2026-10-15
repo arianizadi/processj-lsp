@@ -1,0 +1,17 @@
+-- A two-place buffer built from two one-place COPY processes joined by a
+-- hidden channel, checked against a buffer specification.
+channel left, mid, right : {0..1}
+
+COPY(in, out) = in?x -> out!x -> COPY(in, out)
+
+SYSTEM = (COPY(left, mid) [| {| mid |} |] COPY(mid, right)) \ {| mid |}
+
+BUFF2 = left?x -> BUFF2'(x)
+BUFF2'(x) = left?y -> right!x -> BUFF2'(y) [] right!x -> BUFF2
+
+assert BUFF2 [FD= SYSTEM
+assert SYSTEM [FD= BUFF2
+assert SYSTEM :[deadlock free]
+assert SYSTEM :[divergence free]
+-- A one-place buffer is not enough: SYSTEM can take a second input first.
+assert COPY(left, right) [T= SYSTEM

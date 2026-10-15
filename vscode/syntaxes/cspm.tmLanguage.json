@@ -1,0 +1,76 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "CSPm",
+  "scopeName": "source.cspm",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#assert" },
+    { "include": "#declarations" },
+    { "include": "#keywords" },
+    { "include": "#processes" },
+    { "include": "#operators" },
+    { "include": "#numbers" },
+    { "include": "#definitions" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-dash.cspm", "match": "--.*$" },
+        { "name": "comment.block.cspm", "begin": "\\{-", "end": "-\\}", "patterns": [{ "include": "#comments" }] }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        { "name": "string.quoted.double.cspm", "begin": "\"", "end": "\"", "patterns": [{ "name": "constant.character.escape.cspm", "match": "\\\\." }] },
+        { "name": "string.quoted.single.cspm", "match": "'\\\\?.'" }
+      ]
+    },
+    "assert": {
+      "patterns": [
+        { "name": "keyword.other.assert.cspm", "match": "\\bassert\\b" },
+        { "name": "keyword.operator.refinement.cspm", "match": "\\[(?:T|F|FD|R|RD|V)=" },
+        { "name": "support.constant.property.cspm", "match": ":\\[\\s*(?:deadlock free|divergence free|livelock free|deterministic|has trace)[^\\]]*\\]?\\]" }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        { "match": "\\b(channel|datatype|subtype|nametype)\\b", "name": "storage.type.declaration.cspm" },
+        { "name": "keyword.control.import.cspm", "match": "\\b(include|external|transparent|module|exports|endmodule|instance|Timed)\\b" }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        { "name": "keyword.control.cspm", "match": "\\b(if|then|else|let|within)\\b" },
+        { "name": "keyword.operator.word.cspm", "match": "\\b(and|or|not)\\b" },
+        { "name": "constant.language.cspm", "match": "\\b(true|false)\\b" }
+      ]
+    },
+    "processes": {
+      "patterns": [
+        { "name": "support.function.process.cspm", "match": "\\b(STOP|SKIP|CHAOS|RUN|DIV|WAIT)\\b" },
+        { "name": "support.type.cspm", "match": "\\b(Events|Int|Bool|Char|Proc|Set|Seq)\\b" },
+        { "name": "support.function.builtin.cspm", "match": "\\b(union|inter|diff|Union|Inter|member|card|empty|set|seq|head|tail|length|null|concat|elem|productions|extensions|normal|sbisim|diamond|explicate|wbisim|chase|prioritise|deter)\\b(?=\\s*\\()" }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        { "name": "keyword.operator.parallel.cspm", "match": "\\[\\||\\|\\]|\\|\\|\\||\\|\\||\\|>|<->" },
+        { "name": "keyword.operator.choice.cspm", "match": "\\[\\]|\\|~\\||\\[>|/\\\\" },
+        { "name": "keyword.operator.prefix.cspm", "match": "->|&" },
+        { "name": "keyword.operator.event-set.cspm", "match": "\\{\\||\\|\\}" },
+        { "name": "keyword.operator.renaming.cspm", "match": "\\[\\[|\\]\\]|<-" },
+        { "name": "keyword.operator.communication.cspm", "match": "[?!$](?=\\s*[A-Za-z_0-9(])" },
+        { "name": "keyword.operator.hiding.cspm", "match": "\\\\" }
+      ]
+    },
+    "numbers": {
+      "patterns": [{ "name": "constant.numeric.integer.cspm", "match": "\\b\\d+\\b" }]
+    },
+    "definitions": {
+      "patterns": [
+        { "match": "^\\s*([A-Za-z_][A-Za-z0-9_']*)(?=\\s*(?:\\([^)]*\\))*\\s*=(?!=))", "captures": { "1": { "name": "entity.name.function.cspm" } } }
+      ]
+    }
+  }
+}

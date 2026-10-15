@@ -1,11 +1,13 @@
 --- processj-lsp: Neovim integration for the ProcessJ language server.
 ---
 --- Install with lazy.nvim:
----   { "arianizadi/processj-lsp", build = "npm ci && npm run build", ft = "processj", opts = {} }
+---   { "arianizadi/processj-lsp", build = "npm ci && npm run build", ft = { "processj", "csp" }, opts = {} }
 ---
 --- The plugin registers the `processj` filetype (ftdetect/), bundles syntax
 --- highlighting and ftplugin settings, and starts the server from its own
---- checkout with Neovim's built-in LSP client (0.11+). Works with AstroNvim as-is:
+--- checkout with Neovim's built-in LSP client (0.11+). The server also attaches
+--- to CSPm files (Neovim's `csp` filetype, *.csp): there :ProcessJGraph draws the
+--- process network and :ProcessJFdr checks the file's own assertions with FDR. Works with AstroNvim as-is:
 --- AstroLSP's capabilities, on_attach and mappings apply through vim.lsp.config("*").
 local M = {}
 
@@ -22,7 +24,8 @@ end
 function M.default_config()
   return {
     cmd = { "node", M.root() .. "/bin/processj-lsp.js", "--stdio" },
-    filetypes = { "processj" },
+    -- `csp` is Neovim's filetype for *.csp (CSPm for FDR): the graph and FDR only, no ProcessJ analysis.
+    filetypes = { "processj", "csp", "cspm" },
     root_markers = { ".git" },
     workspace_required = false,
     init_options = {
@@ -38,7 +41,7 @@ function M.default_config()
       fdrTimeoutMs = 120000,
       fdrMemoryMb = 0, -- stop refines past this much memory; 0: half of this machine's, at most 8 GB
       fdrWorkers = 1, -- 1: the same deadlock and runtime-error counterexamples on every check; 0: every core
-      fdrShowGraph = "onFailure", -- after :ProcessJFdr, open the graph on the result: "onFailure", "always" or "never" (the text report opens instead)
+      fdrShowGraph = "always", -- after :ProcessJFdr, open the graph on the result: "always", "onFailure" (a defect only) or "never" (the text report opens instead)
     },
   }
 end
@@ -72,6 +75,8 @@ end
 
 --- Procedure names of the current buffer (from the server's document symbols), for command completion.
 local function complete_procedure(arglead)
+  -- A CSPm file is checked as a whole: FDR runs its own assertions.
+  if vim.bo.filetype == "csp" or vim.bo.filetype == "cspm" then return {} end
   local client = vim.lsp.get_clients({ bufnr = 0, name = "processj_ls" })[1]
   if not client then return {} end
   local response = client:request_sync("textDocument/documentSymbol", { textDocument = vim.lsp.util.make_text_document_params(0) }, 1000, 0)
@@ -145,7 +150,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("ProcessJEffects", function() exec "processj.showEffectReport" end, { desc = "Show procedure effect summaries for the current file" })
   vim.api.nvim_create_user_command("ProcessJProtocols", function() exec "processj.showProtocolReport" end, { desc = "Show protocol structure and observed flow for the current file" })
   vim.api.nvim_create_user_command("ProcessJCsp", exec_on "processj.convertToCsp", { nargs = "?", complete = complete_procedure, desc = "Convert the program (or the named procedure) to CSPm for FDR" })
-  vim.api.nvim_create_user_command("ProcessJFdr", exec_on "processj.checkWithFdr", { nargs = "?", complete = complete_procedure, desc = "Check the program (or the named procedure) with FDR and show where it gets stuck" })
+  vim.api.nvim_create_user_command("ProcessJFdr", exec_on "processj.checkWithFdr", { nargs = "?", complete = complete_procedure, desc = "Check the program (or the named procedure) with FDR and show where it gets stuck; in a .csp file, the file's own assertions" })
   vim.api.nvim_create_user_command("ProcessJFdrCancel", function() exec "processj.cancelFdr" end, { desc = "Stop the FDR check running for the current file" })
   -- AstroNvim applies its LSP keymaps (<Leader>la, <Leader>lf, gd, ...) from AstroLSP's
   -- on_attach, which only runs for servers AstroLSP started itself. Run it for ours too.
@@ -176,9 +181,9 @@ function M.setup(opts)
       end
     end,
   })
-  -- Warn once, on the first .pj buffer, if the build step was skipped.
+  -- Warn once, on the first .pj or .csp buffer, if the build step was skipped.
   vim.api.nvim_create_autocmd("FileType", {
-    pattern = "processj",
+    pattern = { "processj", "csp", "cspm" },
     once = true,
     callback = function() M.check_build() end,
   })

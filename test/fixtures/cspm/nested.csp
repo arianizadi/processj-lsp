@@ -1,0 +1,13 @@
+-- Three pairs in one chain of [| {go} |]: drawn as one composition of three,
+-- while FDR keeps the binary tree the chain was written as.
+channel go
+channel c : {0..2}
+channel x : {0..2}
+
+P(i) = c.i -> go -> P(i)
+Q(i) = x.i -> c.i -> Q(i)
+
+-- The third pair has no Q: P(2) waits for c.2 with STOP, and nobody gets to go.
+SYS = (P(0) [| {| c |} |] Q(0)) [| {go} |] ((P(1) [| {| c |} |] Q(1)) [| {go} |] (P(2) [| {| c |} |] STOP))
+
+assert SYS :[deadlock free]

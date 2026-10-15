@@ -177,7 +177,7 @@ test('Check with FDR opens the graph on the failure; the page then shows every t
 
     // The verdict lens opens the graph on that result; the code action, on the stuck process.
     const lenses = (await client.request('textDocument/codeLens', { textDocument: { uri } })).result;
-    const verdict = lenses.find((lens: any) => lens.command.title === 'FDR: deadlock (4 steps)');
+    const verdict = lenses.find((lens: any) => lens.command.title === 'FDR: deadlock (4 steps) · show graph');
     assert.deepEqual(verdict.command.arguments, [uri, 'viewer', { check: 'program/deadlock-free' }]);
     assert.equal(verdict.command.command, 'processj.showConcurrencyReport');
     const published = await client.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri && m.params.diagnostics.some((d: any) => d.source === 'fdr'));
@@ -201,9 +201,12 @@ test('Check with FDR opens the graph on the failure; the page then shows every t
     const philosopher = text.split('\n').findIndex((entry) => /void philosopher\(/.test(entry));
     const alone = await client.request('workspace/executeCommand', { command: 'processj.checkWithFdr', arguments: [uri, 'philosopher', philosopher] }, 60_000);
     assert.equal(alone.error, undefined);
-    // It finds no defect, so no page opens: the text report does.
-    assert.equal(external(client).length, 1);
-    assert.ok(client.messages.some((m) => m.method === 'window/showDocument' && m.params.uri === pathToFileURL(alone.result.reportFile).toString()));
+    // It passes, and the graph still shows it (fdrShowGraph: always). Nothing has connected to the first
+    // page yet, so a page opens on this check (an open page is moved instead: below); the report is written, not opened.
+    assert.equal(external(client).length, 2);
+    assert.equal(new URL(external(client)[1].params.uri).searchParams.get('check'), `proc:philosopher:${philosopher}/deadlock-free`);
+    assert.ok(fs.existsSync(alone.result.reportFile));
+    assert.ok(!client.messages.some((m) => m.method === 'window/showDocument' && m.params.uri === pathToFileURL(alone.result.reportFile).toString()), 'the text report is not opened as well');
     const both = JSON.parse((await get(`${base}payload`)).body);
     const ids = both.chips.filter((chip: any) => chip.producer === 'fdr').map((chip: any) => [chip.check, chip.status]);
     const p = `proc:philosopher:${philosopher}`;
@@ -222,7 +225,7 @@ test('Check with FDR opens the graph on the failure; the page then shows every t
     assert.equal(again.error, undefined);
     const update = await until(() => open.events.join('').match(/event: update\ndata: (.*)\n/)?.[1], 'the page to be told');
     assert.deepEqual(JSON.parse(update).focus, { check: 'program/deadlock-free' });
-    assert.equal(external(client).length, 1, 'no second page');
+    assert.equal(external(client).length, 2, 'no further page: the open one is moved');
     assert.ok(client.messages.some((m) => m.method === 'window/showMessage' && /the graph page open for this file now shows the result/.test(m.params.message)));
     // Show in graph on the stuck process: the open page selects it.
     const before = open.events.length;
@@ -237,7 +240,7 @@ test('Check with FDR opens the graph on the failure; the page then shows every t
     const edited = JSON.parse((await get(`${base}payload`)).body);
     assert.deepEqual(edited.chips.filter((chip: any) => chip.producer === 'fdr'), []);
     const fresh = (await client.request('textDocument/codeLens', { textDocument: { uri } })).result;
-    assert.ok(fresh.some((lens: any) => lens.command.title === 'FDR: check program' && lens.command.command === 'processj.checkWithFdr'), 'a fresh lens runs the check');
+    assert.ok(fresh.some((lens: any) => lens.command.title === 'FDR: check program & show graph' && lens.command.command === 'processj.checkWithFdr'), 'a fresh lens runs the check');
     assert.ok(fs.existsSync(dir));
   } finally {
     await close();
@@ -273,6 +276,51 @@ test('a procedure checked on its own is shown on its own view, its parameters as
   } finally {
     await client.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a procedure whose arguments decide its network is checked as its calls give it, and says so in the report, the lens and the diagnostics', { skip: SKIP }, async () => {
+  const fifo = path.join(ROOT, 'test', 'fixtures', 'fifo');
+  const read = (name: string): string => fs.readFileSync(path.join(fifo, name), 'utf8');
+  const { client, uri, text, close } = await startOn({ 'blocks.pj': read('blocks.pj') });
+  try {
+    const line = text.split('\n').findIndex((entry) => /void altFIFO\(/.test(entry));
+    const checked = await client.request('workspace/executeCommand', { command: 'processj.checkWithFdr', arguments: [uri, 'altFIFO'] }, 60_000);
+    assert.equal(checked.error, undefined);
+    assert.deepEqual(checked.result.report.checks.map((c: any) => [c.id, c.status, c.target.arguments]), [['deadlock-free', 'passed', 'size = 6'], ['divergence-free', 'passed', 'size = 6'], ['no-runtime-errors', 'passed', 'size = 6'], ['deterministic', 'passed', 'size = 6']]);
+    assert.ok(checked.result.report.assumptions.some((entry: string) => entry.startsWith('altFIFO checked with size = 6 (the call at line 75)')));
+    // The editor's message, the text report and the lens name the arguments.
+    assert.ok(client.messages.some((m) => m.method === 'window/showMessage' && /^FDR, procedure altFIFO \(size = 6\): no deadlock, [\d,]+ states$/.test(m.params.message)), 'the message names the arguments');
+    assert.match(fs.readFileSync(checked.result.reportFile, 'utf8'), /^Checked: procedure altFIFO on its own, with size = 6 \(the call at line 75\) · /m);
+    const lens = (await fdrLens(client, uri)).find((entry) => entry.range.start.line === line);
+    assert.match(lens.command.title, /^FDR: no deadlock, [\d,]+ states · size = 6 · show graph$/);
+    // A check that passes opens the graph too (fdrShowGraph: always), on that procedure's check.
+    assert.ok(external(client).some((m) => /[?&]check=proc%3AaltFIFO%3A\d+%2Fdeadlock-free$/.test(m.params.uri)), 'the passing check opened the graph on itself');
+  } finally {
+    await close();
+  }
+  // A broken copy: the deadlock's diagnostics say which arguments, and the graph draws the six stages it was found in.
+  const broken = await startOn({ 'blocks_alt.pj': read('blocks_alt.pj') });
+  try {
+    const line = broken.text.split('\n').findIndex((entry) => /void altFIFO\(/.test(entry));
+    const checked = await broken.client.request('workspace/executeCommand', { command: 'processj.checkWithFdr', arguments: [broken.uri, 'altFIFO', line] }, 60_000);
+    assert.equal(checked.error, undefined);
+    const published = await broken.client.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === broken.uri && m.params.diagnostics.some((d: any) => d.source === 'fdr'));
+    const fdr = published.params.diagnostics.filter((d: any) => d.source === 'fdr');
+    assert.ok(fdr.length && fdr.every((d: any) => d.message.startsWith('FDR (altFIFO on its own, size = 6): ')), fdr.map((d: any) => d.message).join('\n'));
+    const page = new URL(external(broken.client)[0].params.uri);
+    assert.equal(page.searchParams.get('check'), `proc:altFIFO:${line}/deadlock-free`);
+    const payload = JSON.parse((await get(`${page.origin}${page.pathname}payload`)).body);
+    const chip = payload.chips.find((entry: any) => entry.check === `proc:altFIFO:${line}/deadlock-free`);
+    const view = payload.views.find((entry: any) => entry.id === chip.preferredView);
+    assert.deepEqual([view.kind, view.procedure], ['procedure', 'altFIFO']);
+    assert.ok(view.notes.some((note: string) => note.startsWith('Drawn with size = 6')));
+    assert.equal(view.nodes.filter((node: any) => node.name === 'id(in, middle)').length, 5);
+    const overlay = payload.overlays.find((entry: any) => entry.check === chip.check && entry.view === view.id);
+    assert.deepEqual(overlay.unplaced, []);
+    assert.ok(overlay.processes.every((entry: any) => entry.exact));
+  } finally {
+    await broken.close();
   }
 });
 
@@ -376,7 +424,7 @@ test('a check whose file changes while FDR runs shows nothing as current, and sa
     // Not opened over the editing, not shown as current anywhere; the report says it at its top.
     assert.ok(!client.messages.some((m) => m.method === 'window/showDocument'), 'no page, no report opened');
     assert.match(fs.readFileSync(checked.result.reportFile, 'utf8'), /^# FDR check: dining_philosophers\.pj\n\n\*\*The file changed while FDR ran/);
-    assert.deepEqual((await fdrLens(client, uri)).map((lens) => lens.command.title), ['FDR: check', 'FDR: check', 'FDR: check program']);
+    assert.deepEqual((await fdrLens(client, uri)).map((lens) => lens.command.title), ['FDR: check & show graph', 'FDR: check & show graph', 'FDR: check program & show graph']);
     assert.equal((await client.request('processj/fdrReport', { textDocument: { uri } })).result, null);
   } finally {
     await close();
@@ -400,7 +448,7 @@ test('an edit of an imported file takes back the FDR results of the file that im
     const republished = await client.waitFor((m) => client.messages.indexOf(m) >= before && m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri);
     assert.deepEqual(republished.params.diagnostics.filter((d: any) => d.source === 'fdr'), []);
     assert.equal((await client.request('processj/fdrReport', { textDocument: { uri } })).result, null);
-    assert.equal((await fdrLens(client, uri))[0].command.title, 'FDR: check program');
+    assert.equal((await fdrLens(client, uri))[0].command.title, 'FDR: check program & show graph');
   } finally {
     await close();
   }

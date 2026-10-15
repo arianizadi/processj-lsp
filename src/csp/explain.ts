@@ -157,15 +157,40 @@ function outcome(model: CspModel, a: CspAssertion, r: FdrResult | undefined, run
     const inner = a.assertion.replace(/^not\s*/, '');
     if (!r.passed) return { ...base, status: 'failed', stats, message: `does not hold: ${inner} holds${r.states !== undefined ? ` (${r.states.toLocaleString('en-US')} states)` : ''}` };
     if (!raw) return { ...base, status: 'passed', stats, message: `holds: ${inner} does not` };
-    const witness = new Explainer(model, run.eventMap, opts.uri).counterexample({ ...a, label: inner, assertion: inner }, raw);
+    const witness = new Explainer(instanceRun(model, raw, run.eventMap), run.eventMap, opts.uri).counterexample({ ...a, label: inner, assertion: inner }, raw);
     return { ...base, status: 'passed', stats, message: `holds: ${inner} does not (${witness.summary})`, counterexample: witness };
   }
   if (r.passed) return { ...base, status: 'passed', stats, message: passedMessage(a, r) };
   if (!raw) return { ...base, status: 'failed', stats, message: `${a.label} does not hold (FDR gave no counterexample)` };
-  const counterexample = new Explainer(model, run.eventMap, opts.uri).counterexample(a, raw);
+  const counterexample = new Explainer(instanceRun(model, raw, run.eventMap), run.eventMap, opts.uri).counterexample(a, raw);
   // A user's `:[deadlock free]` that fails only because the program ends: not a defect of the program.
   const ends = counterexample.kind === 'deadlock' && counterexample.final.length > 0 && counterexample.final.every((p) => p.status === 'terminated');
   return { ...base, status: 'failed', stats, message: counterexample.summary, counterexample, ...(ends && a.at ? { severity: 'info' as const } : {}) };
+}
+
+/**
+ * A procedure checked once per argument tuple (sourceMap.instances): the
+ * model as the instance the counterexample ran, with that instance's own
+ * network and processes. Its trace starts with the instance's `pj_call`.
+ */
+export function instanceRun(model: CspModel, raw: FdrCounterexample, eventMap: Record<string, string>): CspModel {
+  const instances = model.sourceMap.instances;
+  if (!instances?.length) return model;
+  const views = instances.map((inst) => ({ ...model, sourceMap: { ...model.sourceMap, processes: inst.processes, network: inst.network, networkRoot: inst.networkRoot } }));
+  // FDR shows every alternative of the first choice; the one that ran takes part in the trace.
+  const ran = views.filter((view) => {
+    const net = networkBehaviour(view, raw, eventMap);
+    return !!net && (net.node.trace.some((e) => e !== 0) || !!net.node.error_event);
+  });
+  if (ran.length === 1) return ran[0];
+  // Else the instance is the one the trace's `pj_call` calls (its fixed fields).
+  const first = (raw.implementation_behaviour?.trace ?? []).map((e) => eventMap[String(e)]).find((e) => e?.startsWith('pj_call.'));
+  if (first) {
+    const fields = splitDots(first).slice(1);
+    const k = instances.findIndex((inst) => !!inst.call && inst.call.every((f, i) => f === undefined || f === fields[i]));
+    if (k >= 0) return views[k];
+  }
+  return ran[0] ?? model;
 }
 
 function formatBytes(bytes: number): string {
@@ -190,6 +215,7 @@ export const COMPILED_DIFFERS: ReadonlySet<string> = new Set([
   'compiler/short-circuit-read',
   'compiler/replicated-alt-precondition',
   'compiler/labelled-break',
+  'compiler/empty-par-for',
 ]);
 
 /** Places where the model's own abstraction may differ from any program: an array or record shared between references (lower.ts). */
@@ -589,6 +615,12 @@ class Explainer {
   /** `a.4` -> channel `a`, value `4`; `b.1.pj_sync` -> `b`, op `pj_sync`; mediated and fork fields skip the instance. */
   private parse(event: string): { base: string; info?: CspChannelInfo; fields: string[]; instance?: string } {
     const parts = splitDots(event);
+    // One channel of an array, or of one instance of a recursive procedure, has an entry of its own (`cs.2`, `m.3`, `cs.3.2`).
+    for (let n = Math.min(3, parts.length - 1); n >= 2; n--) {
+      const key = parts.slice(0, n).join('.');
+      const part = this.channelInfo(key);
+      if (part?.part) return { base: key, info: part, fields: parts.slice(n) };
+    }
     const base = parts[0];
     const info = this.channelInfo(base);
     const fields = parts.slice(1);
@@ -676,9 +708,16 @@ class Explainer {
   /** The channel a definition's operation is on, in this instance (`out1` bound to `a`). */
   private boundChannel(b: Bound, expr: string | undefined): string | undefined {
     if (!expr) return undefined;
-    const head = splitDots(expr)[0];
+    const [head, ...fields] = splitDots(expr);
     const bound = b.env.get(head);
-    return splitDots(bound ?? head)[0];
+    // An element of an array (`chans.(i - 1)`, `FIFO_chans.2`) or a recursive instance's channel
+    // (`m.pj_h`) is its own channel: its fields, with the state's values, name the entry.
+    const parts = [...splitDots(bound ?? head), ...fields.map((f) => fieldValue(f, b.env))];
+    for (let n = Math.min(3, parts.length); n >= 2; n--) {
+      const key = parts.slice(0, n).join('.');
+      if (this.channelInfo(key)?.part) return key;
+    }
+    return parts[0];
   }
 
   /**
@@ -1737,6 +1776,12 @@ export function processNames(model: Pick<CspModel, 'sourceMap' | 'target'>, uri:
       callNames.set(group[0], proc);
       continue;
     }
+    // Instances of one call site (the stages of an unfolded recursion) differ in the arguments elaboration knows.
+    const known = group.map((p) => model.sourceMap.processes[p.index]?.known);
+    if (known.every((k) => k !== undefined) && new Set(known).size === group.length) {
+      group.forEach((p, k) => callNames.set(p, `${proc} (${known[k]})`));
+      continue;
+    }
     const iteration = (p: Named): string | undefined => /\[([^\]]*)\]$/.exec(p.ref.label)?.[1];
     const args = group.map((p) => callArguments(p.ref.label.replace(/\s*\[[^\]]*\]$/, '')));
     const width = Math.max(...args.map((a) => a.length));
@@ -1758,11 +1803,19 @@ export function processNames(model: Pick<CspModel, 'sourceMap' | 'target'>, uri:
     else if (last?.kind === 'par-for') p.name = `iteration ${p.ref.label.replace(/^iteration\s*\[(.*)\]$/, '$1')}${below}`;
     else p.name = `branch ${last?.index ?? '?'}${below}`;
   }
-  // Two processes with one name (two pars with a branch 1): add where each starts.
+  // Two processes with one name (two pars with a branch 1): say whose process each is when that
+  // tells them apart (`id of altFIFO (size = 4)`), else add where each starts.
   const byName = new Map<string, Named[]>();
   for (const p of procs) byName.set(p.name, [...(byName.get(p.name) ?? []), p]);
-  for (const [, same] of byName) {
+  const depth = (same: Named[]): number => Math.min(...same.map((p) => p.ref.path.length));
+  for (const same of [...byName.values()].sort((a, b) => depth(a) - depth(b))) {
     if (same.length < 2) continue;
+    const parents = same.map(parentOf);
+    const owners = parents.map((q) => (q && q.ref.path.length ? q.name : undefined));
+    if (owners.every((o) => o !== undefined) && new Set(owners).size === same.length && !same.some((p) => / of /.test(p.name))) {
+      same.forEach((p, k) => (p.name = `${p.name} of ${owners[k]}`));
+      continue;
+    }
     for (const p of same) {
       const last = p.ref.path[p.ref.path.length - 1];
       if (last) p.name = `${p.name} (${where(last.site, uri)})`;
@@ -1773,9 +1826,55 @@ export function processNames(model: Pick<CspModel, 'sourceMap' | 'target'>, uri:
   return out;
 }
 
+/**
+ * A field of a channel expression in a state: a parameter's value, or simple
+ * arithmetic on parameters (`(i - 1)` with i = 3 is 2); anything else as written.
+ */
+function fieldValue(field: string, env: ReadonlyMap<string, string>): string {
+  const direct = env.get(field);
+  if (direct !== undefined) return direct;
+  const substituted = field.replace(/[A-Za-z_][A-Za-z0-9_']*/g, (name) => env.get(name)?.replace(/^\((-?\d+)\)$/, '$1') ?? name);
+  if (!/^[-+*() 0-9]+$/.test(substituted)) return field;
+  const tokens = substituted.match(/\d+|[-+*()]/g) ?? [];
+  let i = 0;
+  const atom = (): number | undefined => {
+    const t = tokens[i++];
+    if (t === '(') {
+      const v = sum();
+      i++;
+      return v;
+    }
+    if (t === '-') {
+      const v = atom();
+      return v === undefined ? undefined : -v;
+    }
+    return t !== undefined && /^\d+$/.test(t) ? Number(t) : undefined;
+  };
+  const product = (): number | undefined => {
+    let v = atom();
+    while (v !== undefined && tokens[i] === '*') {
+      i++;
+      const r = atom();
+      v = r === undefined ? undefined : v * r;
+    }
+    return v;
+  };
+  const sum = (): number | undefined => {
+    let v = product();
+    while (v !== undefined && (tokens[i] === '+' || tokens[i] === '-')) {
+      const op = tokens[i++];
+      const r = product();
+      v = r === undefined ? undefined : op === '+' ? v + r : v - r;
+    }
+    return v;
+  };
+  const value = sum();
+  return value === undefined || i !== tokens.length ? field : String(value);
+}
+
 export function sameChannel(a: ChannelRef, b: ChannelRef): boolean {
   if (a === b) return true;
-  if (a.name !== b.name || a.kind !== b.kind) return false;
+  if (a.name !== b.name || a.kind !== b.kind || a.index !== b.index) return false;
   const da = a.declaration;
   const db = b.declaration;
   if (!!da !== !!db) return false;

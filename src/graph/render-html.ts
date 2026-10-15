@@ -250,7 +250,7 @@ body.vscode-dark, body.vscode-high-contrast { ${DARK_PAGE} ${VSCODE_PAGE} }
 [hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body { background: var(--bg); color: var(--text); font: 13px/1.45 var(--font); overflow: hidden; }
-#app { display: grid; grid-template-rows: auto auto 1fr auto; height: 100vh; }
+#app { display: grid; grid-template-rows: auto auto 1fr auto; grid-template-columns: minmax(0, 1fr); height: 100vh; }
 button, select, input { font: inherit; color: inherit; }
 button { cursor: pointer; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
@@ -306,7 +306,7 @@ select, input[type="search"] { background: var(--surface-2); border: 1px solid v
 .chip.fresh { animation: pj-chip-pulse 1.2s ease-in-out 3; }
 @keyframes pj-chip-pulse { 50% { box-shadow: 0 0 0 5px var(--accent-soft), 0 0 0 2px var(--accent); } }
 
-main { display: grid; grid-template-columns: 1fr 340px; min-height: 0; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 0; }
 #stage { position: relative; overflow: hidden; background: var(--canvas); cursor: grab; touch-action: none; outline: none; }
 #stage.dragging { cursor: grabbing; }
 #canvas { display: block; width: 100%; height: 100%; user-select: none; }
@@ -523,7 +523,7 @@ button.action:hover { background: var(--accent-soft); }
 @media (prefers-reduced-motion: reduce) { .pj-flash .pj-box, .pj-flash .pj-group-box, .code-line.pulse { animation: none; } * { scroll-behavior: auto !important; } }
 /* Narrow (a VS Code panel beside the editor, half a screen): the network keeps the room, details open as a drawer. */
 @media (max-width: 900px) {
-  main { grid-template-columns: 1fr; position: relative; }
+  main { grid-template-columns: minmax(0, 1fr); position: relative; }
   #panel { display: none; position: absolute; top: 0; right: 0; bottom: 0; width: min(340px, 88vw); z-index: 30; border-left: 1px solid var(--border-strong); box-shadow: -12px 0 30px rgba(0, 0, 0, 0.18); }
   body.panel-open #panel { display: block; }
   #details-button { display: inline-block; }

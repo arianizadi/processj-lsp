@@ -15,7 +15,15 @@ import { refreshConcurrencyGraph, showConcurrencyGraph, showProtocolGraph, type 
 const DOCUMENT_SELECTOR = [
   { scheme: 'file', language: 'processj' },
   { scheme: 'untitled', language: 'processj' },
+  // CSPm files get the process graph and FDR on their own assertions; no ProcessJ analysis.
+  { scheme: 'file', language: 'cspm' },
+  { scheme: 'untitled', language: 'cspm' },
 ];
+
+/** A ProcessJ or a CSPm editor: the documents the graph and FDR commands work on. */
+function graphable(document: vscode.TextDocument | undefined): boolean {
+  return document?.languageId === 'processj' || document?.languageId === 'cspm';
+}
 
 let client: LanguageClient | undefined;
 let clientStateSubscription: vscode.Disposable | undefined;
@@ -63,8 +71,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand('processj.exportConcurrencyGraphFiles', async () => {
       const editor = vscode.window.activeTextEditor;
-      if (!editor || editor.document.languageId !== 'processj') {
-        void vscode.window.showWarningMessage('ProcessJ: open a ProcessJ editor first.');
+      if (!editor || !graphable(editor.document)) {
+        void vscode.window.showWarningMessage('ProcessJ: open a ProcessJ or CSPm editor first.');
         return;
       }
       if (!client?.isRunning()) {
@@ -82,7 +90,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await client.sendRequest('workspace/executeCommand', { command: 'processj.exportConcurrencyGraph', arguments: [editor.document.uri.toString(), choice.format] });
     }),
     vscode.workspace.onDidSaveTextDocument((document) => {
-      if (document.languageId === 'processj' && client?.isRunning()) void refreshConcurrencyGraph(client, document.uri.toString());
+      if (graphable(document) && client?.isRunning()) void refreshConcurrencyGraph(client, document.uri.toString());
     }),
     vscode.commands.registerCommand('processj.showProtocolFlow', async () => {
       if (!client?.isRunning()) {
@@ -96,7 +104,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('processj.checkCurrentFileWithFdr', () => executeOnTarget('processj.checkWithFdr', 'Check with FDR')),
     vscode.commands.registerCommand('processj.cancelFdrCheck', () => {
       if (!client?.isRunning()) return undefined;
-      const uri = vscode.window.activeTextEditor?.document.languageId === 'processj' ? vscode.window.activeTextEditor.document.uri.toString() : undefined;
+      const uri = graphable(vscode.window.activeTextEditor?.document) ? vscode.window.activeTextEditor!.document.uri.toString() : undefined;
       return client.sendRequest(ExecuteCommandRequest.type, { command: 'processj.cancelFdr', arguments: uri ? [uri] : [] });
     }),
     vscode.commands.registerCommand('processj.showOutput', () => {
@@ -174,6 +182,14 @@ async function executeForActiveEditor(command: 'processj.run' | 'processj.build'
  */
 async function executeOnTarget(command: 'processj.convertToCsp' | 'processj.checkWithFdr', title: string): Promise<unknown> {
   const editor = vscode.window.activeTextEditor;
+  // A CSPm file is checked as it is: FDR runs its own assertions.
+  if (editor?.document.languageId === 'cspm' && command === 'processj.checkWithFdr') {
+    if (!client?.isRunning()) {
+      void vscode.window.showWarningMessage('ProcessJ: the language server is not ready. Run ProcessJ: Restart Language Server and check its output.');
+      return undefined;
+    }
+    return checkWithProgress(client, [editor.document.uri.toString()]);
+  }
   if (!editor || editor.document.languageId !== 'processj') {
     void vscode.window.showWarningMessage('ProcessJ: open a ProcessJ editor first.');
     return undefined;
@@ -211,7 +227,8 @@ async function executeOnTarget(command: 'processj.convertToCsp' | 'processj.chec
  * is shown in the status bar, which has no cancel button.)
  */
 function checkWithProgress(languageClient: LanguageClient, args: unknown[]): Thenable<unknown> {
-  const target = typeof args[1] === 'string' ? `procedure ${args[1]}` : 'the program';
+  const cspm = typeof args[0] === 'string' && /\.csp$/i.test(args[0]);
+  const target = cspm ? 'the assertions of this file' : typeof args[1] === 'string' ? `procedure ${args[1]}` : 'the program';
   return vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: `ProcessJ: checking ${target} with FDR`, cancellable: true },
     (_progress, token) => languageClient.sendRequest(ExecuteCommandRequest.type, { command: 'processj.checkWithFdr', arguments: args }, token),

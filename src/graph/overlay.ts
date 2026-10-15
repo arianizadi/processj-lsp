@@ -216,7 +216,8 @@ function overlayFor(model: NetworkModel, view: NetworkView, report: Verification
     const placeProcess = (ref: ProcessRef): { node: NetNode; exact: boolean } | undefined => findProcess(view, mapPath(ref.path));
     const placeChannel = (ref: ChannelRef | undefined): NetChannel | undefined => ref ? findChannel(view, mapChannel(ref))?.channel : undefined;
     // The caller of a procedure checked on its own, drawn as the port of the parameter it uses.
-    const portOf = (ref: ChannelRef | undefined): string | undefined => (ref?.declaration && isPort(ref) ? view.nodes.find((node) => node.kind === 'port' && node.source && sameSource(node.source, ref.declaration!))?.id : undefined);
+    // One channel of a channel-array parameter has a port of its own: the one with its index.
+    const portOf = (ref: ChannelRef | undefined): string | undefined => (ref?.declaration && isPort(ref) ? view.nodes.find((node) => node.kind === 'port' && node.source && sameSource(node.source, ref.declaration!) && (node.port?.index === undefined || node.port.index === ref.index))?.id : undefined);
 
     for (const snapshot of counterexample.final) {
       const placed = placeProcess(snapshot.process);
@@ -470,6 +471,7 @@ function waitText(wait: WaitInfo): string {
 }
 
 export function snapshotBadge(snapshot: ProcessSnapshot): string {
+  if (snapshot.badge) return snapshot.badge;
   switch (snapshot.status) {
     case 'blocked': {
       const waits = snapshot.waits ?? [];
@@ -537,6 +539,7 @@ const SHORT = 46;
  * the producer names it (`iteration i = 1`), a branch by its label.
  */
 function shortWho(ref: ProcessRef): string {
+  if (ref.short) return ref.short;
   if (/^\w+\(.*\)$/.test(ref.label)) return ref.label.replace(/^(\w+)\(.*\)$/, '$1');
   return /^iteration\b/.test(ref.label) && ref.name ? ref.name : ref.label;
 }
@@ -621,7 +624,10 @@ export function story(counterexample: Counterexample, check: CheckOutcome): stri
   };
   // Sentences by part, each group of processes told the same way once.
   const groups = new Map<Part, Map<string, { snapshots: ProcessSnapshot[]; tell: (who: string, plural: boolean) => string }>>();
+  // A process the producer marked (the one that can perform a refused event) is told first, in its words.
+  for (const snapshot of counterexample.final) if (snapshot.badge && snapshot.status === 'running') lines.push(`${upperFirst(snapshot.description)}.`);
   for (const snapshot of counterexample.final) {
+    if (snapshot.badge && snapshot.status === 'running') continue;
     const part = partOf(snapshot);
     if (!part) continue;
     const tell = sentence(snapshot, line, part, counterexample);
@@ -767,6 +773,11 @@ function sentence(snapshot: ProcessSnapshot, line: (ref?: SourceRef) => string, 
 }
 
 function gerund(wait: WaitInfo): string {
+  // A wait named only by its detail (`waits to sync on pickup.0.1`) reads as `waiting to sync on pickup.0.1`.
+  return gerundOf(wait).replace(/^waits /, 'waiting ');
+}
+
+function gerundOf(wait: WaitInfo): string {
   const name = wait.channel?.name;
   switch (wait.operation) {
     case 'write': return name ? `writing ${name}` : wait.detail;
@@ -845,7 +856,8 @@ export function verdictChips(model: NetworkModel, reports: readonly Verification
                       : counterexample.kind === 'nondeterminism' ? `nondeterministic ${seen ? `after ${seen} visible step${seen === 1 ? '' : 's'}` : 'at the start'}`
                         // A user's `:[deadlock free]` on a program that ends: FDR counts the end as a deadlock.
                         : counterexample.kind === 'deadlock' && counterexample.final.length && counterexample.final.every((snapshot) => snapshot.status === 'terminated') ? `terminates${after} (FDR counts that as a deadlock)`
-                          : `${counterexample.kind.replace('-', ' ')}${after}`
+                          : model.language === 'cspm' && counterexample.kind === 'refinement' ? `fails${after}`
+                            : `${counterexample.kind.replace('-', ' ')}${after}`
             : 'fails'
           : check.status;
       chips.push({
@@ -865,7 +877,8 @@ export function verdictChips(model: NetworkModel, reports: readonly Verification
         ...(check.limits?.length ? { limits: check.limits } : {}),
         ...(counterexample?.caveats?.length ? { caveats: counterexample.caveats } : {}),
         target: check.target.kind === 'program' ? 'program' : `proc:${check.target.name}:${check.target.at?.span.start.line ?? ''}`,
-        ...(check.target.kind === 'procedure' && report.producer === 'fdr' ? { targetLabel: `${check.target.name} on its own` } : {}),
+        // A CSPm file's assertions are about the processes the file defines: nothing is checked apart from its context.
+        ...(check.target.kind === 'procedure' && report.producer === 'fdr' && model.language !== 'cspm' ? { targetLabel: `${check.target.name} on its own` } : {}),
       });
     }
   });

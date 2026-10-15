@@ -17,8 +17,8 @@ import type { ChannelRef, CheckProperty, ProcessRef, SourceRef } from '../verifi
 export interface CspModel {
   /** The generated CSPm file. */
   text: string;
-  /** What was translated: a whole program (from `main`) or one procedure checked on its own. */
-  target: { kind: 'program' | 'procedure'; name: string; at?: SourceRef };
+  /** What was translated: a whole program (from `main`) or one procedure checked on its own (and the arguments it was checked with: CheckedWith.short). */
+  target: { kind: 'program' | 'procedure'; name: string; at?: SourceRef; arguments?: string };
   /** The root process FDR checks (`MAIN` or `PROC_<name>`). */
   root: string;
   /** Integer range every byte/short/char/int/long value is modelled with, and where it came from. */
@@ -35,6 +35,27 @@ export interface CspModel {
    * consumers must not present any check as passed (fail closed).
    */
   unsupported: CspDiagnostic[];
+  /**
+   * A procedure checked on its own whose data parameters decide its network
+   * (recursion depth, channel-array lengths, par for counts) is checked with
+   * the arguments its calls give (or every modelled value that elaborates):
+   * which ones, for the report, the lens and the diagnostics
+   * (`altFIFO checked with size = 6 (the call at line 75)`).
+   */
+  checkedWith?: CheckedWith;
+}
+
+export interface CheckedWith {
+  /** One sentence: `altFIFO checked with size = 6 (the call at line 75)`. */
+  text: string;
+  /** The same after `checked with`: `size = 6 (the call at line 75)`. */
+  detail: string;
+  /** Short, for a lens: `size = 6`. */
+  short: string;
+  /** Where the values come from. */
+  source: 'calls' | 'directive' | 'range';
+  /** Each instance checked: its arguments (`size = 6`), by parameter name, and the call sites that give them. */
+  instances: Array<{ label: string; values: Record<string, number | boolean>; arrays: Record<string, number>; sites: SourceRef[] }>;
 }
 
 export interface CspDiagnostic {
@@ -56,7 +77,7 @@ export interface CspAssertion {
   label: string;
   /** Termination and determinism are informational: servers run forever, alts choose. */
   severity: 'error' | 'warning' | 'info';
-  target: { kind: 'program' | 'procedure'; name: string; at?: SourceRef };
+  target: { kind: 'program' | 'procedure'; name: string; at?: SourceRef; arguments?: string };
   /** The assertion as written in the file (FDR echoes it with its own spacing). */
   assertion: string;
   /** For assertions written in the ProcessJ source: where. */
@@ -101,6 +122,15 @@ export interface CspSourceMap {
    * checked procedure takes data arguments (one `PJ_RUN(...)` per argument value).
    */
   networkRoot: string;
+  /**
+   * A procedure checked once per argument tuple (CspModel.checkedWith): each
+   * instance's own network (`PJ_RUN_1`, ...) and processes, in instance
+   * order; `network`, `networkRoot` and `processes` are the first one's.
+   * explain.ts reads a counterexample against the instance that ran it.
+   * `call`: the fields of its `pj_call` event, a field it leaves to the
+   * caller undefined.
+   */
+  instances?: Array<{ label: string; networkRoot: string; network: CspNetworkNode; processes: CspProcessInfo[]; call?: Array<string | undefined> }>;
   /** Record and protocol constructors, so values in events read back in ProcessJ terms. */
   constructors: Record<string, CspConstructor>;
   /**
@@ -279,6 +309,15 @@ export interface CspChannelInfo {
   fields?: string[];
   /** Fork and join channels: what they start or collect. */
   spawns?: 'branches' | 'iterations';
+  /** An array of channels: its length (the CSPm channel's first field is the element, 0 to array - 1). */
+  array?: number;
+  /**
+   * One channel of an array (`cs.2`), or a local channel of one instance of a
+   * recursive procedure (`m.3`, its first field the instance), or both
+   * (`cs.3.2`): an entry of its own, named by the event's leading fields.
+   * `channel` is the CSPm channel it is part of.
+   */
+  part?: { channel: string; instance?: number; index?: number };
   /**
    * A par for fork with computed bounds: the first two fields after the
    * instance are the first and the last iteration value (first > last when
@@ -310,6 +349,8 @@ export interface CspProcessInfo {
   barrier?: ChannelRef;
   /** For servers: the resource key (CspUse.resource) of the barrier or channel instance they serve. */
   resource?: string;
+  /** For a process that is a call: the data arguments elaboration knows (`size = 4`), which tell instances apart. */
+  known?: string;
   /**
    * What the CSPm channels this leaf uses stand for in this instance. Local
    * channels of a procedure share one CSPm name across instances; this map
