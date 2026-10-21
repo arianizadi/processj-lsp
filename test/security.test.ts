@@ -12,7 +12,7 @@ import * as path from 'node:path';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { checkWithFdr } from '../src/csp/check';
-import { findRefines } from '../src/csp/fdr';
+import { configureFdrQueue, fdrQueueState, findRefines, OUTPUT_LIMITS, runRefines } from '../src/csp/fdr';
 import { includePolicy, prepareIncludes } from '../src/csp/includes';
 import { loadProgram } from '../src/csp/load';
 import { typecheckCspm } from '../src/cspm/check';
@@ -400,4 +400,52 @@ test('F-04: the server shows a refused include of a .csp file as a diagnostic', 
   const published = await client.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri && m.params.diagnostics.some((d: any) => /refused/.test(d.message)));
   const refused = published.params.diagnostics.find((d: any) => /refused/.test(d.message));
   assert.equal(refused.range.start.line, 1);
+});
+
+// ---------------------------------------------------------------------------
+// F-07: FDR runs, together
+// ---------------------------------------------------------------------------
+
+/** An executable standing in for refines. */
+function fakeRefines(dir: string, script: string): string {
+  const file = path.join(dir, 'refines');
+  fs.writeFileSync(file, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+  return file;
+}
+
+test('F-07: every FDR run of the process waits in one bounded queue, and is turned away past it', { skip: process.platform === 'win32' && 'POSIX shell script' }, async (t) => {
+  const dir = tempDir(t, 'pj-fdr-queue-');
+  const refines = fakeRefines(dir, 'sleep 0.4\necho \'{"results":[]}\'');
+  const model = path.join(dir, 'model.csp');
+  fs.writeFileSync(model, 'MAIN = STOP\n');
+  configureFdrQueue({ concurrency: 2, waiting: 2 });
+  t.after(() => configureFdrQueue({ concurrency: 2, waiting: 16 }));
+  const cancelled = new AbortController();
+  const runs = [runRefines(refines, model), runRefines(refines, model), runRefines(refines, model), runRefines(refines, model, { signal: cancelled.signal })];
+  assert.deepEqual(fdrQueueState(), { running: 2, waiting: 2 });
+  const turnedAway = await runRefines(refines, model);
+  assert.match(turnedAway.busy ?? '', /^FDR is busy: 2 checks are running and 2 are waiting/);
+  // A run cancelled while it waits leaves the queue at once, without starting refines.
+  cancelled.abort();
+  const stopped = await runs[3];
+  assert.equal(stopped.aborted, true);
+  assert.equal(stopped.durationMs, 0);
+  assert.deepEqual(fdrQueueState(), { running: 2, waiting: 1 });
+  const done = await Promise.all(runs.slice(0, 3));
+  assert.deepEqual(done.map((run) => [run.exitCode, run.aborted, run.busy]), [[0, false, undefined], [0, false, undefined], [0, false, undefined]]);
+  assert.deepEqual(fdrQueueState(), { running: 0, waiting: 0 });
+});
+
+test('F-07: refines is stopped when one line of its output passes the limit, before it is held in memory', { skip: process.platform === 'win32' && 'POSIX shell script' }, async (t) => {
+  const dir = tempDir(t, 'pj-fdr-frame-');
+  // One line, never ended, longer than a line may be; then it would wait for good.
+  const refines = fakeRefines(dir, `head -c ${OUTPUT_LIMITS.line + 1_000_000} /dev/zero | tr '\\0' x\nsleep 30`);
+  const model = path.join(dir, 'model.csp');
+  fs.writeFileSync(model, 'MAIN = STOP\n');
+  const started = Date.now();
+  const run = await runRefines(refines, model, { timeoutMs: 60_000 });
+  assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started} ms`);
+  assert.ok((run.outputExceeded ?? 0) > OUTPUT_LIMITS.line, JSON.stringify({ outputExceeded: run.outputExceeded, aborted: run.aborted }));
+  assert.equal(run.aborted, false);
+  assert.equal(run.timedOut, false);
 });

@@ -102,7 +102,8 @@ export async function typecheckCspm(document: CspmDocument, refines: string, opt
     const file = path.join(temp, safeName(document.title));
     fs.writeFileSync(file, prepared.text);
     const run = await runRefines(refines, file, { typecheckOnly: true, timeoutMs: opts.timeoutMs ?? 20_000, signal: opts.signal });
-    if (run.aborted) return [];
+    // Stopped, or not started (too many FDR runs waiting): the next save type-checks again.
+    if (run.aborted || run.busy) return [];
     return fdrErrors([...run.errors, ...run.results.flatMap((result) => result.errors)], path.basename(file));
   } finally {
     removePrivateDir(temp, true);
