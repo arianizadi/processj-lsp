@@ -587,6 +587,21 @@ button.action:hover { background: var(--accent-soft); }
   .chip { flex: 0 0 auto; }
 }
 @media (max-height: 640px) { #dock { height: var(--dock-height, 30vh); } }
+/* A phone, or a slim panel: the toolbar is one row that scrolls sideways (its menu opens over the page). */
+@media (max-width: 600px) {
+  .toolbar { flex-wrap: nowrap; overflow-x: auto; gap: 8px 12px; padding: 6px 10px; }
+  .toolbar > *, .tools > * { flex: 0 0 auto; }
+  .tools { flex-wrap: nowrap; }
+  .search { flex: 0 0 170px; min-width: 0; }
+  #view-select { max-width: 180px; }
+  .menu { position: fixed; top: 44px; right: 8px; }
+}
+/* A short frame: the network keeps a usable height, and the timeline and the code give way. */
+@media (max-height: 560px) {
+  #app { grid-template-rows: auto auto minmax(96px, 1fr) auto; }
+  #dock { min-height: 0; height: var(--dock-height, 32vh); }
+  .verdicts { min-height: 0; padding-top: 5px; padding-bottom: 5px; }
+}
 `;
 
 /** Every network and sequence-chart custom property for one theme. */

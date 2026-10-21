@@ -551,6 +551,7 @@ function showView(id: string, options: { fit?: boolean } = {}): void {
   const saved = transforms.get(view.id);
   if (saved && !options.fit) {
     transform = { ...saved };
+    reframe = undefined;
     applyTransform();
   } else openingView();
   overlay = active ? payload.overlays.find((entry) => entry.view === view.id && entry.report === active!.report && entry.check === active!.check) : undefined;
@@ -568,6 +569,31 @@ function showView(id: string, options: { fit?: boolean } = {}): void {
 // ---------------------------------------------------------------------------
 // Pan and zoom
 // ---------------------------------------------------------------------------
+
+/** The zoom's range: the buttons, the wheel and every fit stay inside it. */
+const MIN_SCALE = 0.04;
+const MAX_SCALE = 8;
+/**
+ * A stage smaller than this is still being laid out, or squeezed shut by the
+ * frame around the page (a panel on a phone): nothing is fitted to it, and the
+ * framing waits until it has grown (the ResizeObserver below).
+ */
+const MIN_STAGE = 64;
+
+function clampScale(k: number): number {
+  return Number.isFinite(k) ? Math.min(MAX_SCALE, Math.max(MIN_SCALE, k)) : 1;
+}
+
+function stageReady(rect: DOMRect = stage.getBoundingClientRect()): boolean {
+  return rect.width >= MIN_STAGE && rect.height >= MIN_STAGE;
+}
+
+/**
+ * The framing the page chose by itself (the view's opening, a result), done
+ * again whenever the stage changes size until the person pans or zooms: the
+ * frame around the page may still be settling when a result arrives.
+ */
+let reframe: (() => void) | undefined;
 
 function applyTransform(): void {
   viewport.setAttribute('transform', `translate(${transform.x.toFixed(2)} ${transform.y.toFixed(2)}) scale(${transform.k.toFixed(4)})`);
@@ -627,6 +653,8 @@ let animation: number | undefined;
 
 function animateTo(target: Transform, animate = true): void {
   if (animation) cancelAnimationFrame(animation);
+  if (!Number.isFinite(target.x) || !Number.isFinite(target.y)) return;
+  target = { ...target, k: clampScale(target.k) };
   if (!animate || reduceMotion) {
     transform = target;
     applyTransform();
@@ -648,12 +676,14 @@ function animateTo(target: Transform, animate = true): void {
 }
 
 function fit(animate = true, bounds = contentBounds()): void {
+  userMoved = false;
+  reframe = () => fit(false, bounds);
   const rect = stage.getBoundingClientRect();
+  if (!stageReady(rect)) return;
   const width = Math.max(rect.width, 100);
   const height = Math.max(rect.height, 100);
   const k = Math.min((width - 56) / Math.max(bounds.width, 1), (height - 56) / Math.max(bounds.height, 1), 1.6);
   animateTo({ k, x: (width - bounds.width * k) / 2 - bounds.x * k, y: (height - bounds.height * k) / 2 - bounds.y * k }, animate);
-  userMoved = false;
 }
 
 /**
@@ -661,22 +691,25 @@ function fit(animate = true, bounds = contentBounds()): void {
  * inputs, on the left) at a readable size; the minimap shows the rest and 0 fits.
  */
 function openingView(): void {
+  userMoved = false;
+  reframe = openingView;
   const rect = stage.getBoundingClientRect();
+  if (!stageReady(rect)) return;
   const bounds = contentBounds();
   const k = Math.min((rect.width - 56) / Math.max(bounds.width, 1), (rect.height - 56) / Math.max(bounds.height, 1), 1.6);
   if (k >= 0.5) {
     fit(false);
+    reframe = openingView;
     return;
   }
   // Never below a readable size: the minimap shows the rest.
   const readable = Math.max(0.6, Math.min(0.75, Math.max(k, (rect.height - 56) / Math.max(bounds.height, 1))));
   transform = { k: readable, x: 28 - bounds.x * readable, y: Math.max(28, (rect.height - bounds.height * readable) / 2) - bounds.y * readable };
-  userMoved = false;
   applyTransform();
 }
 
 function zoomAt(factor: number, cx: number, cy: number, animate = false): void {
-  const k = Math.min(8, Math.max(0.04, transform.k * factor));
+  const k = clampScale(transform.k * factor);
   const ratio = k / transform.k;
   const target = { k, x: cx - (cx - transform.x) * ratio, y: cy - (cy - transform.y) * ratio };
   userMoved = true;
@@ -696,12 +729,19 @@ function actualSize(): void {
   userMoved = true;
 }
 
-/** Bring a box into view, zooming in only as far as is comfortable. */
-function focusBox(box: { x: number; y: number; width: number; height: number }, minScale = 0.85): void {
+/**
+ * Bring a box into view, zooming in only as far as is comfortable. `auto`: the
+ * page's own framing (a result), which a change of the stage's size redoes;
+ * otherwise the person asked, and the view stays where it is put.
+ */
+function focusBox(box: { x: number; y: number; width: number; height: number }, minScale = 0.85, options: { auto?: boolean; animate?: boolean } = {}): void {
+  if (!options.auto) userMoved = true;
   const rect = stage.getBoundingClientRect();
-  const k = Math.min(Math.max(transform.k, minScale), (rect.width - 120) / Math.max(box.width, 1), (rect.height - 120) / Math.max(box.height, 1), 2);
-  animateTo({ k, x: rect.width / 2 - (box.x + box.width / 2) * k, y: rect.height / 2 - (box.y + box.height / 2) * k });
-  userMoved = true;
+  if (!stageReady(rect)) return;
+  // A margin around the box, smaller on a small stage.
+  const margin = (size: number): number => Math.min(120, size / 4);
+  const k = Math.min(Math.max(transform.k, minScale), (rect.width - margin(rect.width)) / Math.max(box.width, 1), (rect.height - margin(rect.height)) / Math.max(box.height, 1), 2);
+  animateTo({ k, x: rect.width / 2 - (box.x + box.width / 2) * k, y: rect.height / 2 - (box.y + box.height / 2) * k }, options.animate ?? true);
 }
 
 function updateMinimap(): void {
@@ -801,7 +841,7 @@ minimapBox.addEventListener('pointerup', (event) => {
 });
 
 new ResizeObserver(() => {
-  if (!userMoved && view && !view.pending) openingView();
+  if (!userMoved && view && !view.pending && stageReady()) (reframe ?? openingView)();
   else updateMinimap();
 }).observe(stage);
 
@@ -1322,12 +1362,20 @@ function activate(next: typeof active): void {
  * wait on and the other ends of those (partners, stubs, ports, junctions), and
  * the words drawn for them. The rest waits behind those, and the minimap shows it.
  */
-function frameResult(result: Overlay): void {
+function frameResult(result: Overlay, animate = true): void {
+  const again = (): void => {
+    if (overlay === result) frameResult(result, false);
+    else openingView();
+  };
+  userMoved = false;
+  reframe = again;
   const rect = stage.getBoundingClientRect();
+  if (!stageReady(rect)) return;
   const bounds = contentBounds();
   const fitScale = Math.min((rect.width - 56) / Math.max(bounds.width, 1), (rect.height - 56) / Math.max(bounds.height, 1));
   if (fitScale >= 0.6) {
-    fit(true);
+    fit(animate);
+    reframe = again;
     return;
   }
   const roots = result.processes.filter((entry) => entry.cause === 'root' || entry.status === 'error');
@@ -1358,7 +1406,7 @@ function frameResult(result: Overlay): void {
   const y = Math.min(...boxes.map((box) => box.y));
   const right = Math.max(...boxes.map((box) => box.x + box.width));
   const bottom = Math.max(...boxes.map((box) => box.y + box.height));
-  focusBox({ x: x - 40, y: y - 40, width: right - x + 80, height: bottom - y + 80 }, 0.6);
+  focusBox({ x: x - 40, y: y - 40, width: right - x + 80, height: bottom - y + 80 }, 0.6, { auto: true, animate });
 }
 
 // ---------------------------------------------------------------------------
@@ -2927,15 +2975,25 @@ function connectLive(): void {
   }
 }
 
+/**
+ * A message from the editor this page is shown in: its parent frame (VS Code's
+ * webview host, or the web IDE around its iframe), never another window that
+ * holds a reference to this one, and nothing when the page is not framed.
+ */
+function fromEditor(event: MessageEvent): boolean {
+  return window.parent !== window && event.source === window.parent;
+}
+
 window.addEventListener('message', (event: MessageEvent) => {
+  if (!vscode || !fromEditor(event)) return;
   const data = event.data as { type?: string; payload?: Payload; view?: VView; focus?: Focus; machine?: Machine | MachineError } | undefined;
-  if (vscode && data?.type === 'update' && data.payload) {
+  if (data?.type === 'update' && data.payload) {
     applyPayload(data.payload);
     applyFocus(data.focus, !!data.focus);
   }
-  if (vscode && data?.type === 'focus') applyFocus(data.focus, true);
-  if (vscode && data?.type === 'view' && data.view) receiveView(data.view);
-  if (vscode && data?.type === 'machine' && data.machine) receiveMachine(data.machine);
+  if (data?.type === 'focus') applyFocus(data.focus, true);
+  if (data?.type === 'view' && data.view) receiveView(data.view);
+  if (data?.type === 'machine' && data.machine) receiveMachine(data.machine);
 });
 
 // ---------------------------------------------------------------------------
