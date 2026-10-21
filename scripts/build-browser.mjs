@@ -5,6 +5,8 @@
 //
 //   processj-lsp.worker.js   the server, one classic (IIFE) worker script, with
 //                            the standard library headers inside (+ .map)
+//   elk.<hash>.js            the layout engine (elkjs), which the worker loads
+//                            with importScripts when it first lays out a view
 //   graph-viewer.html        the graph viewer for <iframe sandbox="allow-scripts">
 //   manifest.json            { version, commit, files }
 //
@@ -13,7 +15,7 @@
 // modules become the ones in src/browser/ (files in memory, which the page
 // fills). See docs/DETAILS.md, "The browser build".
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import * as path from 'node:path';
@@ -64,6 +66,7 @@ const builtins = {
 const browserModules = {
   name: 'processj-lsp-browser',
   setup(build) {
+    build.onResolve({ filter: /^elkjs\/lib\/elk\.bundled\.js$/ }, () => ({ path: src('browser/elk.ts') }));
     build.onResolve({ filter: /^(node:)?[a-z_]+$/ }, (args) => {
       const name = args.path.replace(/^node:/, '');
       if (builtins[name]) return { path: builtins[name] };
@@ -76,6 +79,12 @@ const browserModules = {
 
 fs.rmSync(out, { recursive: true, force: true });
 fs.mkdirSync(out, { recursive: true });
+
+// The layout engine as a file of its own (src/browser/elk.ts loads it), named by its content for caching.
+const elkCode = (await esbuild.transform(fs.readFileSync(require.resolve('elkjs/lib/elk.bundled.js'), 'utf8'), { minify: true, target: 'es2022', legalComments: 'inline' })).code;
+const ELK = `elk.${createHash('sha256').update(elkCode).digest('hex').slice(0, 12)}.js`;
+fs.writeFileSync(path.join(out, ELK), elkCode);
+
 const result = await esbuild.build({
   absWorkingDir: root,
   entryPoints: [src('browser/worker.ts')],
@@ -90,17 +99,23 @@ const result = await esbuild.build({
   define: {
     PROCESSJ_LSP_VERSION: JSON.stringify(version),
     PROCESSJ_VIEWER_SCRIPT: JSON.stringify(fs.readFileSync(viewerScript, 'utf8')),
+    PROCESSJ_ELK_FILE: JSON.stringify(ELK),
   },
   plugins: [browserModules],
   metafile: true,
   logLevel: 'warning',
 });
-const unexpected = Object.keys(result.metafile.inputs).filter((file) => /vscode-languageserver\/lib\/node\/|vscode-jsonrpc\/lib\/node\//.test(file));
-if (unexpected.length) throw new Error(`the browser build pulled in Node's LSP transport: ${unexpected.join(', ')}`);
+const unexpected = Object.keys(result.metafile.inputs).filter((file) => /vscode-languageserver\/lib\/node\/|vscode-jsonrpc\/lib\/node\/|elkjs\//.test(file));
+if (unexpected.length) throw new Error(`the browser build pulled in Node's LSP transport or the layout engine: ${unexpected.join(', ')}`);
 
-// The viewer page, built once: payloads reach it by postMessage. Its nonce is fixed with the file.
+// The viewer page, built once: payloads reach it by postMessage. Its nonce is fixed with the file, and
+// made from the page itself, so the same source always builds the same file (a static file's nonce is no
+// secret either way: the page's CSP is what lets only these scripts run).
 const { renderEmbeddedViewerHtml } = require(renderHtml);
-fs.writeFileSync(path.join(out, VIEWER), renderEmbeddedViewerHtml({ nonce: randomBytes(18).toString('base64') }));
+const NONCE_SLOT = 'processjViewerNonceSlot';
+const draft = renderEmbeddedViewerHtml({ nonce: NONCE_SLOT });
+const nonce = createHash('sha256').update(draft).digest('base64').slice(0, 24);
+fs.writeFileSync(path.join(out, VIEWER), draft.split(NONCE_SLOT).join(nonce));
 
 let commit = 'unknown';
 try {
@@ -113,7 +128,7 @@ try {
 const files = fs.readdirSync(out).sort();
 fs.writeFileSync(path.join(out, 'manifest.json'), `${JSON.stringify({ version, commit, files }, null, 2)}\n`);
 
-for (const file of [WORKER, VIEWER]) {
+for (const file of [WORKER, ELK, VIEWER]) {
   const bytes = fs.readFileSync(path.join(out, file));
   console.log(`dist/browser/${file}: ${(bytes.length / 1024).toFixed(0)} KiB, ${(gzipSync(bytes, { level: 9 }).length / 1024).toFixed(0)} KiB gzipped`);
 }

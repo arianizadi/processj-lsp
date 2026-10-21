@@ -15,6 +15,7 @@
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as vm from 'node:vm';
 import { stopServer } from './server-process';
 
@@ -177,6 +178,11 @@ export class WorkerClient extends Peer {
       atob,
       structuredClone,
       performance,
+      // The worker's own URL, and importScripts for the files beside it (the layout engine).
+      location: new URL(pathToFileURL(bundle).href),
+      importScripts: (...urls: string[]) => {
+        for (const url of urls) vm.runInContext(fs.readFileSync(fileURLToPath(url), 'utf8'), context, { filename: path.basename(fileURLToPath(url)) });
+      },
     });
     vm.runInContext('globalThis.self = globalThis', context);
     this.leaked = ['require', 'process', 'Buffer', 'module', 'exports', 'global', 'window', 'document', '__dirname'].filter((name) => vm.runInContext(`typeof ${name}`, context) !== 'undefined');

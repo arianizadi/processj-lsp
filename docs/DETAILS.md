@@ -1548,8 +1548,12 @@ browser IDE, into `dist/browser/`:
 | file | what |
 | --- | --- |
 | `processj-lsp.worker.js` | the server as one classic worker script (minified, with a source map), LSP over the worker's `postMessage` |
+| `elk.<hash>.js` | the layout engine (elkjs, about half of the code), which the worker loads with `importScripts` from beside itself when it first lays out a view (`src/browser/elk.ts`); the name carries a hash of its content |
 | `graph-viewer.html` | the graph viewer page for `<iframe sandbox="allow-scripts">`: webview mode, fed by `postMessage` as VS Code's panel feeds it; a stand-in for `acquireVsCodeApi()` posts the page's messages to the parent as `{ pjViewer: message }`, starting with `{ type: 'ready' }`, and the parent's `{ type: 'theme', theme: 'light' \| 'dark' }` sets the page's theme (an iframe cannot see its embedder's) |
 | `manifest.json` | `{ version, commit, files }` |
+
+The viewer page's script nonce is made from a hash of the page, so the same
+source always builds the same files.
 
 `npm install` builds it too (the `prepare` script runs `build:browser`), and
 so does npm when it installs the package from git, where `prepare` is the only
@@ -1565,7 +1569,7 @@ and `child_process` and `http` that say they are not available. The standard
 library headers (`test/fixtures/include`, the compiler's `include/JVM`) are in
 the bundle and installed at `/processj` with the files an install is
 recognised by, so the server finds its library as it does on disk. ELK lays
-out in the worker's own thread; `src/graph/layout.ts` builds it so that it
+out in the worker's own thread, once `elk.<hash>.js` is loaded; `src/graph/layout.ts` builds it so that it
 does not take the worker's `onmessage` (the bundled elkjs would, thinking it is
 running as ELK's own worker). The build type-checks `src/browser` against the
 worker's library (`tsconfig.browser.json`) first.

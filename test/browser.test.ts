@@ -6,6 +6,7 @@
  * in the worker, so these run without FDR, a compiler or a runner.
  */
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -418,4 +419,12 @@ test('the graph viewer page and manifest of the browser build', () => {
   assert.equal(manifest.version, VERSION);
   assert.ok(typeof manifest.commit === 'string' && manifest.commit.length > 0);
   for (const file of ['processj-lsp.worker.js', 'graph-viewer.html']) assert.ok(manifest.files.includes(file), file);
+  // The nonce is made from the page itself (scripts/build-browser.mjs), so the same source builds the same file.
+  assert.equal(createHash('sha256').update(html.split(nonce!).join('processjViewerNonceSlot')).digest('base64').slice(0, 24), nonce);
+  // The layout engine is a file of its own, named by its content, which the worker loads on its first layout.
+  const elk = manifest.files.filter((file: string) => /^elk\.[0-9a-f]{12}\.js$/.test(file));
+  assert.equal(elk.length, 1, manifest.files.join(', '));
+  const worker = fs.readFileSync(WORKER_BUNDLE, 'utf8');
+  assert.ok(worker.includes(JSON.stringify(elk[0])) && !worker.includes('org.eclipse.elk'), 'the worker names the engine but does not carry it');
+  assert.ok(fs.readFileSync(path.join(dir, elk[0]), 'utf8').includes('org.eclipse.elk'));
 });
