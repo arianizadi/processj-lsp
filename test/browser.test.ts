@@ -383,6 +383,8 @@ test('the graph viewer page and manifest of the browser build', () => {
   assert.ok(html.indexOf('window.acquireVsCodeApi') < html.indexOf('const buildExcalidrawScene'));
   assert.match(html, /window\.parent\.postMessage\(\{ pjViewer: message \}, '\*'\)/);
   assert.match(html, /pjViewer: \{ type: 'ready' \}/);
+  // The IDE's theme, only from the embedding page.
+  assert.match(html, /event\.source === window\.parent && data && data\.type === 'theme'/);
   const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'));
   assert.equal(manifest.version, VERSION);
   assert.ok(typeof manifest.commit === 'string' && manifest.commit.length > 0);

@@ -182,12 +182,18 @@ ${viewerScript()}
  * (vscode/src/graphPanel.ts); a stand-in for VS Code's `acquireVsCodeApi()`,
  * with the page's nonce, posts the page's messages to the parent window as
  * `{ pjViewer: message }`, the first being `{ type: 'ready' }` once it has loaded.
+ * The parent's `{ type: 'theme', theme }` sets the page's theme, which an
+ * iframe cannot see for itself (without one it follows the OS setting).
  */
 export function renderEmbeddedViewerHtml(options: { nonce?: string } = {}): string {
   const nonce = options.nonce ?? randomBytes(16).toString('base64');
   const empty: ViewerPayload = { version: 1, generator: 'processj-lsp', title: 'ProcessJ', uri: '', generatedAt: new Date(0).toISOString(), views: [], defaultView: '', reports: [], chips: [], overlays: [], charts: {}, style: `${svgStyle('themed')}${machineStyle('themed')}`, knownUris: [], notes: [] };
   const bridge = `<script nonce="${nonce}">"use strict";
 window.acquireVsCodeApi = () => ({ postMessage: (message) => window.parent.postMessage({ pjViewer: message }, '*') });
+window.addEventListener('message', (event) => {
+  const data = event.data;
+  if (event.source === window.parent && data && data.type === 'theme' && (data.theme === 'light' || data.theme === 'dark')) document.documentElement.dataset.theme = data.theme;
+});
 window.addEventListener('load', () => window.parent.postMessage({ pjViewer: { type: 'ready' } }, '*'));
 </script>`;
   // Before the page script, which asks for the API as it starts.
