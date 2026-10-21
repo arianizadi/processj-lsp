@@ -5,9 +5,12 @@
  * must end quickly with a clear note, not hang or exhaust memory.
  */
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { loadProgram } from '../src/csp/load';
 import { translateProcedure, translateProgram } from '../src/csp/translate';
 import { CspmDocument } from '../src/cspm/document';
@@ -15,7 +18,9 @@ import { MAX_LAYOUT } from '../src/graph/layout';
 import type { NetNode, NetworkView } from '../src/graph/network';
 import { layoutOrFallback } from '../src/graph/payload';
 import { formatConcurrencyMarkdown } from '../src/graph/render-markdown';
+import { writeGeneratedFile } from '../src/safewrite';
 import { analyzeSource, INCLUDE } from './graph-helpers';
+import { stopServer } from './server-process';
 
 /** Run `fn` and fail when it takes longer than `ms` (the page's watchdog gives a request 10 s). */
 function quick<T>(ms: number, fn: () => T): T {
@@ -29,6 +34,79 @@ function quick<T>(ms: number, fn: () => T): T {
 function cspmNotes(text: string): string[] {
   const doc = new CspmDocument('file:///workspace/model.csp', text);
   return doc.model([doc.defaultView()]).views.flatMap((view) => view.notes);
+}
+
+/** A language server over stdio, answering its requests to the client the way an editor would. */
+class Client {
+  private nextId = 1;
+  private buffer = Buffer.alloc(0);
+  private readonly waiting = new Map<number, (message: any) => void>();
+  readonly messages: any[] = [];
+  readonly child = spawn(process.execPath, [path.join(__dirname, '..', 'src', 'server.js'), '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  readonly sent = new Set<string>();
+
+  constructor() {
+    this.child.stdout.on('data', (chunk: Buffer) => {
+      this.buffer = Buffer.concat([this.buffer, chunk]);
+      for (;;) {
+        const end = this.buffer.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        const length = Number(/Content-Length:\s*(\d+)/i.exec(this.buffer.subarray(0, end).toString())?.[1] ?? 0);
+        if (this.buffer.length < end + 4 + length) return;
+        const message = JSON.parse(this.buffer.subarray(end + 4, end + 4 + length).toString());
+        this.buffer = this.buffer.subarray(end + 4 + length);
+        if (message.id !== undefined && !message.method && this.waiting.has(message.id)) {
+          this.waiting.get(message.id)!(message);
+          this.waiting.delete(message.id);
+        } else if (message.method) {
+          this.messages.push(message);
+          if (message.id !== undefined) this.send({ jsonrpc: '2.0', id: message.id, result: message.method === 'window/showDocument' ? { success: true } : null });
+        }
+      }
+    });
+  }
+
+  request(method: string, params: unknown, timeoutMs = 20_000): Promise<any> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timed out waiting for ${method}`)), timeoutMs);
+      this.waiting.set(id, (message) => {
+        clearTimeout(timer);
+        resolve(message);
+      });
+      this.send({ jsonrpc: '2.0', id, method, params });
+    });
+  }
+
+  notify(method: string, params: unknown): void {
+    this.send({ jsonrpc: '2.0', method, params });
+  }
+
+  async waitFor(predicate: (message: any) => boolean, timeoutMs = 20_000): Promise<any> {
+    for (const deadline = Date.now() + timeoutMs; Date.now() < deadline;) {
+      const found = this.messages.find(predicate);
+      if (found) return found;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error('timed out waiting for a message');
+  }
+
+  close(): Promise<void> {
+    return stopServer(this);
+  }
+
+  private send(message: unknown): void {
+    const body = JSON.stringify(message);
+    this.sent.add((message as { method?: string }).method ?? '');
+    this.child.stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+  }
+}
+
+function tempDir(t: { after(fn: () => void): void }, prefix: string): string {
+  // The real path: macOS' temporary directory is reached through a link of its own.
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
 }
 
 function translated(text: string, procedure?: string) {
@@ -162,4 +240,58 @@ test('F-09: names and notes in the Markdown report are text, not HTML, links or 
   assert.match(markdown, /\*\*\\\*\\\*bold\\\*\\\* \\`tick\\`\*\*/);
   // The label stays inside its code span and the chart inside its fence: one fence opens it, one closes it.
   assert.equal(markdown.split('\n').filter((line) => line.startsWith('```')).length, 2, markdown);
+});
+
+// ---------------------------------------------------------------------------
+// F-06: files written beside the source
+// ---------------------------------------------------------------------------
+
+const OURS = (head: string): boolean => head.startsWith('-- Generated by processj-lsp from ');
+
+test('F-06: a generated file is never written through a symbolic link, dangling or not', (t) => {
+  const dir = tempDir(t, 'pj-safewrite-');
+  const outside = path.join(dir, 'outside');
+  fs.mkdirSync(outside);
+  // Dangling: following it would create a file elsewhere.
+  fs.symlinkSync(path.join(outside, 'created'), path.join(dir, 'a.csp'));
+  assert.deepEqual(writeGeneratedFile(path.join(dir, 'a.csp'), '-- Generated by processj-lsp from a.pj.\n', OURS), { written: false, reason: 'it is a symbolic link' });
+  assert.ok(!fs.existsSync(path.join(outside, 'created')));
+  // To a file that even looks generated: left alone too.
+  fs.writeFileSync(path.join(outside, 'victim'), '-- Generated by processj-lsp from x.pj.\nsecret\n');
+  fs.symlinkSync(path.join(outside, 'victim'), path.join(dir, 'b.csp'));
+  assert.equal(writeGeneratedFile(path.join(dir, 'b.csp'), 'replaced', OURS).written, false);
+  assert.equal(fs.readFileSync(path.join(outside, 'victim'), 'utf8'), '-- Generated by processj-lsp from x.pj.\nsecret\n');
+  // A new name is created, a generated file replaced, a file the user wrote kept.
+  assert.deepEqual(writeGeneratedFile(path.join(dir, 'c.csp'), '-- Generated by processj-lsp from c.pj. one\n', OURS), { written: true });
+  assert.deepEqual(writeGeneratedFile(path.join(dir, 'c.csp'), '-- Generated by processj-lsp from c.pj. two\n', OURS), { written: true });
+  assert.equal(fs.readFileSync(path.join(dir, 'c.csp'), 'utf8'), '-- Generated by processj-lsp from c.pj. two\n');
+  fs.writeFileSync(path.join(dir, 'd.csp'), '-- my own model\n');
+  assert.deepEqual(writeGeneratedFile(path.join(dir, 'd.csp'), 'replaced', OURS), { written: false, reason: 'it was not written by processj-lsp' });
+  assert.equal(fs.readFileSync(path.join(dir, 'd.csp'), 'utf8'), '-- my own model\n');
+  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith('.tmp')), [], 'no temporary file is left');
+});
+
+test('F-06: Convert to CSP and graph exports do not follow links the workspace put in their place', async (t) => {
+  const dir = tempDir(t, 'pj-convert-links-');
+  const outside = tempDir(t, 'pj-convert-outside-');
+  const file = path.join(dir, 'demo.pj');
+  fs.writeFileSync(file, 'void main() {\n    chan<int> c;\n    par { c.write(1); int x = c.read(); }\n}\n');
+  fs.symlinkSync(path.join(outside, 'newfile'), path.join(dir, 'demo.csp'));
+  fs.symlinkSync(path.join(outside, 'graph.svg'), path.join(dir, 'demo.graph.svg'));
+  const client = new Client();
+  t.after(() => client.close());
+  const uri = pathToFileURL(file).toString();
+  await client.request('initialize', { processId: process.pid, rootUri: pathToFileURL(dir).toString(), capabilities: { window: { showDocument: { support: true } } }, initializationOptions: { installDir: path.join(dir, 'no-processj'), fdrPath: path.join(dir, 'no-fdr') } });
+  client.notify('initialized', {});
+  client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: fs.readFileSync(file, 'utf8') } });
+  const converted = await client.request('workspace/executeCommand', { command: 'processj.convertToCsp', arguments: [uri] });
+  assert.equal(converted.error, undefined);
+  assert.notEqual(converted.result.cspFile, path.join(dir, 'demo.csp'), 'the model goes to the private report directory');
+  assert.ok(client.messages.some((m) => m.method === 'window/showMessage' && /could not write .*demo\.csp \(it is a symbolic link\)/.test(m.params.message)));
+  const exported = await client.request('workspace/executeCommand', { command: 'processj.exportConcurrencyGraph', arguments: [uri, 'svg'] });
+  assert.equal(exported.error, undefined);
+  assert.deepEqual(exported.result.written, []);
+  assert.deepEqual(exported.result.refused, [path.join(dir, 'demo.graph.svg')]);
+  assert.deepEqual(fs.readdirSync(outside), [], 'nothing was created outside the workspace');
+  assert.ok(fs.lstatSync(path.join(dir, 'demo.csp')).isSymbolicLink());
 });
