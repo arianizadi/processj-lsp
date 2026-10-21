@@ -11,13 +11,18 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
+import { checkWithFdr } from '../src/csp/check';
+import { findRefines } from '../src/csp/fdr';
+import { includePolicy, prepareIncludes } from '../src/csp/includes';
 import { loadProgram } from '../src/csp/load';
+import { typecheckCspm } from '../src/cspm/check';
 import { translateProcedure, translateProgram } from '../src/csp/translate';
 import { CspmDocument } from '../src/cspm/document';
 import { MAX_LAYOUT } from '../src/graph/layout';
 import type { NetNode, NetworkView } from '../src/graph/network';
 import { layoutOrFallback } from '../src/graph/payload';
 import { formatConcurrencyMarkdown } from '../src/graph/render-markdown';
+import { setBrowserMode } from '../src/mode';
 import { writeGeneratedFile } from '../src/safewrite';
 import { analyzeSource, INCLUDE } from './graph-helpers';
 import { stopServer } from './server-process';
@@ -294,4 +299,105 @@ test('F-06: Convert to CSP and graph exports do not follow links the workspace p
   assert.deepEqual(exported.result.refused, [path.join(dir, 'demo.graph.svg')]);
   assert.deepEqual(fs.readdirSync(outside), [], 'nothing was created outside the workspace');
   assert.ok(fs.lstatSync(path.join(dir, 'demo.csp')).isSymbolicLink());
+});
+
+// ---------------------------------------------------------------------------
+// F-04: what FDR may include
+// ---------------------------------------------------------------------------
+
+/** A workspace with a model in `sub/`, files around it, and a private file outside it. */
+function includeWorkspace(t: { after(fn: () => void): void }) {
+  const root = tempDir(t, 'pj-includes-');
+  const workspace = path.join(root, 'workspace');
+  const outside = path.join(root, 'private');
+  fs.mkdirSync(path.join(workspace, 'sub'), { recursive: true });
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, 'spec.csp'), 'SECRET = STOP\n');
+  fs.writeFileSync(path.join(workspace, 'common.csp'), 'include "sub/leaf.csp"\nCOMMON = STOP\n');
+  fs.writeFileSync(path.join(workspace, 'sub', 'leaf.csp'), 'include "../common.csp"\nLEAF = STOP\n');
+  return { root, workspace, outside, base: path.join(workspace, 'sub') };
+}
+
+test('F-04: includes inside the workspace are followed (cycles once) and made absolute for the copy FDR runs', (t) => {
+  const { workspace, base } = includeWorkspace(t);
+  const prepared = prepareIncludes('include "../common.csp"\nMAIN = STOP\n', base, includePolicy([workspace], base));
+  assert.deepEqual(prepared.problems, []);
+  assert.equal(prepared.text, `include "${path.join(workspace, 'common.csp').split(path.sep).join('/')}"\nMAIN = STOP\n`);
+  assert.deepEqual(prepared.files.map((file) => file.relative), ['../common.csp', 'leaf.csp']);
+});
+
+test('F-04: an include out of the workspace, by .. or through a symbolic link, is refused, also from an included file', (t) => {
+  const { workspace, outside, base } = includeWorkspace(t);
+  const policy = includePolicy([workspace], base);
+  const escaping = prepareIncludes('include "../../private/spec.csp"\n', base, policy);
+  assert.match(escaping.problems[0]?.message ?? '', /include "\.\.\/\.\.\/private\/spec\.csp" is refused: it is outside the workspace/);
+  assert.deepEqual(escaping.problems[0].span, { start: { line: 0, col: 8 }, end: { line: 0, col: 32 } });
+  fs.symlinkSync(path.join(outside, 'spec.csp'), path.join(base, 'spec.csp'));
+  assert.match(prepareIncludes('include "spec.csp"\n', base, policy).problems[0]?.message ?? '', /symbolic link to a file outside the workspace/);
+  fs.symlinkSync(outside, path.join(workspace, 'linked'));
+  assert.match(prepareIncludes(`include "${path.join(workspace, 'linked', 'spec.csp')}"\n`, base, policy).problems[0]?.message ?? '', /symbolic link to a file outside the workspace/);
+  fs.writeFileSync(path.join(base, 'nested.csp'), '-- a comment\n  include "../../private/spec.csp"\n');
+  const nested = prepareIncludes('MAIN = STOP\ninclude "nested.csp"\n', base, policy);
+  assert.match(nested.problems[0]?.message ?? '', /include "\.\.\/\.\.\/private\/spec\.csp" in nested\.csp is refused: it is outside the workspace/);
+  assert.equal(nested.problems[0].span.start.line, 1, 'placed on the include that leads there');
+  // An include in a comment is not one; one after a comment on its line is.
+  assert.deepEqual(prepareIncludes('-- include "../../private/spec.csp"\n', base, policy).problems, []);
+  assert.equal(prepareIncludes('{- x -} include "../../private/spec.csp"\n', base, policy).problems.length, 1);
+});
+
+test('F-04: an absolute include outside the workspace is kept for a local editor and refused in the browser', (t) => {
+  const { workspace, outside, base } = includeWorkspace(t);
+  const text = `include "${path.join(outside, 'spec.csp')}"\n`;
+  assert.deepEqual(prepareIncludes(text, base, includePolicy([workspace], base)).problems, []);
+  setBrowserMode({ remoteFdr: true });
+  try {
+    const browser = prepareIncludes(text, base, includePolicy([workspace], base));
+    assert.match(browser.problems[0]?.message ?? '', /must name a file of the project, relative to the including file/);
+    // In the browser the model keeps its relative includes: the runner resolves them among the project's files.
+    const relative = prepareIncludes('include "../common.csp"\n', base, includePolicy([workspace], base));
+    assert.equal(relative.text, 'include "../common.csp"\n');
+    assert.deepEqual(relative.files.map((file) => file.relative), ['../common.csp', 'leaf.csp']);
+  } finally {
+    setBrowserMode(undefined);
+  }
+});
+
+test('F-04: Check with FDR is not run on a /*@csp block that includes a file outside the workspace', async (t) => {
+  const { workspace } = includeWorkspace(t);
+  const file = path.join(workspace, 'prog.pj');
+  const text = '/*@csp\ninclude "../private/spec.csp"\n*/\nvoid main() { skip; }\n';
+  const loaded = loadProgram(file, INCLUDE, text);
+  // refines is never started: the include is refused first.
+  const result = await checkWithFdr({ units: loaded.units, index: loaded.index, uri: pathToFileURL(file).toString(), refines: path.join(workspace, 'no-refines'), includeRoots: [workspace] });
+  assert.equal(result.rawResults, undefined);
+  assert.ok(result.report.checks.length > 0);
+  for (const check of result.report.checks) assert.match(check.message ?? '', /FDR was not run: include "\.\.\/private\/spec\.csp" is refused: it is outside the workspace/);
+});
+
+test('F-04: FDR\'s type check of a .csp file reports a refused include at the include, without running FDR', async (t) => {
+  const { workspace } = includeWorkspace(t);
+  const uri = pathToFileURL(path.join(workspace, 'model.csp')).toString();
+  const doc = new CspmDocument(uri, 'channel c\ninclude "../private/spec.csp"\nMAIN = c -> STOP\n');
+  const errors = await typecheckCspm(doc, path.join(workspace, 'no-refines'), { includeRoots: [workspace] });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /refused: it is outside the workspace/);
+  assert.equal(errors[0].span?.start.line, 1);
+});
+
+const REFINES = findRefines();
+
+test('F-04: the server shows a refused include of a .csp file as a diagnostic', { skip: !REFINES && 'FDR (refines) is not installed' }, async (t) => {
+  const { workspace } = includeWorkspace(t);
+  const file = path.join(workspace, 'model.csp');
+  const text = 'channel c\ninclude "../private/spec.csp"\nMAIN = c -> STOP\nassert MAIN :[deadlock free]\n';
+  fs.writeFileSync(file, text);
+  const client = new Client();
+  t.after(() => client.close());
+  const uri = pathToFileURL(file).toString();
+  await client.request('initialize', { processId: process.pid, rootUri: pathToFileURL(workspace).toString(), capabilities: {}, initializationOptions: { installDir: path.join(workspace, 'no-processj'), fdrPath: REFINES } });
+  client.notify('initialized', {});
+  client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'csp', version: 1, text } });
+  const published = await client.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri && m.params.diagnostics.some((d: any) => /refused/.test(d.message)));
+  const refused = published.params.diagnostics.find((d: any) => /refused/.test(d.message));
+  assert.equal(refused.range.start.line, 1);
 });

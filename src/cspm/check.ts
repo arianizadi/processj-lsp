@@ -9,8 +9,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makePrivateDir, removePrivateDir } from '../compiler';
-import { absoluteIncludes } from '../csp/check';
 import { findRefines, refinesNotFoundMessage, runRefines, type FdrResult, type FdrRun } from '../csp/fdr';
+import { includePolicy, includeProblemsText, prepareIncludes, type PreparedModel } from '../csp/includes';
 import type { Span } from '../parser/ast';
 import type { VerificationReport } from '../verification';
 import type { CspmDocument } from './document';
@@ -25,6 +25,8 @@ export interface CspmCheckRequest {
   workers?: number;
   /** Where to write the copy FDR runs (kept); a private temporary directory otherwise. */
   cspFile?: string;
+  /** Where includes may resolve (the workspace roots); default: the document's directory (src/csp/includes.ts). */
+  includeRoots?: readonly string[];
   onProgress?: (done: number, total: number, label: string, result: FdrResult) => void;
 }
 
@@ -44,6 +46,12 @@ export function documentDirectory(uri: string): string | undefined {
   }
 }
 
+/** The document's text as FDR runs it, its includes checked against the workspace (src/csp/includes.ts). */
+export function prepareDocument(document: CspmDocument, roots: readonly string[] | undefined): PreparedModel {
+  const base = documentDirectory(document.uri);
+  return prepareIncludes(document.text, base, includePolicy(roots, base));
+}
+
 /** Check a CSPm document's own assertions with FDR and explain the answers. */
 export async function checkCspmWithFdr(req: CspmCheckRequest): Promise<CspmCheck> {
   const doc = req.document;
@@ -59,12 +67,13 @@ export async function checkCspmWithFdr(req: CspmCheckRequest): Promise<CspmCheck
   });
   const refines = req.refines ?? findRefines();
   if (!refines) return { report: explainOf(undefined, refinesNotFoundMessage()) };
+  const prepared = prepareDocument(doc, req.includeRoots);
+  if (prepared.problems.length) return { report: explainOf(undefined, includeProblemsText(prepared.problems)) };
   const temp = req.cspFile ? undefined : makePrivateDir('processj-fdr-csp-');
   const file = req.cspFile ?? path.join(temp!, safeName(doc.title));
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const base = documentDirectory(doc.uri);
-    fs.writeFileSync(file, base ? absoluteIncludes(doc.text, base) : doc.text);
+    fs.writeFileSync(file, prepared.text);
     const assertions = cspmAssertions(doc.file);
     let done = 0;
     const run = await runRefines(refines, file, {
@@ -84,12 +93,14 @@ export async function checkCspmWithFdr(req: CspmCheckRequest): Promise<CspmCheck
 }
 
 /** FDR's type check of a document: its errors, each at a span of the document when FDR names one in it. */
-export async function typecheckCspm(document: CspmDocument, refines: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<Array<{ message: string; span?: Span; file?: string }>> {
+export async function typecheckCspm(document: CspmDocument, refines: string, opts: { timeoutMs?: number; signal?: AbortSignal; includeRoots?: readonly string[] } = {}): Promise<Array<{ message: string; span?: Span; file?: string }>> {
+  // A refused include is the diagnostic, at the include; FDR does not read the file.
+  const prepared = prepareDocument(document, opts.includeRoots);
+  if (prepared.problems.length) return prepared.problems.map((problem) => ({ message: `${problem.message}. FDR may read only files inside the workspace`, span: problem.span }));
   const temp = makePrivateDir('processj-fdr-tc-');
   try {
     const file = path.join(temp, safeName(document.title));
-    const base = documentDirectory(document.uri);
-    fs.writeFileSync(file, base ? absoluteIncludes(document.text, base) : document.text);
+    fs.writeFileSync(file, prepared.text);
     const run = await runRefines(refines, file, { typecheckOnly: true, timeoutMs: opts.timeoutMs ?? 20_000, signal: opts.signal });
     if (run.aborted) return [];
     return fdrErrors([...run.errors, ...run.results.flatMap((result) => result.errors)], path.basename(file));

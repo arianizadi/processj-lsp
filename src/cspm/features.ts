@@ -46,6 +46,8 @@ export interface CspmHost {
   sendDiagnostics(uri: string, version: number, diagnostics: Diagnostic[]): void;
   /** FDR's refines, if installed. */
   refines(): string | undefined;
+  /** The workspace roots: a file's includes may name only files inside them (src/csp/includes.ts). */
+  includeRoots(): readonly string[];
   refinesMissing(): string;
   fdr(): { timeoutMs: number; memoryMb: number; workers: number; showGraph: 'onFailure' | 'always' | 'never' };
   writeReport(name: string, content: string): string;
@@ -172,7 +174,7 @@ export class CspmFeatures {
     this.typechecks.set(doc.uri, controller);
     const version = doc.version;
     const parsed = this.document(doc);
-    void typecheckCspm(parsed, refines, { signal: controller.signal })
+    void typecheckCspm(parsed, refines, { signal: controller.signal, includeRoots: this.host.includeRoots() })
       .then((errors) => {
         if (controller.signal.aborted) return;
         const current = this.host.open(doc.uri);
@@ -291,6 +293,7 @@ export class CspmFeatures {
         ...(settings.memoryMb ? { memoryLimit: settings.memoryMb * 1024 * 1024 } : {}),
         ...(settings.workers ? { workers: settings.workers } : {}),
         cspFile: this.host.writeReport(this.host.scopedReportName(uri, `fdr/${fileName.replace(/[^A-Za-z0-9_.-]/g, '_')}`), ''),
+        includeRoots: this.host.includeRoots(),
         onProgress: (done, total, label, raw) => progress?.report(Math.round((done / total) * 100), `${label}: ${raw.passed === true ? 'holds' : raw.passed === false ? 'fails' : 'no verdict'} (${done}/${total})`),
       });
       if (result.run?.aborted) {

@@ -1002,6 +1002,7 @@ const cspm: CspmFeatures = new CspmFeatures({
     return refinesPath;
   },
   refinesMissing: () => refinesNotFoundMessage(settings.fdrPath),
+  includeRoots: () => workspace.getRoots(),
   fdr: () => ({ timeoutMs: settings.fdrTimeoutMs, memoryMb: settings.fdrMemoryMb, workers: settings.fdrWorkers, showGraph: settings.fdrShowGraph }),
   writeReport: (name, content) => writeReport(name, content),
   scopedReportName: (uri, name) => scopedReportName(uri, name),
@@ -1992,6 +1993,7 @@ async function checkDocumentWithFdr(doc: TextDocument, target: CspTarget, token:
       // FDR runs a private copy; a block's `include "spec.csp"` still finds the file next to the source.
       cspFile: writeReport(runName, model.text),
       includeBase: source ? path.dirname(source) : undefined,
+      includeRoots: workspace.getRoots(),
       onProgress: (done, total, label, raw) => progress?.report(Math.round((done / total) * 100), `${label}: ${raw.passed === true ? 'holds' : raw.passed === false ? 'fails' : 'no verdict'} (${done}/${total})`),
     });
     if (result.rawResults?.aborted) {
