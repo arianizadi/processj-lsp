@@ -21,7 +21,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
-      - run: npm run build
+      - run: npm run build:browser
       - run: node --test --test-reporter=spec dist/test/*.test.js
       - name: benchmark (informational)
         run: node scripts/bench.js 1000 10000

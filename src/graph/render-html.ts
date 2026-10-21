@@ -10,9 +10,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ViewerPayload } from './payload';
 import { buildExcalidrawScene } from './render-excalidraw';
-import { machineMarkers } from './render-machine';
+import { machineMarkers, machineStyle } from './render-machine';
 import { MSC_COLORS } from './render-msc';
-import { LIGHT_THEME } from './render-svg';
+import { LIGHT_THEME, svgStyle } from './render-svg';
 import { escapeXml } from './svg';
 
 export interface ViewerOptions {
@@ -26,6 +26,15 @@ export interface ViewerOptions {
 }
 
 let clientScript: string | undefined;
+
+/**
+ * The page script to use instead of reading dist/src/graph/client/viewer.js
+ * next to this module: a bundle without that file (the browser build) carries
+ * the script itself.
+ */
+export function setViewerScript(text: string): void {
+  clientScript = text;
+}
 
 /** The compiled page script (dist/src/graph/client/viewer.js). */
 function viewerScript(): string {
@@ -122,6 +131,7 @@ export function renderViewerHtml(payload: ViewerPayload, options: ViewerOptions)
         <div id="closed-banner" class="banner" hidden>The file was closed in the editor: this is how it was, and its results are gone. Open it again to follow it.</div>
         <div id="stale-banner" class="banner" hidden>Stale: the file changed after this result was computed. Run the check again.</div>
         <div id="caveat-banner" class="banner" role="note" hidden></div>
+        <div id="formation-banner" class="banner formation-banner" role="status" aria-live="polite" hidden></div>
       </div>
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
     </section>
@@ -132,9 +142,9 @@ export function renderViewerHtml(payload: ViewerPayload, options: ViewerOptions)
     <div class="dock-head">
       <div id="timeline-controls" class="transport">
         <button id="to-start" type="button" title="Start (Home)" aria-label="Start">⏮</button>
-        <button id="step-back" type="button" title="Step back ( [ )" aria-label="Step back">◀</button>
+        <button id="step-back" type="button" title="Step back ( ← or [ )" aria-label="Step back">◀</button>
         <button id="play" type="button" title="Play / pause (space)" aria-label="Play">▶</button>
-        <button id="step-forward" type="button" title="Step forward ( ] )" aria-label="Step forward">▶▶</button>
+        <button id="step-forward" type="button" title="Step forward ( → or ] )" aria-label="Step forward">▶▶</button>
         <button id="to-end" type="button" title="End state (End)" aria-label="End state">⏭</button>
         <label class="sr-only" for="speed">Speed</label>
         <select id="speed" title="Replay speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select>
@@ -163,6 +173,31 @@ ${viewerScript()}
 </body>
 </html>
 `;
+}
+
+/**
+ * The page for an `<iframe sandbox="allow-scripts">` in a web page (the
+ * browser IDE): webview mode without a document, so it is built once and
+ * served as a file. Payloads arrive by postMessage as in VS Code's panel
+ * (vscode/src/graphPanel.ts); a stand-in for VS Code's `acquireVsCodeApi()`,
+ * with the page's nonce, posts the page's messages to the parent window as
+ * `{ pjViewer: message }`, the first being `{ type: 'ready' }` once it has loaded.
+ * The parent's `{ type: 'theme', theme }` sets the page's theme, which an
+ * iframe cannot see for itself (without one it follows the OS setting).
+ */
+export function renderEmbeddedViewerHtml(options: { nonce?: string } = {}): string {
+  const nonce = options.nonce ?? randomBytes(16).toString('base64');
+  const empty: ViewerPayload = { version: 1, generator: 'processj-lsp', title: 'ProcessJ', uri: '', generatedAt: new Date(0).toISOString(), views: [], defaultView: '', reports: [], chips: [], overlays: [], charts: {}, style: `${svgStyle('themed')}${machineStyle('themed')}`, knownUris: [], notes: [] };
+  const bridge = `<script nonce="${nonce}">"use strict";
+window.acquireVsCodeApi = () => ({ postMessage: (message) => window.parent.postMessage({ pjViewer: message }, '*') });
+window.addEventListener('message', (event) => {
+  const data = event.data;
+  if (event.source === window.parent && data && data.type === 'theme' && (data.theme === 'light' || data.theme === 'dark')) document.documentElement.dataset.theme = data.theme;
+});
+window.addEventListener('load', () => window.parent.postMessage({ pjViewer: { type: 'ready' } }, '*'));
+</script>`;
+  // Before the page script, which asks for the API as it starts.
+  return renderViewerHtml(empty, { mode: 'webview', nonce }).replace('<head>\n', `<head>\n${bridge}\n`);
 }
 
 const MARKERS = '<marker id="pj-arrow" viewBox="0 0 10 10" refX="9.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="pj-arrow" d="M0,0.8 L10,5 L0,9.2 Z"/></marker>'
@@ -418,6 +453,14 @@ pre.assertion { white-space: pre-wrap; font-family: var(--mono); font-size: 12px
 .tick.final.sev-info { border-color: var(--info); color: var(--info); }
 .tick.final.sev-info.current { background: var(--info); border-color: var(--info); color: var(--surface); }
 .tick.assumed { box-shadow: inset 0 -3px 0 var(--warn); }
+/* How it locked: after the trace, in the result's red, dashed until shown. */
+.tick-phase { flex: 0 0 auto; margin: 0 4px 0 8px; padding-left: 10px; border-left: 2px solid var(--danger); color: var(--danger); font-size: 11px; font-weight: 650; white-space: nowrap; }
+.tick.formation { border-style: dashed; border-color: var(--danger); color: var(--danger); background: var(--danger-soft); font-weight: 600; }
+.tick.formation.fm-cycle, .tick.formation.fm-dead-end { border-style: solid; }
+.tick.formation.current { background: var(--danger-strong); border-color: var(--danger-strong); color: #fff; }
+.step-text .formation-head { color: var(--danger); }
+/* Over the surface colour, like the other banners, in the result's red. */
+.banner.formation-banner { background: linear-gradient(var(--danger-soft), var(--danger-soft)), var(--surface); color: var(--danger); border-color: var(--danger); }
 .dock-body { min-height: 0; overflow: hidden; display: grid; }
 .code { overflow: auto; background: var(--code-bg); font: 12.5px/1.6 var(--mono); padding: 4px 0 12px; }
 .code-line { display: flex; gap: 0; white-space: pre; cursor: pointer; padding-right: 12px; border-left: 3px solid transparent; }
@@ -430,6 +473,7 @@ pre.assertion { white-space: pre-wrap; font-family: var(--mono); font-size: 12px
 .code-line.mark.assumed { border-left-color: var(--warn); border-left-style: dashed; }
 .code-line.mark.choice { border-left-color: var(--info); background: var(--accent-soft); }
 .code-line.mark.done { border-left-color: var(--ok); }
+.code-line.mark.now { border-left-width: 6px; box-shadow: inset 0 0 0 1px var(--danger); }
 .code-line.mark.loop { border-left-color: var(--loop); }
 .lens.loop { color: var(--loop); font-style: normal; }
 .code-line.pulse { animation: pj-line-pulse 0.9s ease-out; }
@@ -520,7 +564,14 @@ button.action:hover { background: var(--accent-soft); }
 .pj-token rect { fill: var(--token-fill); opacity: 0.95; }
 .pj-token-hidden rect { fill: var(--token-hidden); }
 .pj-token-hidden text { fill: #fff; }
-@media (prefers-reduced-motion: reduce) { .pj-flash .pj-box, .pj-flash .pj-group-box, .code-line.pulse { animation: none; } * { scroll-behavior: auto !important; } }
+/* How it locked: the boxes a step is about, the arrows it adds, and whom they wait for. */
+.pj-now-ring { fill: none; stroke: var(--pj-danger, #dc2626); stroke-width: 3; pointer-events: none; }
+.pj-now-ring.pj-now-animate { animation: pj-now 1s ease-out; }
+@keyframes pj-now { from { stroke-width: 12; stroke-opacity: 0.25; } to { stroke-width: 3; stroke-opacity: 1; } }
+.pj-partner-ring { fill: none; stroke: var(--pj-danger, #dc2626); stroke-width: 1.8; stroke-dasharray: 6 4; opacity: 0.8; pointer-events: none; }
+.pj-now-edge { fill: none; stroke: var(--pj-danger, #dc2626); stroke-width: 5; stroke-linecap: round; stroke-linejoin: round; opacity: 0.75; pointer-events: none; }
+.pj-now-edge.pj-now-cycle { stroke-width: 7; opacity: 0.6; }
+@media (prefers-reduced-motion: reduce) { .pj-flash .pj-box, .pj-flash .pj-group-box, .code-line.pulse, .pj-now-ring { animation: none; } * { scroll-behavior: auto !important; } }
 /* Narrow (a VS Code panel beside the editor, half a screen): the network keeps the room, details open as a drawer. */
 @media (max-width: 900px) {
   main { grid-template-columns: minmax(0, 1fr); position: relative; }
@@ -536,6 +587,21 @@ button.action:hover { background: var(--accent-soft); }
   .chip { flex: 0 0 auto; }
 }
 @media (max-height: 640px) { #dock { height: var(--dock-height, 30vh); } }
+/* A phone, a slim panel or a short one: the toolbar is one row that scrolls sideways (its menu opens over the page). */
+@media (max-width: 600px), (max-height: 640px) {
+  .toolbar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; gap: 8px 12px; padding: 6px 10px; }
+  .toolbar > *, .tools > * { flex: 0 0 auto; }
+  .tools { flex-wrap: nowrap; }
+  .search { flex: 0 0 200px; min-width: 0; }
+  #view-select { max-width: 200px; }
+  .menu { position: fixed; top: 44px; right: 8px; }
+}
+/* A short frame: the network keeps a usable height, and the timeline and the code give way. */
+@media (max-height: 560px) {
+  #app { grid-template-rows: auto auto minmax(96px, 1fr) auto; }
+  #dock { min-height: 0; height: var(--dock-height, 32vh); }
+  .verdicts { min-height: 0; padding-top: 5px; padding-bottom: 5px; }
+}
 `;
 
 /** Every network and sequence-chart custom property for one theme. */

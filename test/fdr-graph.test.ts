@@ -553,3 +553,95 @@ test('a model translated from an imported file too: recorded for the server test
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('how the dining philosophers lock up: each process in the order it got stuck, then the circle closing link by link', async () => {
+  const { analyzed, report } = await checked(path.join(EXAMPLES, 'dining_philosophers.pj'), 'dining_philosophers');
+  const view = programView(analyzed.model);
+  const overlays = buildOverlays(analyzed.model, [report], { documentVersion: 1 });
+  const deadlock = overlays.find((entry) => entry.check === 'deadlock-free' && entry.view === view.id)!;
+  const cx = report.checks[0].counterexample!;
+  const name = (key: string): string => cx.final.find((snap) => pathKey(snap.process.path) === key)!.process.name ?? '';
+  // Each stuck process after the last step it took part in, ties in the report's order (main's par started them all).
+  assert.deepEqual(deadlock.formation.map((step) => [step.kind, step.keys.map(name).join('+'), step.after]), [
+    ['stuck', 'main', 0],
+    ['stuck', 'philosopher(1, …)', 1],
+    ['stuck', 'chopstick(p1f1.read, …)', 1],
+    ['stuck', 'philosopher(0, …)', 2],
+    ['stuck', 'chopstick(p0f0.read, …)', 2],
+    ['stuck', 'philosopher(2, …)', 3],
+    ['stuck', 'chopstick(p2f2.read, …)', 3],
+    ['cycle', 'philosopher(0, …)+chopstick(p1f1.read, …)', undefined],
+    ['cycle', 'chopstick(p1f1.read, …)+philosopher(1, …)', undefined],
+    ['cycle', 'philosopher(1, …)+chopstick(p2f2.read, …)', undefined],
+    ['cycle', 'chopstick(p2f2.read, …)+philosopher(2, …)', undefined],
+    ['cycle', 'philosopher(2, …)+chopstick(p0f0.read, …)', undefined],
+    ['cycle', 'chopstick(p0f0.read, …)+philosopher(0, …)', undefined],
+  ]);
+  // Who, what it waits for, where, and whom that depends on: only what the report says.
+  assert.equal(deadlock.formation[0].caption, 'main is stuck at line 37 after step 1: it waits at its par for philosopher(0, …), philosopher(1, …), philosopher(2, …) and 3 more to finish.');
+  assert.equal(deadlock.formation[1].caption, 'philosopher(1, …) is stuck at line 28 after step 2: it waits to write true on right (p1f2), whose reader chopstick(p2f2.read, …) is itself waiting to read left (p2f2) for philosopher(2, …).');
+  assert.equal(deadlock.formation[2].caption, 'chopstick(p1f1.read, …) is stuck at line 18 after step 2: it waits to read left (p1f1), whose writer philosopher(1, …) is itself waiting to write true on right (p1f2) for chopstick(p2f2.read, …).');
+  assert.equal(deadlock.formation[1].title, 'philosopher(1, …) stuck at line 28');
+  assert.ok(deadlock.formation.every((step) => !/\bholds?\b/.test(step.caption)), 'nothing the report does not say');
+  assert.equal(deadlock.formation[7].caption, 'Closing the circle, link 1 of 6: philosopher(0, …) waits for chopstick(p1f1.read, …) on p0f1.');
+  assert.equal(deadlock.formation[12].caption, 'Circular wait: philosopher(0, …) → chopstick(p1f1.read, …) → philosopher(1, …) → chopstick(p2f2.read, …) → philosopher(2, …) → chopstick(p0f0.read, …) → philosopher(0, …). main is stuck behind it. Nobody can move.');
+  // Each step lands on the drawing: a stuck process on its box with the arrow it waits on and its partner's box;
+  // a link on the arrow of the circle that joins its two boxes.
+  const placed = (key: string): string => deadlock.processes.find((process) => process.key === key)!.node;
+  for (const step of deadlock.formation.filter((entry) => entry.kind === 'stuck')) {
+    assert.deepEqual(step.nodes, step.keys.map(placed));
+    const waits = deadlock.waits.filter((wait) => step.nodes.includes(wait.node));
+    assert.deepEqual(step.edges, waits.map((wait) => wait.edge).filter(Boolean));
+    // A par's partner is only the first of its branches: no partner is ringed for it.
+    assert.deepEqual(step.partners, waits.filter((wait) => wait.operation !== 'other').map((wait) => wait.partnerNode).filter(Boolean));
+  }
+  const links = deadlock.formation.filter((entry) => entry.kind === 'cycle');
+  assert.deepEqual(links.flatMap((step) => step.edges).sort(), [...deadlock.cycles[0].edges].sort(), 'the links cover the circle, each arrow once');
+  assert.ok(links.every((step) => step.edges.length === 1 && step.nodes.length === 2));
+  // The termination check repeats forever: nothing locks up there, and the checker's results are no runs.
+  assert.deepEqual(overlays.find((entry) => entry.check === 'terminates' && entry.view === view.id)!.formation, []);
+});
+
+test('how a run without a circle locks up: the processes in order, then the dead end the others wait behind', async () => {
+  const read = await checkedSource(fs.readFileSync(path.join(EXAMPLES, 'deadlock_read.pj'), 'utf8'), 'no_writer');
+  const lonely = buildOverlays(read.analyzed.model, [read.report], { documentVersion: 1 }).find((entry) => entry.check === 'deadlock-free')!;
+  // No trace at all: stuck from the start, which the caption then does not say.
+  assert.deepEqual(lonely.formation.map((step) => [step.kind, step.caption]), [
+    ['stuck', 'main is stuck at line 8: it waits to read c; nothing in the program writes c.'],
+    ['dead-end', 'Dead end: main can never read c at line 8: nothing in the program writes c. Nobody can move.'],
+  ]);
+  assert.equal(lonely.formation[0].edges.length, 1, 'the read, on its arrow from the missing writer');
+  const ended = await checkedSource(fs.readFileSync(path.join(ROOT, 'test', 'fixtures', 'processj', 'commstime.pj'), 'utf8').replace(/1000000/g, '5').replace(/999999/g, '4').replace(/(public void consume[\s\S]*?while \(l < )5/, '$13'), 'reader_ended');
+  const view = programView(ended.analyzed.model);
+  const overlay = buildOverlays(ended.analyzed.model, [ended.report], { documentVersion: 1 }).find((entry) => entry.check === 'deadlock-free' && entry.view === view.id)!;
+  assert.deepEqual(overlay.formation.map((step) => [step.kind, step.title, step.after]), [
+    ['stuck', 'main stuck at line 42', 0],
+    ['stuck', 'delta stuck at line 24', 30],
+    ['stuck', 'branch 1 of delta stuck at line 25', 30],
+    ['stuck', 'prefix stuck at line 8', 32],
+    ['dead-end', 'dead end', undefined],
+  ]);
+  assert.equal(overlay.formation[3].caption, 'prefix is stuck at line 8 after step 33: it waits to write 5 on out (d), whose reader delta is itself waiting at its par for branch 1 to finish.');
+  assert.equal(overlay.formation[4].caption, 'Dead end: branch 1 of delta can never write 4 on out1 (a) at line 25: consume, the only reader of a (line 35), has already terminated (its last step was 27). main, delta and prefix are stuck behind it. Nobody can move.');
+  // The dead end is drawn where it is: the write's arrow, and the reader that finished.
+  const consume = overlay.processes.find((process) => process.name === 'consume')!.node;
+  assert.deepEqual(overlay.formation[4].partners, [consume]);
+  assert.deepEqual(overlay.formation[4].edges, overlay.formation[2].edges);
+});
+
+test('the sequence chart marks where each lane gets stuck, after the last step it takes part in', async () => {
+  const dining = await checked(path.join(EXAMPLES, 'dining_philosophers.pj'), 'dining_philosophers');
+  const cx = dining.report.checks[0].counterexample!;
+  const chart = renderSequenceChart(cx);
+  const marks = [...chart.matchAll(/<g class="pj-msc-from" data-stuck="([^"]*)">.*?<title>([^<]*)<\/title><\/g>/g)];
+  assert.equal(marks.length, 7, 'one per process stuck for good');
+  const titles = new Map(marks.map((match) => [match[1].replace(/&amp;/g, '&'), match[2]]));
+  const keyOf = (label: string): string => pathKey(cx.final.find((snap) => snap.process.label.startsWith(label))!.process.path);
+  assert.equal(titles.get(keyOf('main')), 'main is stuck from here: it takes part in no step after step 1');
+  assert.equal(titles.get(keyOf('philosopher(1')), 'philosopher(1, …) is stuck from here: it takes part in no step after step 2');
+  assert.equal(titles.get(keyOf('chopstick(p2f2')), 'chopstick(p2f2.read, …) is stuck from here: it takes part in no step after step 4');
+  // Its own group, outside the end state's, so the viewer can light each one up alone.
+  assert.ok(chart.indexOf('class="pj-msc-from-marks"') < chart.indexOf('data-step="final"'));
+  // A run that repeats forever leaves processes waiting, not stuck: nothing is marked.
+  assert.doesNotMatch(renderSequenceChart(dining.report.checks[2].counterexample!), /pj-msc-from"/);
+});

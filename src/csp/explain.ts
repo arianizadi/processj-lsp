@@ -134,6 +134,8 @@ function outcome(model: CspModel, a: CspAssertion, r: FdrResult | undefined, run
       return { ...base, status: 'timeout', message: `FDR did not finish within ${secs} s: the model may have more states than FDR can explore in that time. Check one procedure at a time, add //@csp compress, lower the loop and par for bounds, or allow more time (fdrTimeoutMs)` };
     }
     if (run.memoryExceeded) return { ...base, status: 'timeout', message: `FDR was stopped after using more than ${formatBytes(run.memoryExceeded)} of memory: the model has more states than this machine can hold. Check one procedure at a time, add //@csp compress, lower the loop and par for bounds, or allow more memory (fdrMemoryMb)` };
+    if (run.busy) return { ...base, status: 'skipped', message: run.busy };
+    if (run.outputExceeded) return { ...base, status: 'error', message: `FDR was stopped after writing ${formatBytes(run.outputExceeded)} of output: its counterexamples are too large to read. Lower the loop and par for bounds, or check one procedure at a time` };
     if (run.errors.length) {
       const found = specErrors(model, run.errors);
       const user = found.find((x) => x.user);

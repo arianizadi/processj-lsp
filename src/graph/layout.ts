@@ -7,8 +7,10 @@
  * Every label is drawn in a monospace stack, so its width is known without a
  * browser: about 0.6 em per character. Sizes include room for the overlay
  * badges a verification result adds to a box. The same view always produces the
- * same coordinates.
+ * same coordinates, so ELK's answers are kept by what it was asked: an edit that
+ * leaves a drawing as it was does not lay it out again.
  */
+import { createHash } from 'node:crypto';
 import type { NetEdge, NetNode, NetworkModel, NetworkView } from './network';
 
 export interface Point {
@@ -136,14 +138,124 @@ function elk(): Elk {
     // The bundled build runs ELK in this thread: no worker, no network.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const ELK = require('elkjs/lib/elk.bundled.js') as new () => Elk;
-    elkInstance = new ELK();
+    // Inside a Web Worker (the browser build) the bundled build takes itself
+    // for ELK's own worker: it claims `self.onmessage`, which carries the
+    // language server's connection, and has no in-thread worker to offer. It
+    // decides that in the constructor, by whether there is a `document`, so
+    // one stands in for exactly that long.
+    const scope = globalThis as { document?: unknown; self?: unknown };
+    const standIn = scope.document === undefined && scope.self !== undefined;
+    if (standIn) scope.document = {};
+    try {
+      elkInstance = new ELK();
+    } finally {
+      if (standIn) delete scope.document;
+    }
   }
   return elkInstance;
 }
 
+/**
+ * Largest graph handed to the layout engine. Its time grows much faster than
+ * the graph (a dense view of 500 boxes and 1500 arrows takes seconds), and it
+ * runs in this thread with no deadline: a larger view gets the plain
+ * arrangement (fallbackLayout) instead.
+ */
+export const MAX_LAYOUT = Object.freeze({ nodes: 1500, edges: 1000 });
+
+/** Why a graph of this size is not given to the layout engine, or undefined when it may be. */
+export function layoutSizeProblem(nodes: number, edges: number): string | undefined {
+  if (nodes <= MAX_LAYOUT.nodes && edges <= MAX_LAYOUT.edges) return undefined;
+  return `${nodes} boxes and ${edges} arrows, more than the layout engine is given (${MAX_LAYOUT.nodes} boxes, ${MAX_LAYOUT.edges} arrows)`;
+}
+
+function elkSize(graph: ElkNode): { nodes: number; edges: number } {
+  let nodes = 0;
+  let edges = 0;
+  const stack: ElkNode[] = [graph];
+  while (stack.length) {
+    const node = stack.pop()!;
+    edges += node.edges?.length ?? 0;
+    for (const child of node.children ?? []) {
+      nodes++;
+      stack.push(child);
+    }
+  }
+  return { nodes, edges };
+}
+
+/** ELK's answers, by a hash of the graph it was given with its ids by position (most recently used last). */
+const elkAnswers = new Map<string, { result: ElkNode; size: number }>();
+let elkAnswerSize = 0;
+/** Characters of graph JSON whose answers are kept: a few hundred ordinary views. */
+const ELK_ANSWER_BUDGET = 16_000_000;
+
+/**
+ * ELK's layout of a graph: the answer it gave for a graph of the same shape
+ * if that is still kept, else a fresh one. Element ids carry source positions
+ * (a box's id names the line of its par), so a keystroke above a procedure
+ * renames every box without moving any. The graph ELK sees therefore has its
+ * ids by position (`n0`, `e3`, …), which makes its answer depend on the shape
+ * alone; the real ids are put back on a copy for the caller.
+ */
+async function layoutGraph(graph: ElkNode): Promise<ElkNode> {
+  const { shape, ids } = byPosition(graph);
+  const json = JSON.stringify(shape);
+  const key = createHash('sha256').update(json).digest('hex');
+  let kept = elkAnswers.get(key);
+  if (kept) elkAnswers.delete(key);
+  else {
+    kept = { result: await elk().layout(shape), size: json.length };
+    elkAnswerSize += kept.size;
+  }
+  elkAnswers.set(key, kept);
+  for (const [oldest, entry] of elkAnswers) {
+    if (elkAnswerSize <= ELK_ANSWER_BUDGET || oldest === key) break;
+    elkAnswers.delete(oldest);
+    elkAnswerSize -= entry.size;
+  }
+  return renamed(kept.result, (id) => ids.get(id) ?? id);
+}
+
+/** A copy of the graph with its nodes, edges and labels named by position, and each new name's real id. */
+function byPosition(graph: ElkNode): { shape: ElkNode; ids: Map<string, string> } {
+  const ids = new Map<string, string>();
+  const nodes = new Map<string, string>();
+  let next = 0;
+  const name = (prefix: string, id: string): string => {
+    const short = `${prefix}${next++}`;
+    ids.set(short, id);
+    return short;
+  };
+  // Nodes first: an edge may name a node that comes after it.
+  const visit = (node: ElkNode): void => {
+    nodes.set(node.id, name('n', node.id));
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(graph);
+  const shape = renamed(graph, (id) => nodes.get(id) ?? id, (label) => name('l', label), (edge) => name('e', edge));
+  return { shape, ids };
+}
+
+/** A copy of a graph (or ELK's answer) with node ids mapped by `node`, and edge and label ids by their own maps. */
+function renamed(graph: ElkNode, node: (id: string) => string, label: (id: string) => string = node, edge: (id: string) => string = node): ElkNode {
+  const labels = (list: ElkNode['labels']): ElkNode['labels'] => list?.map((entry) => (entry.id === undefined ? { ...entry } : { ...entry, id: label(entry.id) }));
+  const copy = (item: ElkNode): ElkNode => ({
+    ...item,
+    id: node(item.id),
+    ...(item.labels ? { labels: labels(item.labels) } : {}),
+    ...(item.children ? { children: item.children.map(copy) } : {}),
+    ...(item.edges ? { edges: item.edges.map((entry) => ({ ...entry, id: edge(entry.id), sources: entry.sources.map(node), targets: entry.targets.map(node), ...(entry.labels ? { labels: labels(entry.labels) } : {}) })) } : {}),
+  });
+  return copy(graph);
+}
+
 /** Lay out any graph with the same in-process ELK the views use (the state machines do). */
 export function runElk(graph: ElkNode): Promise<ElkNode> {
-  return elk().layout(graph);
+  const size = elkSize(graph);
+  const problem = layoutSizeProblem(size.nodes, size.edges);
+  if (problem) return Promise.reject(new Error(`too large to lay out: ${problem}`));
+  return layoutGraph(graph);
 }
 
 export const LAYOUT_OPTIONS: Readonly<Record<string, string>> = Object.freeze({
@@ -175,6 +287,9 @@ const GROUP_PADDING = `[top=${METRICS.groupHeader + 14},left=22,bottom=22,right=
 
 /** Lay out one view; `overrides` replaces individual ELK options (for experiments and tests). */
 export async function layoutView(view: NetworkView, overrides: Readonly<Record<string, string>> = {}): Promise<ViewLayout> {
+  // Checked before the graph is built for ELK.
+  const problem = layoutSizeProblem(view.nodes.length, view.edges.length);
+  if (problem) throw new Error(`too large to lay out: ${problem}`);
   const children = new Map<string, NetNode[]>();
   for (const node of view.nodes) {
     const key = node.parent ?? '';
@@ -222,7 +337,7 @@ export async function layoutView(view: NetworkView, overrides: Readonly<Record<s
     labels: edge.label ? [{ id: `${edge.id}:label`, text: edge.label, ...edgeLabelSize(edgeLabelText(edge)), layoutOptions: { 'elk.edgeLabels.inline': edge.from === edge.to ? 'false' : 'true', 'elk.edgeLabels.placement': 'CENTER' } }] : undefined,
   }));
   const graph: ElkNode = { id: `${view.id}:graph`, layoutOptions: { ...LAYOUT_OPTIONS, ...overrides }, children: roots, edges };
-  const result = await elk().layout(graph);
+  const result = await layoutGraph(graph);
   return collect(view, result, depth, reversed);
 }
 

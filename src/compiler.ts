@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import type { Install } from './config';
 import type { RawDiagnostic } from './diagnostics';
+import { parse } from './parser/parser';
 import { augmentYieldAnnotations, mapYieldGeneratedRange, type YieldAnnotationContext, type YieldSourceMap } from './yieldfix';
 
 export interface ExecResult {
@@ -199,6 +200,8 @@ export interface Sandbox {
   sourcePath: string;
   /** Maps token columns in the private compiler copy back to the editor text. */
   yieldSourceMap: YieldSourceMap;
+  /** Why the compiler must not run on these files (it would write outside the sandbox); it is then not started. */
+  refused?: { message: string; file: string; line: number };
   cleanup: () => void;
 }
 
@@ -210,6 +213,16 @@ export interface ImportMirror {
   target: string;
 }
 
+/**
+ * The compiler's working directory for one run: a private copy of the
+ * document, read-only copies of the .pj files its imports reach, and a home
+ * of its own. Nothing in it links out: the compiler writes generated
+ * libraries to paths built from `#pragma FILE` and the package name, and a
+ * link to a directory of the workspace would let those writes land there
+ * (or, through a link the workspace contains, anywhere). A `#pragma FILE`
+ * that names a path rather than a file name would leave the directory by
+ * itself, so the compiler is not run on such files (Sandbox.refused).
+ */
 export function makeSandbox(install: Install, sourcePath: string, text: string, yieldContext?: YieldAnnotationContext, mirrors: readonly ImportMirror[] = []): Sandbox {
   const root = makePrivateDir('processj-lsp-');
   const home = path.join(root, '.pjlsp-home');
@@ -225,40 +238,13 @@ export function makeSandbox(install: Install, sourcePath: string, text: string, 
   // diagnostic. Capture the same stable spelling while the temp file exists;
   // compile() starts asynchronous cleanup before the server maps diagnostics.
   const canonicalSourcePath = fs.realpathSync(src);
-  // The compiler resolves `import a.b;` relative to its working directory before the
-  // include directory, so mirror the file's own directory here with symlinks (no copies):
-  // sibling .pj files and subdirectories become visible exactly as with `pjc`.
+  let refused = unsafeLibraryFile(augmented.text, sourcePath);
+  // The compiler resolves `import a.b;` relative to its working directory before the include directory:
+  // the files the imports reach from the file's own directory (then from the workspace package roots)
+  // are copied to the same relative paths here, as `pjc` run next to the file would find them.
   const dir = path.dirname(sourcePath);
-  if (path.isAbsolute(dir)) {
-    let entries: fs.Dirent[] = [];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      /* buffer without a directory on disk */
-    }
-    for (const e of entries) {
-      if (e.name === fileName || e.name.startsWith('.')) continue;
-      if (!(e.isDirectory() || (e.isFile() && e.name.endsWith('.pj')))) continue;
-      try {
-        fs.symlinkSync(path.join(dir, e.name), path.join(root, e.name));
-      } catch {
-        /* a name clash or unsupported symlinks: the compiler just won't see this entry */
-      }
-    }
-  }
-  // Imports resolved under a workspace root rather than next to the file: the
-  // compiler searches only its working directory and the include directory, so
-  // link each package root in (siblings mirrored above take precedence).
-  for (const mirror of mirrors) {
-    if (!mirror.name || mirror.name.startsWith('.') || mirror.name.includes('/') || mirror.name.includes(path.sep)) continue;
-    const link = path.join(root, mirror.name);
-    if (fs.existsSync(link)) continue;
-    try {
-      fs.symlinkSync(mirror.target, link);
-    } catch {
-      /* unsupported symlinks: the compiler reports the import as missing, as before */
-    }
-  }
+  const copied = path.isAbsolute(dir) ? copyImports(augmented.text, root, fileName, dir, mirrors) : [];
+  for (const copy of copied) refused ??= unsafeLibraryFile(copy.text, copy.source);
   return {
     root,
     home,
@@ -266,8 +252,132 @@ export function makeSandbox(install: Install, sourcePath: string, text: string, 
     fileName,
     sourcePath: canonicalSourcePath,
     yieldSourceMap: augmented.sourceMap,
+    ...(refused ? { refused } : {}),
     cleanup: () => removePrivateDir(root),
   };
+}
+
+/** Most files and characters copied into one sandbox (as many files as a wildcard import may reach). */
+const MAX_SANDBOX_FILES = 2000;
+const MAX_SANDBOX_CHARS = 32_000_000;
+const MAX_PACKAGE_DEPTH = 8;
+
+/**
+ * Copy into `root` every .pj file the imports of `text` reach, transitively,
+ * looking where the compiler would from a working directory that holds the
+ * file's own directory (`dir`) and the workspace package roots (`mirrors`).
+ * The copies are regular files, read-only, in real directories.
+ */
+function copyImports(text: string, root: string, fileName: string, dir: string, mirrors: readonly ImportMirror[]): Array<{ source: string; text: string }> {
+  const copied: Array<{ source: string; text: string }> = [];
+  const taken = new Set<string>([fileName]);
+  let chars = 0;
+  const full = (): boolean => copied.length >= MAX_SANDBOX_FILES || chars >= MAX_SANDBOX_CHARS;
+  const copy = (source: string, relative: string): void => {
+    if (full() || taken.has(relative)) return;
+    let content: string;
+    try {
+      if (!fs.statSync(source).isFile()) return;
+      content = fs.readFileSync(source, 'utf8');
+    } catch {
+      return;
+    }
+    taken.add(relative);
+    chars += content.length;
+    const target = path.join(root, relative);
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, content, { flag: 'wx' });
+      if (process.platform !== 'win32') fs.chmodSync(target, 0o444);
+    } catch {
+      return;
+    }
+    copied.push({ source, text: content });
+    queue.push(content);
+  };
+  /** Where an import is found: next to the file, else under the workspace package root of its first segment. */
+  const locate = (parts: string[], wildcard: boolean): string | undefined => {
+    const bases = [dir];
+    for (const mirror of mirrors) {
+      if (!mirror.name || mirror.name.startsWith('.') || mirror.name.includes('/') || mirror.name.includes(path.sep)) continue;
+      if (mirror.name === parts[0] || mirror.name === `${parts[0]}.pj`) bases.push(path.dirname(mirror.target));
+    }
+    for (const base of bases) {
+      const target = path.join(base, ...parts);
+      if (wildcard ? isDirectory(target) : isFile(`${target}.pj`)) return target;
+    }
+    return undefined;
+  };
+  const queue: string[] = [text];
+  for (let next = queue.shift(); next !== undefined && !full(); next = queue.shift()) {
+    let imports: ReturnType<typeof parse>['program']['imports'];
+    try {
+      imports = parse(next).program.imports;
+    } catch {
+      continue;
+    }
+    for (const im of imports) {
+      const parts = im.path.map((part) => part.name);
+      if (!parts.length || parts.some((part) => !part || part.startsWith('.'))) continue;
+      const target = locate(parts, im.wildcard);
+      if (!target) continue;
+      if (!im.wildcard) {
+        copy(`${target}.pj`, `${path.join(...parts)}.pj`);
+        continue;
+      }
+      // `import a.*;` reads every .pj file under a/, sub-packages included (imports.ts listPj).
+      const walk = (from: string, relative: string, depth: number): void => {
+        if (depth > MAX_PACKAGE_DEPTH || full()) return;
+        let entries: fs.Dirent[];
+        try {
+          entries = fs.readdirSync(from, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          if (entry.name.startsWith('.')) continue;
+          const source = path.join(from, entry.name);
+          if (entry.name.endsWith('.pj')) copy(source, path.join(relative, entry.name));
+          else if (isDirectory(source)) walk(source, path.join(relative, entry.name), depth + 1);
+        }
+      };
+      walk(target, path.join(...parts), 0);
+    }
+  }
+  return copied;
+}
+
+/**
+ * The first `#pragma FILE "..."` of a file whose value is not a plain file
+ * name: the compiler builds a library's output paths from it (and the
+ * package name), so `/../x` or an absolute path would write outside its
+ * working directory.
+ */
+function unsafeLibraryFile(text: string, file: string): Sandbox['refused'] {
+  const pragma = /#\s*pragma\s+file\s*"([^"\n]*)"/gi;
+  for (let m = pragma.exec(text); m; m = pragma.exec(text)) {
+    const value = m[1];
+    if (/^[A-Za-z0-9_][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+)*$/.test(value)) continue;
+    const line = (text.slice(0, m.index).match(/\n/g) ?? []).length;
+    return { message: `#pragma FILE "${value}" is not a plain file name, so the compiler (which writes the library's files to a path made from it) is not run on ${path.basename(file)}`, file, line };
+  }
+  return undefined;
+}
+
+function isFile(file: string): boolean {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isDirectory(file: string): boolean {
+  try {
+    return fs.statSync(file).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /** Arguments for running the ProcessJ compiler front end inside a sandbox. */
@@ -278,6 +388,8 @@ export function processjcArgs(install: Install, sb: Sandbox): string[] {
 export interface CompileResult extends ExecResult {
   sourcePath: string;
   yieldSourceMap: YieldSourceMap;
+  /** The compiler was not run (Sandbox.refused). */
+  refused?: Sandbox['refused'];
 }
 
 /** Whether a compiler message belongs to the private copy of the current file. */
@@ -315,6 +427,7 @@ export function remapCompilerDiagnostic(
 export async function compile(install: Install, sourcePath: string, text: string, opts: { timeoutMs?: number; signal?: AbortSignal; yieldContext?: YieldAnnotationContext; mirrors?: readonly ImportMirror[] } = {}): Promise<CompileResult> {
   const sb = makeSandbox(install, sourcePath, text, opts.yieldContext, opts.mirrors);
   try {
+    if (sb.refused) return { stdout: '', stderr: '', exitCode: null, timedOut: false, aborted: false, durationMs: 0, sourcePath: sb.sourcePath, yieldSourceMap: sb.yieldSourceMap, refused: sb.refused };
     const r = await exec(install.javaBin, processjcArgs(install, sb), { cwd: sb.root, timeoutMs: opts.timeoutMs, signal: opts.signal });
     return { ...r, sourcePath: sb.sourcePath, yieldSourceMap: sb.yieldSourceMap };
   } finally {

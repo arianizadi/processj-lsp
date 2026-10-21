@@ -193,7 +193,10 @@ public void main(string[] args) {
   // A compiler result depends on imported files as well as the open document
   // version. Saving an import must clear stale compiler errors and queue a
   // fresh compiler pass even though the importer text itself did not change.
-  const dependencyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-smoke-deps-'));
+  // Inside the workspace (the repository): the compiler runs unasked only on files under a workspace root.
+  const scratch = path.join(__dirname, '..', '.smoke-tmp');
+  fs.mkdirSync(scratch, { recursive: true });
+  const dependencyRoot = fs.mkdtempSync(path.join(scratch, 'deps-'));
   try {
     const libDir = path.join(dependencyRoot, 'lib');
     fs.mkdirSync(libDir);
@@ -223,7 +226,27 @@ public void main(string[] args) {
     check(true, 'dependency: import save queues a fresh compiler pass');
     notify('textDocument/didClose', { textDocument: { uri: dependencyUri } });
   } finally {
-    fs.rmSync(dependencyRoot, { recursive: true, force: true });
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+
+  // A file outside the workspace: no compiler run unasked (the log says why), but Run still compiles it.
+  const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'processj-lsp-smoke-outside-'));
+  try {
+    const outsideFile = path.join(outsideRoot, 'Outside.pj');
+    const OUTSIDE = 'import std.*;\n\npublic void main(string[] args) {\n    println("outside " + (3 + 4));\n}\n';
+    fs.writeFileSync(outsideFile, OUTSIDE);
+    const outsideUri = pathToFileURL(outsideFile).toString();
+    notify('textDocument/didOpen', { textDocument: { uri: outsideUri, languageId: 'processj', version: 1, text: OUTSIDE } });
+    const said = await waitFor('window/logMessage', 30000, (n) => /^not running the compiler on .*Outside\.pj: it is outside the workspace/.test(n.params.message));
+    check(!!said, 'outside the workspace: the log says the compiler is not run unasked');
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    check(!notifications.some((n) => n.method === 'window/logMessage' && /checked Outside\.pj/.test(n.params.message)), 'outside the workspace: no compiler pass unasked');
+    const ranOutside = await request('workspace/executeCommand', { command: 'processj.run', arguments: [outsideUri] });
+    const outsideReport = typeof ranOutside.result === 'string' ? fs.readFileSync(ranOutside.result, 'utf8') : '';
+    check(/outside 7/.test(outsideReport), 'outside the workspace: Run still compiles and runs it');
+    notify('textDocument/didClose', { textDocument: { uri: outsideUri } });
+  } finally {
+    fs.rmSync(outsideRoot, { recursive: true, force: true });
   }
 
   // Full pipeline: build + run a valid program through the Run command.

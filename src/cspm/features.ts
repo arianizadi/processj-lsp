@@ -7,7 +7,7 @@
  *   graph, as diagnostics, as code lenses on the assertions, and as a text
  *   report;
  * - diagnostics from the CSPm parser (syntax it cannot read) and FDR's own
- *   type check (on open and save, when FDR is installed);
+ *   type check (on open and save, when FDR is installed or a runner offered);
  * - document symbols for the definitions, channels, types and assertions.
  *
  * The LSP connection stays in src/server.ts; this module reaches it through
@@ -16,8 +16,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { CodeLens, Diagnostic, DiagnosticSeverity, DocumentSymbol, MessageType, Range, SymbolKind } from 'vscode-languageserver/node';
+import { CodeLens, Diagnostic, DiagnosticSeverity, DocumentSymbol, MessageType, Range, SymbolKind } from 'vscode-languageserver';
 import type { TextDocument } from 'vscode-languageserver-textdocument';
+import type { RefinesRunner } from '../csp/fdr';
 import type { VerificationStore } from '../graph/live';
 import type { ViewerFocus, ViewerPayload, ViewerView } from '../graph/payload';
 import type { GraphFormat } from '../graph/session';
@@ -46,6 +47,10 @@ export interface CspmHost {
   sendDiagnostics(uri: string, version: number, diagnostics: Diagnostic[]): void;
   /** FDR's refines, if installed. */
   refines(): string | undefined;
+  /** refines elsewhere (the browser IDE's runner), used instead of refines() when there is one. */
+  runner?(): RefinesRunner | undefined;
+  /** The workspace roots: a file's includes may name only files inside them (src/csp/includes.ts). */
+  includeRoots(): readonly string[];
   refinesMissing(): string;
   fdr(): { timeoutMs: number; memoryMb: number; workers: number; showGraph: 'onFailure' | 'always' | 'never' };
   writeReport(name: string, content: string): string;
@@ -163,16 +168,24 @@ export class CspmFeatures {
     }
   }
 
+  /** Where FDR runs: a runner elsewhere, else the local refines; undefined when there is neither. */
+  private fdrBackend(): { runner: RefinesRunner } | { refines: string } | undefined {
+    const runner = this.host.runner?.();
+    if (runner) return { runner };
+    const refines = this.host.refines();
+    return refines ? { refines } : undefined;
+  }
+
   /** FDR's type check, in the background (on open and save). */
   private typecheck(doc: TextDocument): void {
-    const refines = this.host.refines();
-    if (!refines) return;
+    const backend = this.fdrBackend();
+    if (!backend) return;
     this.typechecks.get(doc.uri)?.abort();
     const controller = new AbortController();
     this.typechecks.set(doc.uri, controller);
     const version = doc.version;
     const parsed = this.document(doc);
-    void typecheckCspm(parsed, refines, { signal: controller.signal })
+    void typecheckCspm(parsed, 'runner' in backend ? backend.runner : backend.refines, { signal: controller.signal, includeRoots: this.host.includeRoots() })
       .then((errors) => {
         if (controller.signal.aborted) return;
         const current = this.host.open(doc.uri);
@@ -197,8 +210,7 @@ export class CspmFeatures {
     const lenses: CodeLens[] = [];
     const root = parsed.lensRoot();
     if (root) lenses.push({ range: rangeOf(root.source.span), command: { title: 'Process network', command: COMMAND_SHOW_GRAPH, arguments: [doc.uri] } });
-    const refines = this.host.refines();
-    if (!refines) return lenses;
+    if (!this.fdrBackend()) return lenses;
     const outcome = this.outcomes.get(doc.uri);
     const fresh = outcome && outcome.version === doc.version ? outcome : undefined;
     for (const assertion of cspmAssertions(parsed.file)) {
@@ -259,8 +271,8 @@ export class CspmFeatures {
 
   /** Check with FDR: every assertion of the file, explained on the graph. */
   async check(doc: TextDocument, token?: { onCancellationRequested(listener: () => void): { dispose(): void } }): Promise<unknown> {
-    const refines = this.host.refines();
-    if (!refines) {
+    const backend = this.fdrBackend();
+    if (!backend) {
       this.host.showMessage(MessageType.Error, `processj-lsp: ${this.host.refinesMissing()}`);
       return null;
     }
@@ -285,12 +297,14 @@ export class CspmFeatures {
       const settings = this.host.fdr();
       const result = await checkCspmWithFdr({
         document: parsed,
-        refines,
+        ...backend,
         timeoutMs: settings.timeoutMs,
         signal: controller.signal,
         ...(settings.memoryMb ? { memoryLimit: settings.memoryMb * 1024 * 1024 } : {}),
         ...(settings.workers ? { workers: settings.workers } : {}),
-        cspFile: this.host.writeReport(this.host.scopedReportName(uri, `fdr/${fileName.replace(/[^A-Za-z0-9_.-]/g, '_')}`), ''),
+        // The copy FDR runs; a local run rewrites it with its includes made absolute.
+        cspFile: this.host.writeReport(this.host.scopedReportName(uri, `fdr/${fileName.replace(/[^A-Za-z0-9_.-]/g, '_')}`), parsed.text),
+        includeRoots: this.host.includeRoots(),
         onProgress: (done, total, label, raw) => progress?.report(Math.round((done / total) * 100), `${label}: ${raw.passed === true ? 'holds' : raw.passed === false ? 'fails' : 'no verdict'} (${done}/${total})`),
       });
       if (result.run?.aborted) {
@@ -370,7 +384,7 @@ function summaryOf(report: VerificationReport, fileName: string): [MessageType, 
   const counts = !broken.length
     ? `${passed} of ${total} assertion${plural} ${total === 1 ? 'holds' : 'hold'}`
     : passed + failed.length === 0
-      ? `${total === 1 ? 'the assertion was' : `none of the ${total} assertions was`} decided`
+      ? `${total === 1 ? 'the assertion was not' : `none of the ${total} assertions was`} decided`
       : `${passed + failed.length} of ${total} assertion${plural} decided, ${passed} ${passed === 1 ? 'holds' : 'hold'}`;
   if (failed.length) return [MessageType.Warning, `FDR, ${fileName}: ${counts}; ${failed[0].label}: ${failed[0].counterexample?.summary ?? failed[0].message ?? 'fails'}`];
   if (broken.length) return [MessageType.Warning, `FDR, ${fileName}: ${counts}; ${broken[0].label}: ${broken[0].message ?? broken[0].status}`];

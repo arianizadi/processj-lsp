@@ -306,16 +306,44 @@ is added (no "its only reader"). In the viewer:
   underlined in amber, its caveat in the step's text) and one more for the end
   state, named as the chip says (`stuck`, `loops`, `error`, `stops`), so the
   last step can be seen before the end; play, pause, step, start, end and
-  speed; a value bubble travels along the arrow from writer to reader (from a
-  port when the caller writes), the participants flash, and each process shows
-  the line it last executed; the step's account is cut at two lines (a click
-  shows it all);
+  speed (1.2 s a step at 1×); a value bubble travels along the arrow from
+  writer to reader (from a port when the caller writes), the participants
+  flash, and each process shows the line it last executed; the step's account
+  is cut at two lines (a click shows it all);
+- when FDR's run ends stuck, the timeline goes on after the trace with **how it
+  locked** (red ticks after a `how it locked` mark), so a deadlock no longer
+  appears all at once: one tick per stuck process, in the order each entered
+  the wait it never leaves (just after the last step it took part in; one that
+  took part in none first; ties in the report's order; processes drawn on one
+  box that got stuck after the same step together). Each such step adds that
+  process's red (or amber) outline, badge, stuck arrow, marker and reason to
+  the ones before, draws its waiting arrow in, rings its box and, dashed, the
+  partner it waits for, puts its line chip on the line it is stuck at, and
+  says it in words, from the report only: `philosopher(1, …) is stuck at line
+  28 after step 2: it waits to write true on right (p1f2), whose reader
+  chopstick(p2f2.read, …) is itself waiting to read left (p2f2) for
+  philosopher(2, …)`. Then a circular wait closes link by link (`↻1` … `↻6`,
+  `Closing the circle, link 1 of 6: philosopher(0, …) waits for
+  chopstick(p1f1.read, …) on p0f1`), its band growing along the arrows and its
+  callout coming with the last link (`Circular wait: philosopher(0, …) → … →
+  philosopher(0, …). main is stuck behind it. Nobody can move.`); where waits
+  end at a partner that finished or never comes, a last step (`⊘`) tells that
+  dead end (`Dead end: main can never read c at line 8: nothing in the program
+  writes c. Nobody can move.`). A banner over the network names the step; the
+  code pane marks the lines of the processes stuck so far, this step's first;
+  the sequence chart lights up the lane's `stuck from here`; the state machine
+  shows its process stuck once the replay has said so; an export at such a
+  step carries its caption. A long circle closes a circle per step, and very
+  many stuck processes are told one trace step at a time. The checker's
+  results are proofs, not runs, and keep their end state alone;
 - the **sequence chart** tab draws the counterexample as a message sequence
   chart, a lifeline per process (named so that two `branch 1` differ), its
   heads kept in view as it scrolls, `channel.value` arrows, barrier bars,
   internal steps as a dot with what they do (`starts branch 1 and branch 2`),
   `done` marks, a lifeline cut after the last step of a process that ended
-  without one of its own (`ends`), each stuck process's wait as a dashed arrow
+  without one of its own (`ends`), `stuck from here` on the lifeline of each
+  process stuck for good after the last step it takes part in (red from there
+  on; a click replays how it locked to that process), each stuck process's wait as a dashed arrow
   toward the partner that never comes, and at the end a red cross where a
   process is stuck for good, an amber pause where a run that repeats forever
   only leaves it waiting, each label cut to its lane, following the timeline;
@@ -469,7 +497,8 @@ follows the buffer until there is one.
 to zoom about the pointer. Keys: `+` `-` zoom, `0` fits, `1` is actual size, `/`
 searches (it highlights the matches and zooms to them; Enter steps through them),
 arrows pan, Tab and Enter move between boxes, space plays the timeline, `[` `]`
-step it, Home and End jump to its ends, and Escape closes the details drawer,
+and the left and right arrows step it (while a replay is shown, Shift with
+those arrows pans), Home and End jump to its ends, and Escape closes the details drawer,
 then clears the selection, then the result. Hovering a box dims everything it
 does not touch, the result's marks included; clicking one shows its kind,
 source, call, parameters, the channels it uses with their partners and lines,
@@ -1302,7 +1331,10 @@ for it.
 
 The server caches parsing, checking, symbols and semantic inputs per document
 version, computes effects/protocols once per version, builds the visual graph only
-on request, coalesces lint bursts into one pass, and routes real-compiler JVM work
+on request, keeps graph layouts by the shape of what is drawn (an edit that moves
+no box, a keystroke above a procedure included, is not laid out again: ELK takes
+tens to hundreds of milliseconds on a larger network, a kept layout well under one),
+coalesces lint bursts into one pass, and routes real-compiler JVM work
 through a latest-wins queue with two workers. A newer edit cancels stale work;
 the queue bounds CPU/memory when many files open together without serializing
 all compiler feedback.
@@ -1431,7 +1463,8 @@ are needed. An untitled editor also gets language features after changing its la
 ```sh
 npm install
 npm run build
-npm test          # parser corpus, formatter, checker, semantic tokens, imports, examples, perf budgets
+npm run build:browser   # also the Web Worker build (dist/browser), see "The browser build"
+npm test          # parser corpus, formatter, checker, semantic tokens, imports, examples, perf budgets, the worker
 npm run smoke     # end-to-end against a real ProcessJ install, including a full program run
 npm run bench     # timings for generated 1k / 10k / 50k-line files
 node scripts/fdr-validate.js   # every corpus program through FDR and the real runtime, compared
@@ -1471,6 +1504,17 @@ install directory; only `codeLens` needs a restart because it is a capability.
 | `fdrWorkers`    | `1`     | `refines`' search workers: `1` finds the same deadlock and runtime-error counterexamples on every check (a termination or determinism counterexample can still vary); `0` uses every core, faster on big models |
 | `fdrShowGraph`  | `always` | after Check with FDR, open the graph on the result: `always`, `onFailure` (only a defect, a partial deadlock or a runtime error), or `never` (the text report opens instead, as it does whenever the graph is not shown) |
 
+The compiler runs without being asked (on open, after `debounceMs`, and on
+save; on every edit with `checkOnChange`) only for files inside a workspace
+folder (`rootUri` or `workspaceFolders`, links resolved). A file opened from
+elsewhere, such as a download or another project, gets the server's own
+analysis but no compiler diagnostics, and the log says so once
+(`not running the compiler on <file>: it is outside the workspace`). Run and
+Build still compile it. An editor started with no workspace folder at all
+(Neovim or Emacs on a single file) compiles every file, as before. Neovim's
+setup takes the folder with `.git` above a file as its root (`root_markers`),
+so a file in no repository has no root and is compiled as before.
+
 ## How diagnostics work
 
 The compiler has no library API and no "check only" mode, so the server writes
@@ -1496,10 +1540,121 @@ passed to a procedure counts as both of its ends being handed away, so aliasing
 through calls is conservative rather than tracked; the rules are tuned to avoid
 false positives rather than to be complete.
 
+## The browser build
+
+`npm run build:browser` builds the server a second time, as a Web Worker for the
+browser IDE, into `dist/browser/`:
+
+| file | what |
+| --- | --- |
+| `processj-lsp.worker.js` | the server as one classic worker script (minified, with a source map), LSP over the worker's `postMessage` |
+| `elk.<hash>.js` | the layout engine (elkjs, about half of the code), which the worker loads with `importScripts` from beside itself when it first lays out a view (`src/browser/elk.ts`); the name carries a hash of its content |
+| `graph-viewer.html` | the graph viewer page for `<iframe sandbox="allow-scripts">`: webview mode, fed by `postMessage` as VS Code's panel feeds it; a stand-in for `acquireVsCodeApi()` posts the page's messages to the parent as `{ pjViewer: message }`, starting with `{ type: 'ready' }`, and the parent's `{ type: 'theme', theme: 'light' \| 'dark' }` sets the page's theme (an iframe cannot see its embedder's) |
+| `gallery.json` | every example program as a project to open (`scripts/gallery.mjs`): below |
+| `manifest.json` | `{ version, commit, files }` |
+
+The viewer page's script nonce is made from a hash of the page, so the same
+source always builds the same files.
+
+`npm install` builds it too (the `prepare` script runs `build:browser`), and
+so does npm when it installs the package from git, where `prepare` is the only
+script it runs: a site can depend on `github:arianizadi/processj-lsp#<branch>`
+and serve `node_modules/processj-lsp/dist/browser`.
+
+It is the same server. `scripts/build-browser.mjs` (esbuild) puts
+`src/connection.browser.ts` in place of `src/connection.ts` and the modules in
+`src/browser/` in place of Node's: an in-memory synchronous file system (the
+analysis reads imports, the workspace and the standard library synchronously,
+so the page puts the project there up front), file URLs, a synchronous SHA-256,
+and `child_process` and `http` that say they are not available. The standard
+library headers (`test/fixtures/include`, the compiler's `include/JVM`) are in
+the bundle and installed at `/processj` with the files an install is
+recognised by, so the server finds its library as it does on disk. ELK lays
+out in the worker's own thread, once `elk.<hash>.js` is loaded; `src/graph/layout.ts` builds it so that it
+does not take the worker's `onmessage` (the bundled elkjs would, thinking it is
+running as ELK's own worker). The build type-checks `src/browser` against the
+worker's library (`tsconfig.browser.json`) first.
+
+Nothing can be started in a browser, so the compiler and FDR run on a runner
+service the page talks to. A client offers it with
+`initializationOptions.browser: { remoteFdr: true, remoteCompile: true }`, and
+then answers two requests (`src/remote.ts`):
+
+- `processj/runRefines { model, name, files, mode: 'check' | 'typecheck', timeoutMs }`
+  → `{ exitCode, frames, error? }`: FDR on `model`, a file `name` at the top of
+  a job whose `files` are the `.csp` files it includes, at their paths in the
+  workspace (the model's includes are rewritten to those paths). `frames` are
+  the lines `refines --format=framed_json` printed; the server reads them as it
+  reads refines' own output, so the explanation, the report, the lenses and the
+  graph are the same as after a local run. The includes are checked first as
+  for a local run (`src/csp/includes.ts`): in the browser an include must be a
+  relative path to a file of the workspace, and a refused one means the runner
+  is not asked. Check with FDR and the FDR lenses
+  are there without a local `refines`, for `.pj` and `.csp` files alike, and a
+  `.csp` file is type-checked on open and save.
+- `processj/compile { entry, files, mode: 'check' }` → `{ output, ok, error? }`:
+  the compiler on `entry` (as the compiler should read it, with the yield
+  annotations it needs) and the workspace files it imports, placed where the
+  compiler resolves the imports from. The output is parsed as a local run's
+  and published as compiler diagnostics. The server asks 1.5 s after a file is
+  opened or last edited, and when it is saved, one request at a time per file
+  (inside the workspace only, as above):
+  an edit cancels a request (`$/cancelRequest`), and the next waits for its answer.
+  The runner compiles a project with imports merged into one unit and maps
+  each message back to its file and line; a message at a line past the end of
+  the file is shown at its top, saying where the compiler put it.
+
+Run and Build are the page's (the worker answers them with a message), as is
+anything else that needs a process. What the page sends the runner for them
+it asks the worker for: `processj/buildInputs { entry }` (a file URI, or a
+path from the workspace folder) → `{ entry, files: [{ path, text }], augmented }`
+is every file below the workspace folder, with the entry and the project
+`.pj` files it imports (directly or through other files) as the compiler
+should read them: each with the yield annotations of its own analysis, as
+`processj/compile` sends a document (`src/yieldfix.ts`). No line changes.
+`augmented` names the files that changed; the answer is null for an entry
+that is not a `.pj` file of the workspace, and from the Node server, whose
+files are the editor's disk.
+
+`gallery.json` is every ProcessJ and CSPm program of this repository (the
+standard library headers in `test/fixtures/include` aside) as a project an IDE
+can open: `examples/` (Start here), `test/fixtures/processj` (Classic
+programs), `test/differential` (Language corner cases), `test/fixtures/fifo`
+(Channel arrays and FIFOs), every `.csp` file (CSPm models) and the rest of
+`test/fixtures` (Other fixtures). An entry has an `id` (its path here), a
+`title` (from the file name, or a better one from `scripts/gallery.mjs`), a
+`description` (the leading comment, without `// expect:` and `// outcome:`,
+which become tags such as `deadlock`, `runs`, `compiler limit`, `type error`
+and `FDR`, next to the language features the code uses), a `category`, its
+`files` (the program, the project files it imports or includes, and its CSPm
+model, at their paths from the program's folder `dir`; the texts are in
+`sources`, each once), the file to `open` and the `entry` Run starts from.
+`featured` is a small set to start with. `test/gallery.test.ts` checks that
+every program is there and that every entry is a project the runner takes.
+
+A client whose files are in memory also uses three more messages:
+`processj/writeFiles { files: [{ uri, text }] }` and
+`processj/deleteFiles { uris }` write and delete files below the workspace
+folders (the files are then analysed again, as after
+`workspace/didChangeWatchedFiles`), `processj/readFile { uri }` → `{ text } | null`
+reads one back, and the server sends `processj/fileWritten { uri, text }` for
+every file it writes: a model from Convert to CSP or a check, a report, an
+export. The Node server does not accept them: its files are the editor's disk.
+
+`test/browser.test.ts` runs the built worker in a Node `vm` context with a Web
+Worker's globals only and drives it as a page does: its diagnostics against the
+Node server's over every example, ELK and the connection, the file messages,
+FDR and the compiler through the two requests, answered from the
+recorded refines output and with canned compiler output, and what
+`processj/buildInputs` gives Run and Build.
+
 ## Layout
 
 ```
 src/server.ts       LSP wiring: documents, caches, debounced compiles, every request handler
+src/connection.ts   the connection to the editor and what the server may do where it runs (connection.browser.ts in a worker)
+src/remote.ts       the compiler and FDR on a client's runner: the jobs sent, and their answers read as a local run's
+src/browser/        the browser build: worker entry, in-memory file system and the other Node stand-ins, the bundled install
 src/parser/ast.ts   AST node types with source spans
 src/parser/parser.ts recursive-descent parser with recovery and "did you mean" suggestions
 src/format.ts       AST printer used for textDocument/formatting
@@ -1561,6 +1716,8 @@ test/fixtures/fdr/  refines output recorded for the explanation and graph tests 
                     test/fdr-recordings.ts reads them, and replays them as a stand-in refines for the server tests
 examples/           one program per diagnostic, self-describing and tested; dining_philosophers.pj is for FDR
 scripts/smoke.js    talks LSP over stdio to a real server, ends with a real program run
+scripts/build-browser.mjs the Web Worker build (dist/browser): the worker, the viewer page, the example gallery and a manifest
+scripts/gallery.mjs every example program as a project for the browser IDE (dist/browser/gallery.json)
 scripts/bench.js    complete in-memory analysis timings on generated large files
 scripts/validate.js builds and runs every program, comparing the checker's verdict against reality
 scripts/parse-diff.js compares the parser's trees with the compiler's -showTree output, on files or generated programs
@@ -1750,6 +1907,15 @@ in which the consumer has ended and the producer waits to write; for
 `starving_loop.pj` (`pj/starving-loop`: the scheduler freezes every process,
 where the model has one loop running forever) the report says the compiled
 program differs from the model, so the hang may have another cause.
+
+The "real program" column is what a ProcessJ install's own runtime did. The
+web IDE's runner runs programs on a patched copy of that runtime (processj-ide,
+`runner/sandbox/patches`), where an exception that escapes a process ends the
+program at once with exit code 1. There `break_after_nested_do.pj`,
+`break_after_nested_for.pj`, `blocks_oob.pj` and `channel_array_assigned.pj`
+throw their exception and stop within about a second instead of hanging after
+it, and `par_ends_early_gc.pj`, whose par a garbage collection can end early
+on the unpatched runtime, prints "quick done" and deadlocks as its code says.
 
 `node scripts/fdr-validate.js --procedures [dirs or files]` checks every
 procedure with a body (but `main`) on its own instead, as Check with FDR on that

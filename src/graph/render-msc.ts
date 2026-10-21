@@ -3,10 +3,13 @@
  * arrow from writer to reader for every communication (labelled channel.value),
  * a bar across the enrolled lifelines for a barrier sync, an end cap where a
  * process terminates (after its last step, when it ends without a step of its
- * own), and the end state: a red cross where a process is stuck for good with
- * the operation it waits on, an amber mark where a run that repeats forever
- * only leaves it waiting. Rows carry `data-step` so the viewer can follow its
- * timeline cursor; the whole chart exports as a standalone SVG.
+ * own), where each process stuck for good gets stuck (`stuck from here`, after
+ * the last step it takes part in, its lifeline red from there), and the end
+ * state: a red cross where a process is stuck for good with the operation it
+ * waits on, an amber mark where a run that repeats forever only leaves it
+ * waiting. Rows carry `data-step` and the stuck marks `data-stuck` (the
+ * process's path) so the viewer can follow its timeline cursor; the whole chart
+ * exports as a standalone SVG.
  */
 import { FONT_STACK, textWidth } from './layout';
 import { truncate } from './network';
@@ -25,6 +28,8 @@ export interface MscOptions {
 const ROW = 34;
 const HEAD = 46;
 const LEFT = 56;
+const FROM_LABEL = 'stuck from here';
+const FROM_WIDTH = textWidth(FROM_LABEL, 10.5) + 8;
 
 /** Light colours of the chart; the viewer redefines `--pj-msc-<name>` for dark themes. */
 export const MSC_COLORS = {
@@ -82,6 +87,13 @@ function mscStyle(themed: boolean): string {
 .pj-msc-left .pj-msc-wait-line { stroke: ${c('wait')}; }
 .pj-msc-left .pj-msc-wait-label, .pj-msc-left .pj-msc-wait-none { fill: ${c('wait')}; }
 .pj-msc-pause { fill: ${c('wait')}; }
+.pj-msc-from-life { stroke: ${c('danger')}; stroke-width: 2; stroke-dasharray: 2 4; opacity: 0.55; }
+.pj-msc-from-bar { stroke: ${c('danger')}; stroke-width: 3; stroke-linecap: round; }
+.pj-msc-from-bg { fill: transparent; }
+.pj-msc-from-label { font-size: 10.5px; font-style: italic; fill: ${c('danger')}; }
+.pj-msc-from.pj-current .pj-msc-from-bg { fill: ${c('current')}; stroke: ${c('danger')}; stroke-width: 1; }
+.pj-msc-from.pj-current .pj-msc-from-label { font-weight: 700; font-style: normal; }
+.pj-msc-from.pj-current .pj-msc-from-life { opacity: 1; }
 `;
 }
 
@@ -123,8 +135,22 @@ export function renderSequenceChart(counterexample: Counterexample, options: Msc
   // What each stuck process waits for, toward its partner's lifeline: one band row per wait.
   const waits = waitArrows(counterexample, laneOf);
   const band = waits.length * 20;
-  const height = rowY(finalRow) + band + 64;
-  const totalWidth = Math.max(LEFT + lanes.length * width + 24, 360);
+  // Where each process stuck for good enters the wait it never leaves: after the last step it takes part in, or
+  // from the top when it takes part in none (none past the steps drawn).
+  const stuckFrom = counterexample.final.flatMap((snapshot) => {
+    const index = laneOf.get(processKey(snapshot.process));
+    if (index === undefined || snapshot.status !== 'blocked' || !stuckForGood(snapshot, counterexample)) return [];
+    const key = processKey(snapshot.process);
+    let last = -1;
+    counterexample.steps.forEach((step, row) => {
+      if (step.participants.some((participant) => processKey(participant.process) === key)) last = row;
+    });
+    return last < steps.length ? [{ snapshot, index, last }] : [];
+  });
+  // A mark after the last step keeps clear of the waits drawn under it.
+  const bottom = rowY(finalRow) + (stuckFrom.some((entry) => entry.last >= 0 && entry.last === finalRow - 1) ? 14 : 0);
+  const height = bottom + band + 64;
+  const totalWidth = Math.max(LEFT + lanes.length * width + 24, 360, ...stuckFrom.map((entry) => x(entry.index) + 13 + FROM_WIDTH));
   const out: string[] = [];
   const terminatedAt = new Map<number, number>();
   /** Lanes that end after a step they took part in (not at a termination step of their own). */
@@ -160,8 +186,8 @@ export function renderSequenceChart(counterexample: Counterexample, options: Msc
   // Lifelines, cut where a process terminated.
   const lifelines = lanes.map((_, index) => {
     const end = terminatedAt.get(index);
-    const stop = end === undefined ? rowY(finalRow) + band : rowY(end) + (endedAfter.has(index) ? ROW / 2 : 0);
-    const after = end === undefined ? '' : `<line class="pj-msc-life-done" x1="${num(x(index))}" y1="${num(stop)}" x2="${num(x(index))}" y2="${num(rowY(finalRow) + band)}"/>`;
+    const stop = end === undefined ? bottom + band : rowY(end) + (endedAfter.has(index) ? ROW / 2 : 0);
+    const after = end === undefined ? '' : `<line class="pj-msc-life-done" x1="${num(x(index))}" y1="${num(stop)}" x2="${num(x(index))}" y2="${num(bottom + band)}"/>`;
     return `<line class="pj-msc-life" x1="${num(x(index))}" y1="${num(top + HEAD)}" x2="${num(x(index))}" y2="${num(stop)}"/>${after}`;
   });
   const heads = lanes.map((entry, index) => {
@@ -174,7 +200,7 @@ export function renderSequenceChart(counterexample: Counterexample, options: Msc
   // good waits (red), or a pause where a run that repeats forever only leaves it waiting (amber).
   const finalMarks: string[] = [...ends];
   waits.forEach((wait, index) => {
-    const wy = rowY(finalRow) - 8 + index * 20;
+    const wy = bottom - 8 + index * 20;
     const from = x(wait.from);
     const to = wait.to === undefined ? from + Math.min(width * 0.6, 90) : x(wait.to);
     const direction = to >= from ? 1 : -1;
@@ -184,7 +210,7 @@ export function renderSequenceChart(counterexample: Counterexample, options: Msc
       : `<path class="pj-msc-x pj-msc-x-small" d="M${num(to - 4)},${num(wy - 4)} L${num(to + 4)},${num(wy + 4)} M${num(to + 4)},${num(wy - 4)} L${num(to - 4)},${num(wy + 4)}"/>`;
     finalMarks.push(`<g class="pj-msc-wait${wait.left ? ' pj-msc-left' : ''}"><line class="pj-msc-wait-line" x1="${num(from)}" y1="${num(wy)}" x2="${num(to - direction * 6)}" y2="${num(wy)}"/>${end}<text class="pj-msc-wait-label" x="${num((from + to) / 2)}" y="${num(wy - 4)}">${escapeXml(label)}</text><title>${escapeXml(wait.title)}</title></g>`);
   });
-  const y = rowY(finalRow) + band;
+  const y = bottom + band;
   // A label under a lane fits that lane: neighbours' labels never run into each other.
   const fits = Math.max(8, Math.floor((width - 14) / (11 * 0.6)));
   for (const snapshot of counterexample.final) {
@@ -192,6 +218,13 @@ export function renderSequenceChart(counterexample: Counterexample, options: Msc
     if (index === undefined) continue;
     finalMarks.push(finalMark(snapshot, x(index), y, terminatedAt.has(index), fits, stuckForGood(snapshot, counterexample)));
   }
+  // `stuck from here`, and from there the lifeline goes on red to its cross. The viewer finds them by data-stuck.
+  const from = stuckFrom.map(({ snapshot, index, last }) => {
+    const at = last < 0 ? top + HEAD + 2 : rowY(last) + ROW / 2;
+    const cx = x(index);
+    const title = `${snapshot.process.name ?? snapshot.process.label} is stuck from here: it takes part in no step ${last < 0 ? 'at all' : `after step ${steps[last].index + 1}`}`;
+    return `<g class="pj-msc-from" data-stuck="${escapeXml(pathKeyOf(snapshot.process.path))}"><line class="pj-msc-from-life" x1="${num(cx)}" y1="${num(at)}" x2="${num(cx)}" y2="${num(y - 12)}"/><rect class="pj-msc-from-bg" x="${num(cx + 5)}" y="${num(at - 14)}" width="${num(FROM_WIDTH)}" height="14" rx="4"/><line class="pj-msc-from-bar" x1="${num(cx - 7)}" y1="${num(at)}" x2="${num(cx + 7)}" y2="${num(at)}"/><text class="pj-msc-from-label" x="${num(cx + 9)}" y="${num(at - 3.5)}">${FROM_LABEL}</text><title>${escapeXml(title)}</title></g>`;
+  });
   if (counterexample.loopStart !== undefined && counterexample.loopStart < steps.length) {
     const y1 = rowY(counterexample.loopStart) - ROW / 2 + 3;
     const y2 = rowY(steps.length - 1) + ROW / 2 - 3;
@@ -200,7 +233,7 @@ export function renderSequenceChart(counterexample: Counterexample, options: Msc
 
   out.push(`<rect class="pj-msc-bg" x="0" y="0" width="${num(totalWidth)}" height="${num(height)}"/>`);
   if (options.title) out.push(`<text class="pj-msc-title" x="16" y="24">${escapeXml(options.title)}</text>`);
-  out.push(`<g class="pj-msc-rows">${rows.join('')}</g>`, `<g class="pj-msc-lifelines">${lifelines.join('')}</g>`, `<g class="pj-msc-heads">${heads.join('')}</g>`, `<g class="pj-msc-final" data-step="final">${finalMarks.join('')}</g>`);
+  out.push(`<g class="pj-msc-rows">${rows.join('')}</g>`, `<g class="pj-msc-lifelines">${lifelines.join('')}</g>`, `<g class="pj-msc-heads">${heads.join('')}</g>`, ...(from.length ? [`<g class="pj-msc-from-marks">${from.join('')}</g>`] : []), `<g class="pj-msc-final" data-step="final">${finalMarks.join('')}</g>`);
   return `<svg xmlns="http://www.w3.org/2000/svg" class="pj-msc" viewBox="0 0 ${num(totalWidth)} ${num(height)}" width="${Math.ceil(totalWidth)}" height="${Math.ceil(height)}" data-heads="${num(top + HEAD - 4)}" role="img" aria-label="${escapeXml(options.title ?? 'sequence chart')}">
 <style>${mscStyle(!!options.themed)}</style>
 ${out.join('\n')}

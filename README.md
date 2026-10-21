@@ -85,6 +85,8 @@ A model Convert to CSP generated is a CSPm file too: its boxes show the ProcessJ
 
 [docs/DETAILS.md](docs/DETAILS.md) covers every diagnostic, how the analysis works, the CSP model FDR checks and how its answers are explained, the options, performance numbers and development (`npm test`, `npm run smoke`, `npm run bench`).
 
+The same server also runs in a browser, as a Web Worker (`npm run build:browser`), with the compiler and FDR on a runner service: see [the browser build](docs/DETAILS.md#the-browser-build).
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

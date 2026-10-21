@@ -367,6 +367,23 @@ test('FDR on the dining philosophers: the deadlock is a circle of waits, placed 
   for (const snapshot of cx.final) assert.ok(view.nodes.some((node) => node.path && pathMatches(node.path, snapshot.process.path)), snapshot.process.label);
 });
 
+test('FDR on the dining philosophers: how it locks up, fork by philosopher, then the circle of waits closing', async () => {
+  const { doc, report } = await checked('dining.csp');
+  const [overlay] = buildOverlays(doc.model(['view:SYSTEM']), [report]);
+  // Each process after the last event it took part in (PHIL(1) and FORK(1) after pickup.1.1, step 3), ties in
+  // the report's order; then the six links of the circle.
+  assert.deepEqual(overlay.formation.map((step) => step.title), [
+    'PHIL(1) stuck at line 11', 'FORK(1) stuck at line 15', 'PHIL(0) stuck at line 11', 'FORK(0) stuck at line 15', 'PHIL(2) stuck at line 11', 'FORK(2) stuck at line 15',
+    'circle, link 1 of 6', 'circle, link 2 of 6', 'circle, link 3 of 6', 'circle, link 4 of 6', 'circle, link 5 of 6', 'circular wait closed',
+  ]);
+  assert.deepEqual(overlay.formation.filter((step) => step.kind === 'stuck').map((step) => step.after), [2, 2, 4, 4, 5, 5]);
+  assert.equal(overlay.formation[0].caption, 'PHIL(1) is stuck at line 11 after step 3: it waits to sync on pickup.1.2, whose partner FORK(2) is itself waiting to sync on putdown.2.2 for PHIL(2).');
+  assert.equal(overlay.formation[1].caption, 'FORK(1) is stuck at line 15 after step 3: it waits to sync on putdown.1.1, whose partner PHIL(1) is itself waiting to sync on pickup.1.2 for FORK(2).');
+  assert.equal(overlay.formation[11].caption, 'Circular wait: PHIL(0) → FORK(1) → PHIL(1) → FORK(2) → PHIL(2) → FORK(0) → PHIL(0). Nobody can move.');
+  // Every step is on the drawing: each process on its box with the link it waits on.
+  assert.ok(overlay.formation.every((step) => step.nodes.length && step.edges.length === 1));
+});
+
 test('FDR on the COPY pipeline: the failing refinement shows the hidden step and who would do the refused event', async () => {
   const { report } = await checked('copy.csp');
   assert.deepEqual(report.checks.map((check) => `${check.label}: ${check.status}`), ['BUFF2 [FD= SYSTEM: passed', 'SYSTEM [FD= BUFF2: passed', 'SYSTEM :[deadlock free]: passed', 'SYSTEM :[divergence free]: passed', 'COPY(left, right) [T= SYSTEM: failed']);

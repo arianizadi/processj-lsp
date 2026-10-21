@@ -1,8 +1,7 @@
 // outcome: runs-wrong
 import std.*;
 // The compiler creates the channels of an array only in a declaration's initialiser.
-// Assigned later, the elements stay null: the writer throws NullPointerException and the
-// program never finishes.
+// Assigned later, the elements stay null, and the writer throws NullPointerException.
 void w(chan<int>.write o, int v) { o.write(v); }
 void r(chan<int>.read i) { int x; x = i.read(); println(x); }
 public void main(string[] args) {
