@@ -15,6 +15,7 @@
     "dist/browser",
     "docs",
     "editor",
+    "examples",
     "README.md",
     "NOTICE"
   ],
