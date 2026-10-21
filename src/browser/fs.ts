@@ -217,6 +217,33 @@ export function rm(file: unknown, options: { recursive?: boolean; force?: boolea
   queueMicrotask(() => callback(error));
 }
 
+export function renameSync(from: unknown, to: unknown): void {
+  const source = resolve(from);
+  const target = resolve(to);
+  const entry = entries.get(source);
+  if (!entry) throw failure('ENOENT', 'rename', String(from));
+  if (entry.kind === 'dir') throw failure('ENOSYS', 'rename', String(from));
+  if (entries.get(target)?.kind === 'dir') throw failure('EISDIR', 'rename', String(to));
+  directory(path.dirname(target), 'rename', false).children.add(path.basename(target));
+  entries.set(target, entry);
+  if (source === target) return;
+  entries.delete(source);
+  const parent = entries.get(path.dirname(source));
+  if (parent?.kind === 'dir') parent.children.delete(path.basename(source));
+}
+
+/** Files in memory have no permissions to change. */
+export function chmodSync(file: unknown): void {
+  if (!entries.has(resolve(file))) throw failure('ENOENT', 'chmod', String(file));
+}
+
+/**
+ * No numeric open flags: openSync reads only, with 'r', so a caller that
+ * builds flags from these (src/safewrite.ts outside the browser mode) fails
+ * with ENOSYS instead of doing something else.
+ */
+export const constants: Readonly<Record<string, number>> = Object.freeze({});
+
 export function unlinkSync(file: unknown): void {
   const entry = entries.get(resolve(file));
   if (!entry) throw failure('ENOENT', 'unlink', String(file));
@@ -224,20 +251,26 @@ export function unlinkSync(file: unknown): void {
   rmSync(file);
 }
 
-/** Open files, for reading only: their contents when they were opened. */
-const descriptors = new Map<number, Uint8Array>();
+/** Open files, for reading only: the file, and its contents when it was opened. */
+const descriptors = new Map<number, { entry: FileNode; contents: Uint8Array }>();
 let nextDescriptor = 3;
 
-export function openSync(file: unknown, flags: string = 'r'): number {
+export function openSync(file: unknown, flags: string | number = 'r'): number {
   if (flags !== 'r') throw failure('ENOSYS', 'open', String(file));
-  const contents = readFileSync(file);
+  const contents = readFileSync(file) as Uint8Array;
   const descriptor = nextDescriptor++;
-  descriptors.set(descriptor, contents as Uint8Array);
+  descriptors.set(descriptor, { entry: entries.get(resolve(file)) as FileNode, contents });
   return descriptor;
 }
 
+export function fstatSync(descriptor: number): Stats {
+  const open = descriptors.get(descriptor);
+  if (!open) throw failure('EBADF', 'fstat', String(descriptor));
+  return new Stats(open.entry);
+}
+
 export function readSync(descriptor: number, buffer: Uint8Array, offset: number, length: number, position: number | null): number {
-  const contents = descriptors.get(descriptor);
+  const contents = descriptors.get(descriptor)?.contents;
   if (!contents) throw failure('EBADF', 'read', String(descriptor));
   const start = position ?? 0;
   const chunk = contents.subarray(start, start + Math.min(length, buffer.length - offset));
