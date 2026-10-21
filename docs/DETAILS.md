@@ -306,16 +306,44 @@ is added (no "its only reader"). In the viewer:
   underlined in amber, its caveat in the step's text) and one more for the end
   state, named as the chip says (`stuck`, `loops`, `error`, `stops`), so the
   last step can be seen before the end; play, pause, step, start, end and
-  speed; a value bubble travels along the arrow from writer to reader (from a
-  port when the caller writes), the participants flash, and each process shows
-  the line it last executed; the step's account is cut at two lines (a click
-  shows it all);
+  speed (1.2 s a step at 1×); a value bubble travels along the arrow from
+  writer to reader (from a port when the caller writes), the participants
+  flash, and each process shows the line it last executed; the step's account
+  is cut at two lines (a click shows it all);
+- when FDR's run ends stuck, the timeline goes on after the trace with **how it
+  locked** (red ticks after a `how it locked` mark), so a deadlock no longer
+  appears all at once: one tick per stuck process, in the order each entered
+  the wait it never leaves (just after the last step it took part in; one that
+  took part in none first; ties in the report's order; processes drawn on one
+  box that got stuck after the same step together). Each such step adds that
+  process's red (or amber) outline, badge, stuck arrow, marker and reason to
+  the ones before, draws its waiting arrow in, rings its box and, dashed, the
+  partner it waits for, puts its line chip on the line it is stuck at, and
+  says it in words, from the report only: `philosopher(1, …) is stuck at line
+  28 after step 2: it waits to write true on right (p1f2), whose reader
+  chopstick(p2f2.read, …) is itself waiting to read left (p2f2) for
+  philosopher(2, …)`. Then a circular wait closes link by link (`↻1` … `↻6`,
+  `Closing the circle, link 1 of 6: philosopher(0, …) waits for
+  chopstick(p1f1.read, …) on p0f1`), its band growing along the arrows and its
+  callout coming with the last link (`Circular wait: philosopher(0, …) → … →
+  philosopher(0, …). main is stuck behind it. Nobody can move.`); where waits
+  end at a partner that finished or never comes, a last step (`⊘`) tells that
+  dead end (`Dead end: main can never read c at line 8: nothing in the program
+  writes c. Nobody can move.`). A banner over the network names the step; the
+  code pane marks the lines of the processes stuck so far, this step's first;
+  the sequence chart lights up the lane's `stuck from here`; the state machine
+  shows its process stuck once the replay has said so; an export at such a
+  step carries its caption. A long circle closes a circle per step, and very
+  many stuck processes are told one trace step at a time. The checker's
+  results are proofs, not runs, and keep their end state alone;
 - the **sequence chart** tab draws the counterexample as a message sequence
   chart, a lifeline per process (named so that two `branch 1` differ), its
   heads kept in view as it scrolls, `channel.value` arrows, barrier bars,
   internal steps as a dot with what they do (`starts branch 1 and branch 2`),
   `done` marks, a lifeline cut after the last step of a process that ended
-  without one of its own (`ends`), each stuck process's wait as a dashed arrow
+  without one of its own (`ends`), `stuck from here` on the lifeline of each
+  process stuck for good after the last step it takes part in (red from there
+  on; a click replays how it locked to that process), each stuck process's wait as a dashed arrow
   toward the partner that never comes, and at the end a red cross where a
   process is stuck for good, an amber pause where a run that repeats forever
   only leaves it waiting, each label cut to its lane, following the timeline;
@@ -469,7 +497,8 @@ follows the buffer until there is one.
 to zoom about the pointer. Keys: `+` `-` zoom, `0` fits, `1` is actual size, `/`
 searches (it highlights the matches and zooms to them; Enter steps through them),
 arrows pan, Tab and Enter move between boxes, space plays the timeline, `[` `]`
-step it, Home and End jump to its ends, and Escape closes the details drawer,
+and the left and right arrows step it (while a replay is shown, Shift with
+those arrows pans), Home and End jump to its ends, and Escape closes the details drawer,
 then clears the selection, then the result. Hovering a box dims everything it
 does not touch, the result's marks included; clicking one shows its kind,
 source, call, parameters, the channels it uses with their partners and lines,

@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { test } from 'node:test';
 import { findProcess } from '../src/graph/network';
-import { buildOverlays, preferredView, shortReason, story, verdictChips } from '../src/graph/overlay';
+import { buildOverlays, formationSteps, pathKey, preferredView, shortReason, story, verdictChips } from '../src/graph/overlay';
 import { staticVerificationReport } from '../src/graph/static-verification';
 import type { Counterexample, ProcessRef, ProcessSnapshot, VerificationReport } from '../src/verification';
 import { analyzeFile, analyzeSource, at, programView, ROOT } from './graph-helpers';
@@ -251,4 +251,49 @@ test('a procedure checked on its own keeps its environment wording when placed o
   assert.equal(program.relocated, 'delta as called here');
   assert.equal(program.waits[0].short, 'as checked alone: nothing reads out1');
   assert.equal(preferredView(analyzed.model, report.checks[0], overlays, 0), delta.id);
+  // How it locked says the same: on its own view the producer's words, on a call the check's environment.
+  assert.deepEqual(own.formation.map((step) => step.caption), ['branch 1 is stuck: it waits to write out1; its reader is not ready.', 'Dead end: branch 1 can never write out1: its reader is not ready. Nobody can move.']);
+  assert.deepEqual(program.formation.map((step) => step.caption), ["branch 1 is stuck: it waits to write out1; in FDR's check of delta on its own, nothing reads out1 there.", "Dead end: branch 1 can never write out1: in FDR's check of delta on its own, nothing reads out1 there. Nobody can move."]);
+});
+
+test('how it locked: who got stuck first, processes on one box together, and only what the report says', () => {
+  const site = (line: number): { uri: string; span: { start: { line: number; col: number }; end: { line: number; col: number } } } => ({ uri: 'file:///x.pj', span: { start: { line, col: 4 }, end: { line, col: 20 } } });
+  const ref = (label: string, line: number): ProcessRef => ({ path: [{ kind: 'branch', site: site(line), index: line }], label });
+  const [a, b, c, d] = [ref('a', 1), ref('b', 2), ref('c', 3), ref('d', 4)];
+  const channel = (name: string) => ({ name, kind: 'channel' as const, owner: [] });
+  const step = (index: number, ...who: ProcessRef[]) => ({ index, event: `e${index}`, kind: 'internal' as const, participants: who.map((process) => ({ process, role: 'actor' as const })), description: `step ${index}` });
+  // a acted last, c before it, b and d never: b and d first (in the report's order), then c, then a.
+  const counterexample: Counterexample = { kind: 'deadlock', summary: 's', steps: [step(0, c), step(1, a)], final: [
+    { process: a, status: 'blocked', at: site(10), description: 'a', waits: [{ operation: 'read', channel: channel('x'), at: site(10), detail: 'waits to read x', partner: { process: b, state: 'terminated', detail: '' } }] },
+    { process: b, status: 'blocked', at: site(11), description: 'b', waits: [{ operation: 'alt-guard', channel: channel('y'), detail: 'waits in an alt for y', partner: { state: 'missing', detail: 'nothing in the program writes y' } }, { operation: 'alt-guard', channel: channel('z'), detail: 'waits in an alt for z', partner: { process: a, state: 'blocked-elsewhere', detail: '' } }] },
+    { process: c, status: 'blocked', at: site(12), description: 'c', waits: [{ operation: 'write', channel: channel('w'), at: site(12), detail: 'waits to write 1 on w', partner: { process: d, state: 'blocked-elsewhere', detail: '' } }] },
+    { process: d, status: 'blocked', at: site(13), description: 'd', waits: [{ operation: 'write', channel: channel('v'), at: site(13), detail: 'waits to write 2 on v' }] },
+  ] };
+  const steps = formationSteps(counterexample);
+  assert.deepEqual(steps.map((entry) => [entry.kind, entry.keys.map((key) => [a, b, c, d].find((process) => pathKey(process.path) === key)!.label).join('+'), entry.after]), [
+    ['stuck', 'b', undefined], ['stuck', 'd', undefined], ['stuck', 'c', 0], ['stuck', 'a', 1], ['dead-end', 'a+b+d', undefined],
+  ]);
+  assert.deepEqual(steps.map((entry) => entry.caption), [
+    'b is stuck at line 12 from the start: it waits in an alt for read y or read z (read y: nothing in the program writes y; read z: a waits on x instead).',
+    'd is stuck at line 14 from the start: it waits to write 2 on v, and no reader can come.',
+    'c is stuck at line 13 after step 1: it waits to write 1 on w, whose reader d is itself waiting to write 2 on v.',
+    'a is stuck at line 11 after step 2: it waits to read x; b has finished.',
+    'Dead ends: a can never read x at line 11: b has finished; b can never complete its alt at line 12: read y: nothing in the program writes y; d can never write 2 on v at line 14: no reader can come. c is stuck behind them. Nobody can move.',
+  ]);
+  // Two processes drawn on one box that got stuck after the same step are one step; the drawing cannot tell them apart.
+  const pair: Counterexample = { ...counterexample, steps: [step(0, a, b)], final: counterexample.final.slice(0, 2) };
+  const drawn = new Map(pair.final.map((snapshot) => [snapshot, { nodes: ['box'], edges: [], partners: [] }]));
+  const together = formationSteps(pair, drawn);
+  assert.equal(together.length, 2);
+  assert.deepEqual([together[0].nodes, together[0].keys.length, together[0].title], [['box'], 2, 'a and 1 more stuck at line 11']);
+  assert.match(together[0].caption, / On the same box, b is stuck too\.$/);
+  // Very many: one step per trace step they follow.
+  const many: Counterexample = { kind: 'deadlock', summary: 's', steps: [step(0, ...Array.from({ length: 30 }, (_, i) => ref(`p${i}`, 100 + i)))], final: Array.from({ length: 50 }, (_, i) => ({ process: ref(`p${i}`, 100 + i), status: 'blocked' as const, description: 'p', waits: [{ operation: 'read' as const, channel: channel('q'), detail: 'waits to read q', partner: { state: 'missing' as const, detail: '' } }] })) };
+  const crowd = formationSteps(many, new Map(many.final.map((snapshot, i) => [snapshot, { nodes: [`n${i}`], edges: [], partners: [] }])));
+  assert.deepEqual(crowd.filter((entry) => entry.kind === 'stuck').map((entry) => [entry.keys.length, entry.title]), [[20, '20 processes stuck'], [30, '30 processes stuck']]);
+  assert.match(crowd[1].caption, /^30 processes are stuck after step 1: p0, p1, p2, p3, p4 and 25 more\.$/);
+  // Nothing blocked, nothing to tell; and the checker's proofs are no runs.
+  assert.deepEqual(formationSteps({ ...counterexample, final: counterexample.final.map((snapshot) => ({ ...snapshot, status: 'terminated' as const })) }), []);
+  const { report, model } = staticFor(path.join(EXAMPLES, 'par_deadlock.pj'));
+  assert.ok(buildOverlays(model, [report]).every((overlay) => overlay.formation.length === 0));
 });

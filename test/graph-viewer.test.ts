@@ -61,7 +61,7 @@ async function load(html: string, harness: string): Promise<Record<string, strin
   }
 }
 
-test('the viewer replays every step, then the end state, and exports what is on screen', { skip: SKIP }, async () => {
+test('the viewer replays every step, then how it locked, then the end state, and exports what is on screen', { skip: SKIP }, async () => {
   const analyzed = analyzeFile(path.join(VERIFICATION, 'commstime_bounded.pj'), FIXTURE_URI);
   const report = JSON.parse(fs.readFileSync(path.join(VERIFICATION, 'commstime_bounded.fdr.json'), 'utf8')) as VerificationReport;
   const payload = await buildViewerPayload({ model: analyzed.model, reports: [report], source: { uri: FIXTURE_URI, text: analyzed.text }, documentVersion: 1 });
@@ -74,6 +74,10 @@ test('the viewer replays every step, then the end state, and exports what is on 
     r.lastToken = document.querySelectorAll('#dynamic .pj-token').length;
     r.lastOverlay = document.querySelectorAll('.pj-overlay-over > *').length;
     document.getElementById('step-forward').click();
+    r.forming = document.querySelector('.tick.current').textContent;
+    r.formingText = document.getElementById('step-text').textContent;
+    r.formingStuck = document.querySelectorAll('.pj-overlay-over .pj-ov-blocked').length;
+    document.getElementById('to-end').click();
     r.end = document.querySelector('.tick.current').textContent;
     r.endOverlay = document.querySelectorAll('.pj-overlay-over .pj-ov-blocked').length;
     let saved = '';
@@ -99,6 +103,10 @@ test('the viewer replays every step, then the end state, and exports what is on 
   assert.equal(result.lastRoute, 1);
   assert.equal(result.lastToken, 1);
   assert.equal(result.lastOverlay, 0);
+  // After the last step, how it locked: the first process to get stuck, alone.
+  assert.equal(result.forming, '1');
+  assert.match(String(result.formingText), /^How it locked, 1 of \d+: \S.* is stuck at line \d+ after step \d+: it waits /);
+  assert.equal(result.formingStuck, 1);
   assert.equal(result.end, 'stuck');
   assert.ok(Number(result.endOverlay) > 0);
   // The sequence chart export is the chart (18 rows), not the copy of its lane heads.
@@ -200,4 +208,84 @@ test('the viewer opens on an editor\'s focus: the check, the stuck process selec
   assert.equal(result.exportName, 'dining_philosophers.philosopher.machine.svg');
   assert.equal(result.exportHasState, true);
   assert.equal(result.exportOrders, 2);
+});
+
+test('the viewer shows how the dining philosophers lock up: one process at a time, then the circle closing link by link', { skip: SKIP }, async () => {
+  const file = path.join(ROOT, 'examples', 'dining_philosophers.pj');
+  const analyzed = analyzeFile(file);
+  const loaded = loadProgram(file, path.join(ROOT, 'test', 'fixtures', 'include'));
+  const model = translateProgram({ units: loaded.units, index: loaded.index });
+  const report = explain(model, await recordedRun('dining_philosophers', model), { uri: analyzed.uri, documentVersion: 1 });
+  const payload = await buildViewerPayload({ model: analyzed.model, reports: [report], source: { uri: analyzed.uri, text: analyzed.text }, documentVersion: 1 });
+  const philosopher1 = pathKey(report.checks[0].counterexample!.final.find((snap) => snap.process.label.startsWith('philosopher(1'))!.process.path);
+  const page = await load(renderViewerHtml(payload, { mode: 'file', nonce: NONCE }), `
+    const key = (k) => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }));
+    const at = () => ({
+      tick: document.querySelector('.tick.current').textContent,
+      text: document.getElementById('step-text').textContent,
+      banner: document.getElementById('formation-banner').hidden ? '' : document.getElementById('formation-banner').textContent,
+      stuck: document.querySelectorAll('.pj-overlay-over .pj-ov-blocked-badge').length,
+      behind: document.querySelectorAll('.pj-overlay-over .pj-ov-behind-badge').length,
+      bands: document.querySelectorAll('.pj-overlay-under .pj-ov-cycle-route').length,
+      callouts: document.querySelectorAll('.pj-overlay-over .pj-ov-callout-wrap').length,
+      rings: document.querySelectorAll('.pj-now-ring').length,
+      partners: document.querySelectorAll('.pj-partner-ring').length,
+      drawn: document.querySelectorAll('.pj-now-edge').length,
+      line: [...document.querySelectorAll('#code .code-line.now')].map((row) => Number(row.dataset.line) + 1),
+      chart: [...document.querySelectorAll('#chart svg.pj-msc:not(.pj-msc-sticky) .pj-msc-from.pj-current')].map((mark) => mark.dataset.stuck),
+    });
+    r.ticks = [...document.querySelectorAll('#timeline .tick, #timeline .tick-phase')].map((tick) => tick.textContent);
+    r.marks = document.querySelectorAll('#chart svg.pj-msc:not(.pj-msc-sticky) [data-stuck]').length;
+    key('Home');
+    for (let i = 0; i < 4; i++) key('ArrowRight');
+    r.trace = at();
+    key('ArrowRight');
+    r.first = at();
+    key('ArrowRight');
+    r.second = at();
+    for (let i = 0; i < 6; i++) key('ArrowRight');
+    r.link = at();
+    for (let i = 0; i < 5; i++) key('ArrowRight');
+    r.closed = at();
+    key('ArrowRight');
+    r.end = at();
+    key('ArrowLeft');
+    r.back = at().tick;
+    // A lane's stuck mark goes to the step where that process gets stuck.
+    document.querySelector('#chart svg.pj-msc:not(.pj-msc-sticky) [data-stuck="' + CSS.escape(${JSON.stringify(philosopher1)}) + '"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    r.clicked = at().tick;
+    let saved = '';
+    save = (name, data) => { saved = name + '\\n' + data; };
+    exportAs('svg');
+    r.svgCaption = saved.includes('How it locked, 2 of 13: philosopher(1, …) is stuck at line 28');
+  `);
+  assert.equal(page['harness-error'], undefined);
+  assert.equal(page.error, undefined, 'the page script threw');
+  const result = JSON.parse(page.result) as Record<string, any>;
+  // Four steps, then a tick per process that gets stuck and per link of the circle, then the end state.
+  assert.deepEqual(result.ticks, ['', '1', '2', '3', '4', 'how it locked', '1', '2', '3', '4', '5', '6', '7', '↻1', '↻2', '↻3', '↻4', '↻5', '↻6', 'stuck']);
+  assert.equal(result.marks, 7, 'every lane stuck for good says where it gets stuck');
+  // The trace's last step shows nothing of the end state.
+  assert.equal(result.trace.tick, '4');
+  assert.deepEqual([result.trace.stuck, result.trace.behind, result.trace.banner], [0, 0, '']);
+  // main first: its last step was the first.
+  assert.match(result.first.text, /^How it locked, 1 of 13: main is stuck at line 37 after step 1: it waits at its par for /);
+  assert.equal(result.first.banner, 'How it locked, 1 of 13: main stuck at line 37');
+  assert.deepEqual([result.first.stuck, result.first.behind, result.first.line], [0, 1, [37]]);
+  // Then philosopher(1): only its badge joins main's, its arrow is drawn in, its reader ringed, its line and its lane marked.
+  assert.equal(result.second.text, 'How it locked, 2 of 13: philosopher(1, …) is stuck at line 28 after step 2: it waits to write true on right (p1f2), whose reader chopstick(p2f2.read, …) is itself waiting to read left (p2f2) for philosopher(2, …).');
+  assert.deepEqual([result.second.stuck, result.second.behind, result.second.bands, result.second.callouts], [1, 1, 0, 0]);
+  assert.deepEqual([result.second.rings, result.second.partners, result.second.drawn], [1, 1, 1]);
+  assert.deepEqual(result.second.line, [28]);
+  assert.deepEqual(result.second.chart, [philosopher1]);
+  // Every process stuck, the circle closes one link at a time; its callout comes with the last link.
+  assert.match(result.link.text, /^How it locked, 8 of 13: Closing the circle, link 1 of 6: philosopher\(0, …\) waits for chopstick\(p1f1\.read, …\) on p0f1\.$/);
+  assert.deepEqual([result.link.stuck, result.link.bands, result.link.callouts], [6, 1, 0]);
+  assert.match(result.closed.text, /^How it locked, 13 of 13: Circular wait: philosopher\(0, …\) → chopstick\(p1f1\.read, …\) → .* → philosopher\(0, …\)\. main is stuck behind it\. Nobody can move\.$/);
+  assert.deepEqual([result.closed.bands, result.closed.callouts], [6, 1]);
+  assert.equal(result.end.tick, 'stuck');
+  assert.deepEqual([result.end.rings, result.end.banner], [0, '']);
+  assert.equal(result.back, '↻6');
+  assert.equal(result.clicked, '2');
+  assert.equal(result.svgCaption, true, 'an export at a step of how it locked carries its caption');
 });

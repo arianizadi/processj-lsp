@@ -138,6 +138,21 @@ interface OverlayStep {
   caveat?: string;
 }
 
+/** A step of how the run locked up, after its trace (overlay.ts OverlayFormationStep). */
+interface FormationStep {
+  kind: 'stuck' | 'cycle' | 'dead-end';
+  nodes: string[];
+  keys: string[];
+  after?: number;
+  edges: string[];
+  partners: string[];
+  cycle?: number;
+  link?: number;
+  title: string;
+  caption: string;
+  at?: SourceRef;
+}
+
 interface Overlay {
   view: string;
   report: number;
@@ -159,6 +174,8 @@ interface Overlay {
   choice?: { step: number; node?: string; at?: SourceRef; description: string };
   caveats: string[];
   story: string[];
+  /** Absent in a payload from before it. */
+  formation?: FormationStep[];
   unplaced: string[];
   relocated?: string;
   under: string;
@@ -1098,7 +1115,7 @@ function verdictSection(): HTMLElement[] {
   const caveats = overlay?.caveats ?? chip.caveats ?? [];
   if (caveats.length) out.push(h('section', { class: 'panel-section caveats' }, h('h2', {}, 'What this run relies on'), h('p', {}, 'The real program may not do this:'), list(caveats.map((caveat) => `${caveat}.`))));
   if (overlay) {
-    const ending = overlay.steps.length && cursor < endPosition();
+    const ending = endPosition() > 0 && cursor < endPosition();
     out.push(section(ending ? 'How it ends' : 'What happens', h('div', { class: `story sev-${overlay.severity}` }, ...overlay.story.map((sentence) => h('p', {}, sentence)))));
     if (overlay.unplaced.length) out.push(section('Not drawn in this view', list(overlay.unplaced)));
   } else {
@@ -1349,12 +1366,31 @@ function frameResult(result: Overlay): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Timeline positions: 0 is the start, k is just after step k (1..n), and the
- * end state has a position of its own after the last step (0 when there are no
- * steps), so the last step can be shown before the end state.
+ * Timeline positions: 0 is the start, k is just after step k (1..n), then
+ * one position per step of how the run locked up (n+1..n+f), and the end
+ * state has a position of its own after those (0 when there is nothing
+ * before it), so the last step can be shown before the end state.
  */
 function endPosition(): number {
-  return overlay && overlay.steps.length ? overlay.steps.length + 1 : 0;
+  return overlay && (overlay.steps.length || formation().length) ? overlay.steps.length + formation().length + 1 : 0;
+}
+
+/** How the shown result locked up, step by step after its trace (none for any other result). */
+function formation(): FormationStep[] {
+  return overlay?.formation ?? [];
+}
+
+/** The step of how it locked up at the cursor, when the cursor is past the trace and before the end state. */
+function formationAt(): number | undefined {
+  if (!overlay) return undefined;
+  const index = cursor - overlay.steps.length - 1;
+  return index >= 0 && index < formation().length ? index : undefined;
+}
+
+/** The processes (pathKey) stuck by formation step `index`, and their boxes. */
+function stuckBy(index: number): { keys: Set<string>; nodes: Set<string> } {
+  const shown = formation().slice(0, index + 1).filter((step) => step.kind === 'stuck');
+  return { keys: new Set(shown.flatMap((step) => step.keys)), nodes: new Set(shown.flatMap((step) => step.nodes)) };
 }
 
 function layer(name: 'under' | 'over'): SVGGElement | null {
@@ -1384,15 +1420,21 @@ function renderOverlayState(animateStep: boolean): void {
   }
   const steps = overlay.steps;
   const final = cursor >= endPosition();
+  const forming = formationAt();
   canvas.classList.toggle('pj-stale-overlay', overlay.stale);
   overlayText = [];
-  if (final) {
+  if (final || forming !== undefined) {
     if (under) under.innerHTML = overlay.under;
     if (over) over.innerHTML = overlay.over;
+    // While it locks up, only what has happened so far: the end state's marks of the processes stuck by now.
+    if (forming !== undefined) revealFormation(forming);
     overlayText = [...(over?.querySelectorAll<SVGGElement>('.pj-ov-badge-wrap, .pj-ov-reason-wrap, .pj-ov-callout-wrap') ?? [])];
     measureOverlayText();
     scaleOverlayText();
   }
+  const banner = $('formation-banner');
+  banner.hidden = forming === undefined;
+  if (forming !== undefined) banner.textContent = `How it locked, ${forming + 1} of ${formation().length}: ${formation()[forming].title}`;
   // Who has finished, and where each process last acted, up to the cursor.
   const lines = new Map<string, number>();
   const finished = new Set<string>();
@@ -1404,9 +1446,15 @@ function renderOverlayState(animateStep: boolean): void {
     }
   }
   if (!final) for (const node of finished) nodeEls.get(node)?.classList.add('pj-done');
+  // A process stuck by now shows the line it is stuck at.
+  if (forming !== undefined) {
+    const stuck = stuckBy(forming).keys;
+    for (const process of overlay.processes) if (stuck.has(process.key) && process.at && process.at.uri === payload.source?.uri) lines.set(process.node, process.at.span.start.line);
+  }
   // The end state is told by its badges; line chips follow the replay.
   if (!final) for (const [node, line] of lines) drawLineChip(node, line);
-  if (!final && cursor > 0) {
+  if (forming !== undefined) drawFormationMarks(formation()[forming], animateStep);
+  else if (!final && cursor > 0) {
     const step = steps[cursor - 1];
     for (const participant of step.participants) if (participant.node) {
       const element = nodeEls.get(participant.node);
@@ -1421,6 +1469,71 @@ function renderOverlayState(animateStep: boolean): void {
   renderChartCursor();
   drawMachineMarks();
   updateStepText();
+}
+
+/**
+ * The end state's marks as they stand at formation step `index`: a process's
+ * outline, badge, stuck arrow, marker and reason once it is stuck; a circle's
+ * band and loops link by link as it closes, and its callout once the last step
+ * is shown. What has finished, or still runs, shows from the first step.
+ */
+function revealFormation(index: number): void {
+  const steps = formation();
+  const shown = steps.slice(0, index + 1);
+  const { nodes } = stuckBy(index);
+  const waited = new Set(shown.filter((step) => step.kind !== 'cycle').flatMap((step) => step.edges));
+  const links = shown.filter((step) => step.kind === 'cycle');
+  const closed = new Set(links.flatMap((step) => step.edges));
+  const closedFrom = new Set(links.map((step) => step.nodes[0]));
+  const complete = index === steps.length - 1 && steps[index].kind !== 'stuck';
+  const blocked = new Set(overlay!.processes.filter((process) => process.status === 'blocked').map((process) => process.node));
+  for (const element of graph.querySelectorAll<SVGElement>('.pj-overlay-under > *, .pj-overlay-over > *, .pj-overlay-under > .pj-ov-stale > *, .pj-overlay-over > .pj-ov-stale > *')) {
+    if (element.classList.contains('pj-ov-stale')) continue;
+    const { node, edge } = element.dataset;
+    const keep = element.classList.contains('pj-ov-callout-wrap') ? complete
+      : element.classList.contains('pj-ov-cycle-route') ? closed.has(edge ?? '')
+        : element.classList.contains('pj-ov-cycle-edge') ? complete || closedFrom.has(node ?? '')
+          : element.classList.contains('pj-ov-stuck-edge') ? waited.has(edge ?? '')
+            : node === undefined || !blocked.has(node) || nodes.has(node);
+    if (!keep) element.remove();
+  }
+}
+
+/**
+ * What formation step `step` is about: its process ringed (a link of a circle:
+ * the process that waits), the arrows it adds drawn in from end to end (unless
+ * motion is reduced), and the processes it waits for ringed with a dashed
+ * line. All under the result's words, so its badges and reasons stay readable.
+ */
+function drawFormationMarks(step: FormationStep, animate: boolean): void {
+  const target = layer('under') ?? dynamic;
+  const ring = (id: string, cls: string, pad: number): SVGRectElement | undefined => {
+    const node = nodeById.get(id);
+    if (!node) return undefined;
+    const rect = svg('rect', { class: cls, x: node.x - pad, y: node.y - pad, width: node.width + pad * 2, height: node.height + pad * 2, rx: (node.kind === 'group' ? 13 : 9) + pad });
+    target.append(rect);
+    return rect;
+  };
+  for (const id of step.partners) ring(id, 'pj-partner-ring', 7);
+  // The arrows this step adds, drawn over the result: its waits, or the link of the circle.
+  const paths = step.edges.map((id) => graph.querySelector<SVGPathElement>(`.pj-overlay-under [data-edge="${CSS.escape(id)}"]`) ?? edgeEls.get(id)?.querySelector<SVGPathElement>('path')).filter((path): path is SVGPathElement => !!path);
+  if (step.kind === 'cycle' && !paths.length && step.nodes[0]) {
+    const curve = graph.querySelector<SVGPathElement>(`.pj-overlay-under .pj-ov-cycle-edge[data-node="${CSS.escape(step.nodes[0])}"]`);
+    if (curve) paths.push(curve);
+  }
+  for (const path of paths) {
+    const now = svg('path', { class: `pj-now-edge${step.kind === 'cycle' ? ' pj-now-cycle' : ''}`, d: path.getAttribute('d') ?? '' });
+    target.append(now);
+    if (!animate || reduceMotion || typeof now.animate !== 'function') continue;
+    const length = now.getTotalLength();
+    now.style.strokeDasharray = String(length);
+    now.animate([{ strokeDashoffset: length }, { strokeDashoffset: 0 }], { duration: Math.min(900, 700 / speed), easing: 'ease-out', fill: 'forwards' });
+  }
+  for (const id of step.kind === 'cycle' ? step.nodes.slice(0, 1) : step.nodes) {
+    const now = ring(id, 'pj-now-ring', 4);
+    if (animate && now && !reduceMotion) now.classList.add('pj-now-animate');
+  }
+  for (const id of step.nodes) nodeEls.get(id)?.classList.add('pj-current');
 }
 
 function drawLineChip(nodeId: string, line: number): void {
@@ -1518,7 +1631,7 @@ function renderDock(): void {
   document.body.classList.toggle('dock-open', show);
   timeline.replaceChildren();
   const controls = $('timeline-controls');
-  controls.hidden = !overlay || !overlay.steps.length;
+  controls.hidden = !overlay || endPosition() === 0;
   if (overlay) {
     const steps = overlay.steps;
     const track = h('div', { class: 'ticks', role: 'group', 'aria-label': 'Counterexample steps' });
@@ -1528,10 +1641,19 @@ function renderDock(): void {
       button.textContent = String(index + 1);
       track.append(button);
     });
+    // How it locked up: a tick per process that gets stuck (numbered), per link of a circle (↻), for the dead end (⊘).
+    const forming = formation();
+    if (forming.length) track.append(h('span', { class: 'tick-phase', 'aria-hidden': 'true' }, 'how it locked'));
+    let stuckCount = 0;
+    forming.forEach((step, index) => {
+      const button = tick(steps.length + 1 + index, `formation fm-${step.kind}`, `How it locked, ${index + 1} of ${forming.length}: ${step.caption}`);
+      button.textContent = step.kind === 'stuck' ? String(++stuckCount) : step.kind === 'cycle' ? `↻${step.link ?? ''}` : '⊘';
+      track.append(button);
+    });
     const end = tick(endPosition(), `final ${overlay.status} kind-${overlay.kind ?? 'other'} sev-${overlay.severity}`, overlay.summary);
     // The same word as the chip: how the run ends.
     end.textContent = overlay.ending === 'stuck' ? 'stuck' : overlay.ending === 'loop' ? 'loops' : overlay.ending === 'error' ? 'error' : overlay.ending === 'range' ? 'stops' : 'end';
-    if (steps.length) track.append(end);
+    if (endPosition() > 0) track.append(end);
     else {
       track.replaceChildren(end);
     }
@@ -1582,10 +1704,15 @@ function updateStepText(): void {
     return;
   }
   const steps = overlay.steps;
+  const forming = formationAt();
   if (cursor >= endPosition()) {
     stepText.replaceChildren(h('strong', {}, steps.length ? `End state, after step ${steps.length}: ` : 'End state: '), overlay.summary);
   } else if (cursor === 0) {
-    stepText.textContent = `Start: ${plural(steps.length, 'step')} to the ${overlay.kind === 'deadlock' ? 'deadlock' : 'end'}. Press play or step forward.`;
+    stepText.textContent = formation().length
+      ? `Start: ${steps.length ? `${plural(steps.length, 'step')}, then ` : ''}how it locked, one process at a time. Press play or step forward.`
+      : `Start: ${plural(steps.length, 'step')} to the ${overlay.kind === 'deadlock' ? 'deadlock' : 'end'}. Press play or step forward.`;
+  } else if (forming !== undefined) {
+    stepText.replaceChildren(h('strong', { class: 'formation-head' }, `How it locked, ${forming + 1} of ${formation().length}: `), formation()[forming].caption);
   } else {
     const step = steps[cursor - 1];
     stepText.replaceChildren(h('strong', {}, `Step ${cursor} of ${steps.length}: `), step.description || step.event, step.visible ? '' : h('span', { class: 'muted' }, ' (internal, not visible outside)'), step.caveat ? h('span', { class: 'warn' }, ` Assumed: ${step.caveat}.`) : '', h('code', { class: 'event' }, step.event));
@@ -1598,8 +1725,11 @@ function updateStepText(): void {
   $('play').setAttribute('aria-label', playing ? 'Pause' : 'Play');
 }
 
+/** Time a step is shown while playing, at 1×. */
+const STEP_MS = 1200;
+
 function play(): void {
-  if (!overlay || !overlay.steps.length) return;
+  if (!overlay || endPosition() === 0) return;
   if (playing) {
     stopPlaying();
     return;
@@ -1617,7 +1747,7 @@ function play(): void {
       }
     }
     setCursor(cursor + 1, true);
-    playTimer = window.setTimeout(advance, 1150 / speed);
+    playTimer = window.setTimeout(advance, STEP_MS / speed);
   };
   advance();
   updateStepText();
@@ -1682,14 +1812,28 @@ function renderChart(): void {
       setCursor(index, false);
     });
   }
+  // A lane's `stuck from here`: the step of how it locked where that process gets stuck.
+  for (const mark of chartPane.querySelectorAll<SVGGElement>('[data-stuck]')) {
+    mark.style.cursor = 'pointer';
+    mark.addEventListener('click', () => {
+      const index = formation().findIndex((step) => step.kind === 'stuck' && step.keys.includes(mark.dataset.stuck!));
+      if (index < 0 || !overlay) return;
+      stopPlaying();
+      setCursor(overlay.steps.length + 1 + index, false);
+    });
+  }
   renderChartCursor();
 }
 
 function renderChartCursor(): void {
   for (const element of chartPane.querySelectorAll('.pj-current')) element.classList.remove('pj-current');
   if (!overlay) return;
-  const target = cursor >= endPosition() ? chartPane.querySelector('svg.pj-msc:not(.pj-msc-sticky) [data-step="final"]') : cursor > 0 ? chartPane.querySelector(`svg.pj-msc:not(.pj-msc-sticky) [data-step="${cursor - 1}"]`) : undefined;
-  target?.classList.add('pj-current');
+  const forming = formationAt();
+  // While it locks up: where the lanes of this step's processes become stuck.
+  const from = forming !== undefined ? [...chartPane.querySelectorAll<SVGGElement>('svg.pj-msc:not(.pj-msc-sticky) [data-stuck]')].filter((element) => formation()[forming].keys.includes(element.dataset.stuck!)) : [];
+  for (const element of from) element.classList.add('pj-current');
+  const target = cursor >= endPosition() ? chartPane.querySelector('svg.pj-msc:not(.pj-msc-sticky) [data-step="final"]') : forming !== undefined ? from[0] : cursor > 0 ? chartPane.querySelector(`svg.pj-msc:not(.pj-msc-sticky) [data-step="${cursor - 1}"]`) : undefined;
+  if (forming === undefined) target?.classList.add('pj-current');
   if (target && !chartPane.hidden) (target as Element).scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: reduceMotion ? 'auto' : 'smooth' });
 }
 
@@ -1907,8 +2051,11 @@ function drawMachineMarks(): void {
   for (const item of machinePane.querySelectorAll('.machine-trail li')) item.classList.remove('current', 'reached');
   const trail = machine.trail ?? [];
   if (!trail.length || !marks) return;
-  const atEnd = !overlay || cursor >= endPosition();
-  const reached = trail.filter((entry) => atEnd || entry.step <= cursor);
+  // While it locks up the trace is over: the process is stuck once the replay has told it so.
+  const forming = formationAt();
+  const told = forming !== undefined && machineShown?.request.process !== undefined && stuckBy(forming).keys.has(machineShown.request.process);
+  const atEnd = !overlay || cursor >= endPosition() || told;
+  const reached = trail.filter((entry) => atEnd || forming !== undefined || entry.step <= cursor);
   const current = reached[reached.length - 1];
   const stateEl = (id: string): SVGGElement | null => drawing.querySelector<SVGGElement>(`.pj-sm-state[data-state="${CSS.escape(id)}"]`);
   const edgeEls = (index: number): Element[] => [...drawing.querySelectorAll(`.pj-sm-edge[data-index="${index}"], .pj-sm-edge-label[data-index="${index}"]`)];
@@ -2045,13 +2192,13 @@ function buildCode(): void {
 function renderCode(): void {
   if (!codeLines.length) return;
   for (const row of codePane.querySelectorAll('.code-line.mark')) {
-    row.classList.remove('mark', 'stuck', 'behind', 'warning', 'done', 'step', 'loop', 'assumed', 'choice');
+    row.classList.remove('mark', 'stuck', 'behind', 'warning', 'done', 'step', 'loop', 'assumed', 'choice', 'now');
     (row as HTMLElement).style.removeProperty('--mark');
     row.querySelector('.lens')?.remove();
   }
   if (!overlay) return;
   const uri = payload.source?.uri;
-  const marks: Array<{ line: number; kind: 'stuck' | 'behind' | 'warning' | 'done' | 'step' | 'loop' | 'assumed' | 'choice'; node?: string; text?: string; root?: boolean }> = [];
+  const marks: Array<{ line: number; kind: 'stuck' | 'behind' | 'warning' | 'done' | 'step' | 'loop' | 'assumed' | 'choice'; node?: string; text?: string; root?: boolean; now?: boolean }> = [];
   // A value leaving the modelled integers is a warning: amber, as on the canvas.
   const failure = overlay.severity === 'warning' ? 'warning' : 'stuck';
   const steps = overlay.steps;
@@ -2096,20 +2243,32 @@ function renderCode(): void {
       else if (process.status === 'terminated') marks.push({ line: process.at.span.start.line, kind: 'done', node: process.node, text: `${who} finished` });
     }
     marks.push(...special);
-  } else if (cursor > 0) {
+  } else if (formationAt() !== undefined) {
+    // While it locks up: the line of each process stuck by now, the ones this step is about first.
+    const step = formation()[formationAt()!];
+    const stuck = stuckBy(formationAt()!).keys;
+    const now = (process: Overlay['processes'][number]): boolean => step.keys.includes(process.key) && (step.kind === 'stuck' || stuck.has(process.key));
+    const shown = overlay.processes.filter((process) => process.status === 'blocked' && stuck.has(process.key) && process.at?.uri === uri);
+    for (const process of [...shown.filter(now), ...shown.filter((process) => !now(process))]) {
+      const wait = overlay.waits.find((entry) => entry.node === process.node);
+      marks.push({ line: process.at!.span.start.line, kind: tone(process), node: process.node, text: `${processWord(process)} ${process.forGood === false ? 'is left waiting' : 'is stuck'}: ${process.badge}${wait ? ` — ${wait.short}` : ''}`, root: tone(process) === 'stuck', now: now(process) });
+    }
+  } else if (cursor > 0 && cursor <= steps.length) {
     const step = steps[cursor - 1];
     for (const participant of step.participants) {
       if (!participant.at || participant.at.uri !== uri) continue;
       marks.push({ line: participant.at.span.start.line, kind: 'step', node: participant.node, text: `${participant.label}: ${participant.role} · step ${cursor}` });
     }
   }
-  // The line to show: where a process is stuck for good, else stuck behind one, else the first mark.
-  const rank = (mark: (typeof marks)[number]): number => (mark.kind === 'stuck' || mark.kind === 'warning' || mark.kind === 'choice' ? (mark.root === false ? 1 : 0) : mark.kind === 'behind' ? 1 : 2);
+  // The line to show: what the step of how it locked is about, else where a process is stuck for good, else stuck
+  // behind one, else the first mark.
+  const rank = (mark: (typeof marks)[number]): number => (mark.now ? -1 : mark.kind === 'stuck' || mark.kind === 'warning' || mark.kind === 'choice' ? (mark.root === false ? 1 : 0) : mark.kind === 'behind' ? 1 : 2);
   let first: { row: HTMLElement; rank: number } | undefined;
   for (const mark of marks) {
     const row = codeLines[mark.line];
     if (!row) continue;
     row.classList.add('mark', mark.kind);
+    if (mark.now) row.classList.add('now');
     if (mark.node && colors.has(mark.node) && mark.kind === 'step') row.style.setProperty('--mark', colors.get(mark.node)!);
     if (mark.text && !row.querySelector('.lens')) row.append(h('span', { class: `lens ${mark.kind}` }, mark.text));
     if (!first || rank(mark) < first.rank) first = { row, rank: rank(mark) };
@@ -2195,8 +2354,9 @@ function wrapWords(text: string, size: number, width: number): string[] {
  */
 function currentSvg(): string {
   const final = !!overlay && cursor >= endPosition();
-  // A step of the replay draws none of the end state's words: no room is kept for them.
-  const bounds = contentBounds(final);
+  const forming = formationAt();
+  // A step of the replay draws none of the end state's words: no room is kept for them. How it locked draws some.
+  const bounds = contentBounds(final || forming !== undefined);
   const margin = 24;
   const width = Math.max(bounds.width + margin * 2, 600);
   const x = bounds.x - margin;
@@ -2205,9 +2365,11 @@ function currentSvg(): string {
   const subtitle = overlay ? overlay.subtitle : view.subtitle;
   const subtitleLines = firstLines(subtitle, 11.5, column, 3);
   const head = 40 + subtitleLines.length * 16;
-  const step = overlay && !final && cursor > 0 ? overlay.steps[cursor - 1] : undefined;
+  const step = overlay && !final && cursor > 0 && cursor <= overlay.steps.length ? overlay.steps[cursor - 1] : undefined;
   // The end state's story with what the run relies on, as the server's SVG has it; a step says what it assumes.
-  const account = overlay ? final ? [...overlay.story, ...overlay.caveats.map((caveat) => `Caveat: ${caveat}.`)] : step ? [`Step ${cursor} of ${overlay.steps.length}: ${step.description || step.event}${step.caveat ? ` (assumed: ${step.caveat})` : ''}`] : [`Start: ${plural(overlay.steps.length, 'step')} to the end state.`] : [];
+  const account = overlay ? final ? [...overlay.story, ...overlay.caveats.map((caveat) => `Caveat: ${caveat}.`)]
+    : forming !== undefined ? [`How it locked, ${forming + 1} of ${formation().length}: ${formation()[forming].caption}`]
+      : step ? [`Step ${cursor} of ${overlay.steps.length}: ${step.description || step.event}${step.caveat ? ` (assumed: ${step.caveat})` : ''}`] : [`Start: ${plural(overlay.steps.length, 'step')} to the end state.`] : [];
   const caption = account.flatMap((sentence) => wrapWords(sentence, 11.5, column));
   const entries = overlay && final ? overlay.legend : view.legend;
   const rows: string[] = [];
@@ -2268,8 +2430,8 @@ function machineSvg(machine: Machine, drawing: SVGSVGElement): string {
   return `<?xml version="1.0" encoding="UTF-8"?>\n<!-- generated by processj-lsp: a process's state machine in the CSP model -->\n<svg xmlns="http://www.w3.org/2000/svg" class="pj-net" viewBox="0 0 ${width} ${height}" width="${Math.ceil(width)}" height="${Math.ceil(height)}"><title>${escapeText(titleText)}</title><style>${plainStyle(payload.style)}</style><defs>${marker}</defs><rect class="pj-bg" x="0" y="0" width="${width}" height="${height}"/>${text('pj-title', titleText, 28)}${subtitleLines.map((line, index) => text('pj-subtitle', line, 47 + index * 16)).join('')}<g transform="translate(${margin} ${head})">${content.innerHTML}</g>${lines.map((line, index) => text('pj-caption-text', line, head + vh + margin + 12 + index * 16)).join('')}</svg>\n`;
 }
 
-/** The step marks drawn by this page (line chips, tokens), in light colours. */
-const EXPORT_EXTRA = '.pj-line-chip text, .pj-token text { font-size: 10.5px; font-weight: 700; fill: #ffffff; } .pj-token rect { fill: #0f172a; } .pj-token-hidden rect { fill: #64748b; } .pj-current .pj-box, .pj-current .pj-group-box { stroke: #2563eb; stroke-width: 2.4; } .pj-edge.pj-current .pj-edge-line { stroke: #2563eb; stroke-width: 2.6; } .pj-done { opacity: 0.4; }';
+/** The step marks drawn by this page (line chips, tokens, how it locked), in light colours. */
+const EXPORT_EXTRA = '.pj-line-chip text, .pj-token text { font-size: 10.5px; font-weight: 700; fill: #ffffff; } .pj-token rect { fill: #0f172a; } .pj-token-hidden rect { fill: #64748b; } .pj-current .pj-box, .pj-current .pj-group-box { stroke: #2563eb; stroke-width: 2.4; } .pj-edge.pj-current .pj-edge-line { stroke: #2563eb; stroke-width: 2.6; } .pj-done { opacity: 0.4; } .pj-now-ring { fill: none; stroke: #dc2626; stroke-width: 3; } .pj-partner-ring { fill: none; stroke: #dc2626; stroke-width: 1.8; stroke-dasharray: 6 4; } .pj-now-edge { fill: none; stroke: #dc2626; stroke-width: 5; stroke-linecap: round; opacity: 0.75; }';
 
 function escapeText(value: string): string {
   return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
@@ -2540,11 +2702,21 @@ function wireControls(): void {
         else if (active) activate(undefined);
         return;
       case ' ':
-        if (overlay?.steps.length && !target.matches('button')) {
+        if (overlay && endPosition() > 0 && !target.matches('button')) {
           event.preventDefault();
           play();
         }
         return;
+      case 'ArrowLeft':
+      case 'ArrowRight':
+        // With a replay shown, left and right step it (Shift pans the network instead).
+        if (overlay && endPosition() > 0 && !event.shiftKey) {
+          event.preventDefault();
+          stopPlaying();
+          setCursor(cursor + (event.key === 'ArrowRight' ? 1 : -1), event.key === 'ArrowRight');
+          return;
+        }
+        break;
       case ']':
       case '.':
         stopPlaying();
