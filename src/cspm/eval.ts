@@ -496,7 +496,7 @@ export function evaluate(e: Ex, env: Env): Value {
       if (to.t !== 'int') return unknownOf(to, 'a range that does not end at an integer');
       // Counted, not stepped to the end: both ends are exact integers, so `from + k` is too.
       const count = Math.max(0, to.v - from.v + 1);
-      if (count > MAX_SET) return LIMIT(`the range ${from.v}..${to.v} has too many values`);
+      if (count > MAX_SET) return UNKNOWN(`the range ${from.v}..${to.v} has too many values`);
       if (!spend(globals, count)) return LIMIT('the evaluation budget ran out');
       const items: Value[] = Array.from({ length: count }, (_, k) => ({ t: 'int', v: from.v + k }));
       return e.seq ? { t: 'seq', items } : { t: 'set', items };

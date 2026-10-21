@@ -161,6 +161,14 @@ test('F-03: repeated set operations and membership tests are paid for by the eva
   assert.ok(notes.some((note) => /evaluation budget ran out|recurses deeper/.test(note)), notes.join('\n'));
 });
 
+test('F-03: a CSPm composition of thousands of explicit operands is not drawn (nor walked recursively)', () => {
+  const text = `channel c : {0..20000}\nMAIN = ${Array.from({ length: 20000 }, (_, i) => `c!${i} -> STOP`).join(' ||| ')}\n`;
+  const doc = quick(5000, () => new CspmDocument('file:///workspace/wide.csp', text));
+  const view = quick(5000, () => doc.model([doc.defaultView()]).views[0]);
+  assert.equal(view.nodes.length, 1);
+  assert.match(view.notes.join('\n'), /more than 1000 operands: it is too large to draw/);
+});
+
 // ---------------------------------------------------------------------------
 // F-03: ProcessJ graphs and Convert to CSP
 // ---------------------------------------------------------------------------

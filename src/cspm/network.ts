@@ -480,8 +480,18 @@ class ViewBuilder {
         flat.push(e);
         return flat.length - 1;
       };
-      shape = collect(expr);
-      flat.forEach((operand, i) => operands.push({ expr: operand, env, step: branch(i + 1) }));
+      // Counted without recursion first: a chain of thousands of operands is not drawn (nor walked recursively).
+      let count = 0;
+      for (const stack: Ex[] = [expr]; stack.length && count <= MAX_OPERANDS;) {
+        const e = stack.pop()!;
+        if (same(e) && (e.k === 'par' || e.k === 'op')) stack.push(e.right, e.left);
+        else count++;
+      }
+      if (count > MAX_OPERANDS) this.note(`This composition has more than ${MAX_OPERANDS} operands: it is too large to draw, so its processes are left out.`);
+      else {
+        shape = collect(expr);
+        flat.forEach((operand, i) => operands.push({ expr: operand, env, step: branch(i + 1) }));
+      }
       if (expr.k === 'par') {
         op = '[|';
         operator = `[| ${this.text(expr.sync.span)} |]`;
@@ -872,6 +882,9 @@ class ViewBuilder {
 }
 
 /** Whether a process term is a composition the view would unfold (through hiding, renaming and the like). */
+/** Most operands of one explicit composition drawn (as for a ProcessJ view, src/graph/network.ts MAX_VIEW_PROCESSES). */
+const MAX_OPERANDS = 1000;
+
 /** Said when a condition was too large or too long to evaluate (the evaluator's bounds), not merely open. */
 function limitNote(condition: string, why: string): string {
   return `The condition ${condition} was not evaluated (${why}): the process is drawn as written.`;
