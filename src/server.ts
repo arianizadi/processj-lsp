@@ -692,8 +692,42 @@ function schedulePublish(doc: TextDocument): void {
 // ---------------------------------------------------------------------------
 
 function scheduleCheck(doc: TextDocument, delayMs: number): void {
-  if (!install) return;
+  if (!install || !compilesUnasked(doc)) return;
   compilerQueue.schedule(doc.uri, delayMs, (signal) => runCheck(doc.uri, signal));
+}
+
+/** Files outside the workspace the compiler was not run on, said once each in the log. */
+const notCompiledOutside = new Set<string>();
+
+/**
+ * Whether the compiler may run on a document without being asked (on open,
+ * edit and save): only for a file inside a workspace root, links resolved.
+ * A file opened from elsewhere (a download, a library, another project) gets
+ * the server's own analysis but no compiler run until Run or Build asks for
+ * one. With no workspace root at all (an editor started on one file), every
+ * file may be compiled, as before.
+ */
+function compilesUnasked(doc: TextDocument): boolean {
+  const roots = workspace.getRoots();
+  const file = safeFileUri(doc.uri);
+  if (!roots.length || !file) return true;
+  const real = (p: string): string => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  const dir = real(path.dirname(file));
+  const inside = roots.some((root) => {
+    const relative = path.relative(real(root), dir);
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  });
+  if (!inside && !notCompiledOutside.has(doc.uri)) {
+    notCompiledOutside.add(doc.uri);
+    connection.console.log(`not running the compiler on ${file}: it is outside the workspace (Run and Build still do)`);
+  }
+  return inside;
 }
 
 function lintDiagnostics(doc: TextDocument): Diagnostic[] {
@@ -1212,7 +1246,10 @@ async function runCheck(uri: string, signal: AbortSignal): Promise<void> {
   if (!current || current.version !== version) return; // a newer check is on its way
 
   let diagnostics: Diagnostic[];
-  if (result.timedOut) {
+  if (result.refused) {
+    const own = path.resolve(result.refused.file) === path.resolve(sourcePath);
+    diagnostics = [makeDiagnostic(current, { line: own ? result.refused.line : 0, message: result.refused.message, severity: 'warning', code: 'pj/unsafe-pragma', source: 'lsp' })];
+  } else if (result.timedOut) {
     diagnostics = [makeDiagnostic(current, { line: 0, message: `ProcessJ compiler timed out after ${settings.timeoutMs} ms`, severity: 'warning', code: 'timeout', source: 'lsp' })];
   } else {
     const parsed = parseCompilerOutput(result.stdout, result.stderr);

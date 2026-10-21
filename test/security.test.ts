@@ -15,6 +15,7 @@ import { checkWithFdr } from '../src/csp/check';
 import { configureFdrQueue, fdrQueueState, findRefines, OUTPUT_LIMITS, runRefines } from '../src/csp/fdr';
 import { includePolicy, prepareIncludes } from '../src/csp/includes';
 import { loadProgram } from '../src/csp/load';
+import { compile, makeSandbox } from '../src/compiler';
 import { typecheckCspm } from '../src/cspm/check';
 import { translateProcedure, translateProgram } from '../src/csp/translate';
 import { CspmDocument } from '../src/cspm/document';
@@ -448,4 +449,108 @@ test('F-07: refines is stopped when one line of its output passes the limit, bef
   assert.ok((run.outputExceeded ?? 0) > OUTPUT_LIMITS.line, JSON.stringify({ outputExceeded: run.outputExceeded, aborted: run.aborted }));
   assert.equal(run.aborted, false);
   assert.equal(run.timedOut, false);
+});
+
+// ---------------------------------------------------------------------------
+// F-01: the compiler's working directory
+// ---------------------------------------------------------------------------
+
+const NO_INSTALL = { installDir: '/nonexistent', includeDir: '/nonexistent/include', javaBin: '/nonexistent/java', classpath: '' };
+
+/** Every entry under `dir`, relative, with what it is (links are not followed). */
+function tree(dir: string, relative = ''): string[] {
+  const out: string[] = [];
+  for (const name of fs.readdirSync(path.join(dir, relative)).sort()) {
+    const entry = path.join(relative, name);
+    const stat = fs.lstatSync(path.join(dir, entry));
+    out.push(`${entry.split(path.sep).join('/')}${stat.isSymbolicLink() ? ' -> link' : stat.isDirectory() ? '/' : ''}`);
+    if (stat.isDirectory()) out.push(...tree(dir, entry));
+  }
+  return out;
+}
+
+test('F-01: the sandbox holds read-only copies of the imported files, and no link out of it', (t) => {
+  const root = tempDir(t, 'pj-sandbox-');
+  const project = path.join(root, 'project');
+  const outside = path.join(root, 'outside');
+  const packages = path.join(root, 'packages');
+  for (const dir of [project, outside, path.join(project, 'geom'), path.join(project, 'lib', 'sub'), path.join(project, 'Blah._'), path.join(project, 'unrelated'), path.join(packages, 'pkg')]) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(outside, 'important.txt'), 'keep me\n');
+  // The review's layout: a directory the compiler's library output path goes through, and a link to a user file.
+  fs.writeFileSync(path.join(project, 'Blah._', 'keep.txt'), 'x\n');
+  fs.symlinkSync(path.join(outside, 'important.txt'), path.join(project, 'victim.h'));
+  fs.writeFileSync(path.join(project, 'util.pj'), 'import geom.shapes;\npublic void util() { }\n');
+  fs.writeFileSync(path.join(project, 'geom', 'shapes.pj'), 'public void shape() { }\n');
+  fs.writeFileSync(path.join(project, 'lib', 'a.pj'), 'public void a() { }\n');
+  fs.writeFileSync(path.join(project, 'lib', 'sub', 'b.pj'), 'public void b() { }\n');
+  fs.writeFileSync(path.join(project, 'unrelated', 'c.pj'), 'public void c() { }\n');
+  fs.writeFileSync(path.join(project, 'other.pj'), 'public void other() { }\n');
+  fs.writeFileSync(path.join(packages, 'pkg', 'x.pj'), 'public void x() { }\n');
+  const text = 'import util;\nimport lib.*;\nimport pkg.x;\npublic void main(string[] args) { }\n';
+  const sandbox = makeSandbox(NO_INSTALL, path.join(project, 'main.pj'), text, undefined, [{ name: 'pkg', target: path.join(packages, 'pkg') }]);
+  t.after(() => sandbox.cleanup());
+  assert.equal(sandbox.refused, undefined);
+  assert.deepEqual(tree(sandbox.root).filter((entry) => !entry.startsWith('.pjlsp-home')), [
+    'geom/', 'geom/shapes.pj',
+    'lib/', 'lib/a.pj', 'lib/sub/', 'lib/sub/b.pj',
+    'main.pj',
+    'pkg/', 'pkg/x.pj',
+    'util.pj',
+  ]);
+  assert.equal(fs.readFileSync(path.join(sandbox.root, 'geom', 'shapes.pj'), 'utf8'), 'public void shape() { }\n');
+  assert.equal(fs.statSync(path.join(sandbox.root, 'util.pj')).mode & 0o222, 0, 'the copies are read-only');
+  assert.equal(fs.readFileSync(path.join(outside, 'important.txt'), 'utf8'), 'keep me\n');
+});
+
+test('F-01: a #pragma FILE that is a path, in the file or in an import, keeps the compiler from running', async (t) => {
+  const project = tempDir(t, 'pj-pragma-');
+  const library = '#pragma LIBRARY;\n#pragma LANGUAGE "C";\n#pragma NATIVELIB "math.h";\n#pragma FILE "/../victim";\npackage p;\n';
+  const own = makeSandbox(NO_INSTALL, path.join(project, 'attack.pj'), library);
+  t.after(() => own.cleanup());
+  assert.match(own.refused?.message ?? '', /#pragma FILE "\/\.\.\/victim" is not a plain file name/);
+  assert.equal(own.refused?.line, 3);
+  fs.writeFileSync(path.join(project, 'evil.pj'), library);
+  const imported = makeSandbox(NO_INSTALL, path.join(project, 'main.pj'), 'import evil;\npublic void main(string[] args) { }\n');
+  t.after(() => imported.cleanup());
+  assert.equal(imported.refused?.file, path.join(project, 'evil.pj'));
+  const plain = makeSandbox(NO_INSTALL, path.join(project, 'io.pj'), '#pragma LIBRARY;\n#pragma NATIVE;\n#pragma FILE "io";\n#pragma LANGUAGE "JVM";\npackage std;\n');
+  t.after(() => plain.cleanup());
+  assert.equal(plain.refused, undefined);
+  // compile() does not start the compiler at all (the java given here does not exist).
+  const result = await compile(NO_INSTALL, path.join(project, 'attack.pj'), library);
+  assert.equal(result.refused?.line, 3);
+  assert.equal(result.stderr, '');
+});
+
+test('F-01: the server runs the compiler unasked only on files inside the workspace', { skip: process.platform === 'win32' && 'POSIX shell script' }, async (t) => {
+  const root = tempDir(t, 'pj-compile-roots-');
+  const workspace = path.join(root, 'workspace');
+  const elsewhere = path.join(root, 'downloads');
+  const install = path.join(root, 'processj');
+  for (const dir of [workspace, elsewhere, path.join(install, 'bin'), path.join(install, 'resources', 'jars')]) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(install, 'bin', 'ProcessJc.class'), '');
+  for (const jar of ['java_cup_runtime.jar', 'ST-4.0.7.jar', 'asm-all-5.2.jar']) fs.writeFileSync(path.join(install, 'resources', 'jars', jar), '');
+  // A java that only says which file it was asked to compile.
+  const log = path.join(root, 'java.log');
+  const java = path.join(root, 'java');
+  fs.writeFileSync(java, `#!/bin/sh\nfor last; do :; done\necho "$last" >> ${JSON.stringify(log)}\n`, { mode: 0o755 });
+  const client = new Client();
+  t.after(() => client.close());
+  await client.request('initialize', { processId: process.pid, rootUri: pathToFileURL(workspace).toString(), capabilities: {}, initializationOptions: { installDir: install, javaBin: java } });
+  client.notify('initialized', {});
+  const source = 'public void main(string[] args) { }\n';
+  const open = (file: string): string => {
+    fs.writeFileSync(file, source);
+    const uri = pathToFileURL(file).toString();
+    client.notify('textDocument/didOpen', { textDocument: { uri, languageId: 'processj', version: 1, text: source } });
+    return uri;
+  };
+  const outsideUri = open(path.join(elsewhere, 'downloaded.pj'));
+  const insideUri = open(path.join(workspace, 'mine.pj'));
+  await client.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === outsideUri);
+  for (const deadline = Date.now() + 10_000; !fs.existsSync(log) && Date.now() < deadline;) await new Promise((resolve) => setTimeout(resolve, 20));
+  await client.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === insideUri);
+  // The outside file was opened first; give a compiler run for it every chance to show up.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(fs.readFileSync(log, 'utf8').trim().split('\n'), ['mine.pj']);
 });
