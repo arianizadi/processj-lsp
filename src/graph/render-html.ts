@@ -587,13 +587,13 @@ button.action:hover { background: var(--accent-soft); }
   .chip { flex: 0 0 auto; }
 }
 @media (max-height: 640px) { #dock { height: var(--dock-height, 30vh); } }
-/* A phone, or a slim panel: the toolbar is one row that scrolls sideways (its menu opens over the page). */
-@media (max-width: 600px) {
-  .toolbar { flex-wrap: nowrap; overflow-x: auto; gap: 8px 12px; padding: 6px 10px; }
+/* A phone, a slim panel or a short one: the toolbar is one row that scrolls sideways (its menu opens over the page). */
+@media (max-width: 600px), (max-height: 640px) {
+  .toolbar { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin; gap: 8px 12px; padding: 6px 10px; }
   .toolbar > *, .tools > * { flex: 0 0 auto; }
   .tools { flex-wrap: nowrap; }
-  .search { flex: 0 0 170px; min-width: 0; }
-  #view-select { max-width: 180px; }
+  .search { flex: 0 0 200px; min-width: 0; }
+  #view-select { max-width: 200px; }
   .menu { position: fixed; top: 44px; right: 8px; }
 }
 /* A short frame: the network keeps a usable height, and the timeline and the code give way. */

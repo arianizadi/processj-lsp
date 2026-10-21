@@ -1673,8 +1673,26 @@ function sendToken(step: OverlayStep): void {
 // Timeline dock
 // ---------------------------------------------------------------------------
 
+/** Whether the person folded or unfolded the dock's code and chart themselves (a sandboxed frame cannot remember it). */
+let dockChosen = false;
+
+function foldDock(collapsed: boolean, chosen: boolean): void {
+  dock.classList.toggle('collapsed', collapsed);
+  $('dock-collapse').setAttribute('aria-expanded', String(!collapsed));
+  if (!chosen) return;
+  dockChosen = true;
+  remember('dock-collapsed', String(collapsed));
+}
+
 function renderDock(): void {
   const show = !!overlay || codeOpen || !!machineShown;
+  // In a short frame (a laptop's panel below its editor) a result's code and chart start folded, so the network
+  // keeps its height; the timeline stays. The fold button, Code or a state machine brings them back.
+  if (!dockChosen && recall('dock-collapsed') === undefined) {
+    if (codeOpen || machineShown) {
+      if (dock.classList.contains('collapsed')) foldDock(false, false);
+    } else if (overlay && window.innerHeight < 640) foldDock(true, false);
+  }
   dock.hidden = !show;
   document.body.classList.toggle('dock-open', show);
   timeline.replaceChildren();
@@ -2668,14 +2686,8 @@ function wireControls(): void {
     dock.style.setProperty('--dock-height', `${savedHeight}px`);
     dock.style.maxHeight = '60vh';
   }
-  const collapse = $('dock-collapse');
-  const setCollapsed = (collapsed: boolean): void => {
-    dock.classList.toggle('collapsed', collapsed);
-    collapse.setAttribute('aria-expanded', String(!collapsed));
-    remember('dock-collapsed', String(collapsed));
-  };
-  collapse.addEventListener('click', () => setCollapsed(!dock.classList.contains('collapsed')));
-  if (recall('dock-collapsed') === 'true') setCollapsed(true);
+  $('dock-collapse').addEventListener('click', () => foldDock(!dock.classList.contains('collapsed'), true));
+  if (recall('dock-collapsed') === 'true') foldDock(true, true);
   $('legend-button').addEventListener('click', () => {
     const legend = $('legend');
     legend.hidden = !legend.hidden;
