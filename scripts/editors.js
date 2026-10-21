@@ -11,6 +11,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { elispString, luaString, unsupportedPath } = require('./editor-strings');
 
 const ROOT = path.resolve(__dirname, '..');
 const EDITORS = ['nvim', 'vscode', 'emacs'];
@@ -108,10 +109,6 @@ function usesLazy(dirs) {
     || fs.existsSync(path.join(dirs.config, 'lua', 'plugins'));
 }
 
-function luaString(value) {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-}
-
 function nvimInstall() {
   if (!which('nvim')) {
     if (explicit) return fail('nvim', 'Neovim is not on PATH. Install Neovim 0.11+ (https://neovim.io) and run this again.');
@@ -121,6 +118,8 @@ function nvimInstall() {
   const spec = path.join(dirs.config, 'lua', 'plugins', 'processj.lua');
   const pack = path.join(dirs.config, 'pack', 'processj', 'start', 'processj-lsp');
   if (usesLazy(dirs)) {
+    const unsupported = unsupportedPath(ROOT);
+    if (unsupported) return fail('nvim', `cannot write the lazy.nvim spec: ${unsupported}.`);
     const text = [
       '-- Written by `npm run setup -- nvim` in processj-lsp; `npm run remove -- nvim` deletes this file.',
       '-- The server runs from the checkout below, so `git pull` there updates it.',
@@ -248,7 +247,10 @@ function emacsInstall() {
   }
   const init = emacsInitFile();
   const modeFile = path.join(ROOT, 'editor', 'emacs', 'processj-mode.el').split(path.sep).join('/');
-  const block = `${MARK_BEGIN}\n(load "${modeFile}" nil t)\n${MARK_END}\n`;
+  const unsupported = unsupportedPath(modeFile);
+  if (unsupported) return fail('emacs', `cannot write the init file: ${unsupported}.`);
+  // A Lisp string literal: a quote in the path cannot end it and run code at Emacs' next start.
+  const block = `${MARK_BEGIN}\n(load ${elispString(modeFile)} nil t)\n${MARK_END}\n`;
   const existing = fs.existsSync(init) ? fs.readFileSync(init, 'utf8') : '';
   const stripped = stripEmacsBlock(existing);
   const next = `${stripped.replace(/\s*$/, '')}${stripped.trim() ? '\n\n' : ''}${block}`;
