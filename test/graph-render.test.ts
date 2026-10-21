@@ -92,6 +92,40 @@ test('layouts keep boxes apart, route every arrow, keep labels on the canvas, an
   }
 });
 
+test('an edit that leaves a drawing as it was does not lay it out again, wherever it moves the source', async () => {
+  // layout.ts makes its one ELK from this module: count the layouts it is asked for.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const ELK = require('elkjs/lib/elk.bundled.js') as { prototype: { layout(...args: unknown[]): Promise<unknown> } };
+  const own = Object.getOwnPropertyDescriptor(ELK.prototype, 'layout');
+  const layout = ELK.prototype.layout;
+  let layouts = 0;
+  ELK.prototype.layout = function (this: unknown, ...args: unknown[]) {
+    layouts++;
+    return layout.apply(this, args);
+  };
+  try {
+    const file = path.join(ROOT, 'examples', 'dining_philosophers.pj');
+    const source = fs.readFileSync(file, 'utf8');
+    const boxes = (view: NetworkView, laid: ViewLayout): Box[] => view.nodes.map((node) => laid.nodes[node.id]);
+    const before = programView(analyzeSource(source, file).model);
+    const first = await layoutView(before);
+    // Two lines above everything: every box gets a new id (ids name source lines), none moves.
+    const after = programView(analyzeSource(`// moved\n\n${source}`, file).model);
+    assert.notDeepEqual(after.nodes.map((node) => node.id), before.nodes.map((node) => node.id));
+    const counted = layouts;
+    const second = await layoutView(after);
+    assert.equal(layouts, counted, 'ELK was not asked again');
+    assert.deepEqual(boxes(after, second), boxes(before, first));
+    assert.deepEqual(Object.keys(second.nodes).sort(), after.nodes.map((node) => node.id).sort(), 'under the new ids');
+    // A drawing that does change is laid out.
+    await layoutView(programView(analyzeSource(source.replace(/philosopher/g, 'thinker'), file).model));
+    assert.equal(layouts, counted + 1);
+  } finally {
+    if (own) Object.defineProperty(ELK.prototype, 'layout', own);
+    else delete (ELK.prototype as { layout?: unknown }).layout;
+  }
+});
+
 test('the SVG is standalone, well-formed, light by default, and escapes every label', async () => {
   const source = [
     'void show(string text, chan<int>.write out) { out.write(1); }',

@@ -9,3 +9,4 @@ vscode/*.vsix
 vscode/LICENSE
 vscode/NOTICE
 vscode/THIRD_PARTY_NOTICES.txt
+src/browser/stdlib.json

@@ -10,9 +10,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { ViewerPayload } from './payload';
 import { buildExcalidrawScene } from './render-excalidraw';
-import { machineMarkers } from './render-machine';
+import { machineMarkers, machineStyle } from './render-machine';
 import { MSC_COLORS } from './render-msc';
-import { LIGHT_THEME } from './render-svg';
+import { LIGHT_THEME, svgStyle } from './render-svg';
 import { escapeXml } from './svg';
 
 export interface ViewerOptions {
@@ -26,6 +26,15 @@ export interface ViewerOptions {
 }
 
 let clientScript: string | undefined;
+
+/**
+ * The page script to use instead of reading dist/src/graph/client/viewer.js
+ * next to this module: a bundle without that file (the browser build) carries
+ * the script itself.
+ */
+export function setViewerScript(text: string): void {
+  clientScript = text;
+}
 
 /** The compiled page script (dist/src/graph/client/viewer.js). */
 function viewerScript(): string {
@@ -163,6 +172,25 @@ ${viewerScript()}
 </body>
 </html>
 `;
+}
+
+/**
+ * The page for an `<iframe sandbox="allow-scripts">` in a web page (the
+ * browser IDE): webview mode without a document, so it is built once and
+ * served as a file. Payloads arrive by postMessage as in VS Code's panel
+ * (vscode/src/graphPanel.ts); a stand-in for VS Code's `acquireVsCodeApi()`,
+ * with the page's nonce, posts the page's messages to the parent window as
+ * `{ pjViewer: message }`, the first being `{ type: 'ready' }` once it has loaded.
+ */
+export function renderEmbeddedViewerHtml(options: { nonce?: string } = {}): string {
+  const nonce = options.nonce ?? randomBytes(16).toString('base64');
+  const empty: ViewerPayload = { version: 1, generator: 'processj-lsp', title: 'ProcessJ', uri: '', generatedAt: new Date(0).toISOString(), views: [], defaultView: '', reports: [], chips: [], overlays: [], charts: {}, style: `${svgStyle('themed')}${machineStyle('themed')}`, knownUris: [], notes: [] };
+  const bridge = `<script nonce="${nonce}">"use strict";
+window.acquireVsCodeApi = () => ({ postMessage: (message) => window.parent.postMessage({ pjViewer: message }, '*') });
+window.addEventListener('load', () => window.parent.postMessage({ pjViewer: { type: 'ready' } }, '*'));
+</script>`;
+  // Before the page script, which asks for the API as it starts.
+  return renderViewerHtml(empty, { mode: 'webview', nonce }).replace('<head>\n', `<head>\n${bridge}\n`);
 }
 
 const MARKERS = '<marker id="pj-arrow" viewBox="0 0 10 10" refX="9.5" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path class="pj-arrow" d="M0,0.8 L10,5 L0,9.2 Z"/></marker>'

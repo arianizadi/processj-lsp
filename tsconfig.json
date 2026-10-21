@@ -15,5 +15,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "exclude": ["src/graph/client"]
+  "exclude": ["src/graph/client", "src/browser", "src/connection.browser.ts"]
 }

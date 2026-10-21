@@ -1302,7 +1302,10 @@ for it.
 
 The server caches parsing, checking, symbols and semantic inputs per document
 version, computes effects/protocols once per version, builds the visual graph only
-on request, coalesces lint bursts into one pass, and routes real-compiler JVM work
+on request, keeps graph layouts by the shape of what is drawn (an edit that moves
+no box, a keystroke above a procedure included, is not laid out again: ELK takes
+tens to hundreds of milliseconds on a larger network, a kept layout well under one),
+coalesces lint bursts into one pass, and routes real-compiler JVM work
 through a latest-wins queue with two workers. A newer edit cancels stale work;
 the queue bounds CPU/memory when many files open together without serializing
 all compiler feedback.
@@ -1431,7 +1434,8 @@ are needed. An untitled editor also gets language features after changing its la
 ```sh
 npm install
 npm run build
-npm test          # parser corpus, formatter, checker, semantic tokens, imports, examples, perf budgets
+npm run build:browser   # also the Web Worker build (dist/browser), see "The browser build"
+npm test          # parser corpus, formatter, checker, semantic tokens, imports, examples, perf budgets, the worker
 npm run smoke     # end-to-end against a real ProcessJ install, including a full program run
 npm run bench     # timings for generated 1k / 10k / 50k-line files
 node scripts/fdr-validate.js   # every corpus program through FDR and the real runtime, compared
@@ -1496,10 +1500,78 @@ passed to a procedure counts as both of its ends being handed away, so aliasing
 through calls is conservative rather than tracked; the rules are tuned to avoid
 false positives rather than to be complete.
 
+## The browser build
+
+`npm run build:browser` builds the server a second time, as a Web Worker for the
+browser IDE, into `dist/browser/`:
+
+| file | what |
+| --- | --- |
+| `processj-lsp.worker.js` | the server as one classic worker script (minified, with a source map), LSP over the worker's `postMessage` |
+| `graph-viewer.html` | the graph viewer page for `<iframe sandbox="allow-scripts">`: webview mode, fed by `postMessage` as VS Code's panel feeds it; a stand-in for `acquireVsCodeApi()` posts the page's messages to the parent as `{ pjViewer: message }`, starting with `{ type: 'ready' }` |
+| `manifest.json` | `{ version, commit, files }` |
+
+It is the same server. `scripts/build-browser.mjs` (esbuild) puts
+`src/connection.browser.ts` in place of `src/connection.ts` and the modules in
+`src/browser/` in place of Node's: an in-memory synchronous file system (the
+analysis reads imports, the workspace and the standard library synchronously,
+so the page puts the project there up front), file URLs, a synchronous SHA-256,
+and `child_process` and `http` that say they are not available. The standard
+library headers (`test/fixtures/include`, the compiler's `include/JVM`) are in
+the bundle and installed at `/processj` with the files an install is
+recognised by, so the server finds its library as it does on disk. ELK lays
+out in the worker's own thread; `src/graph/layout.ts` builds it so that it
+does not take the worker's `onmessage` (the bundled elkjs would, thinking it is
+running as ELK's own worker). The build type-checks `src/browser` against the
+worker's library (`tsconfig.browser.json`) first.
+
+Nothing can be started in a browser, so the compiler and FDR run on a runner
+service the page talks to. A client offers it with
+`initializationOptions.browser: { remoteFdr: true, remoteCompile: true }`, and
+then answers two requests (`src/remote.ts`):
+
+- `processj/runRefines { model, name, files, mode: 'check' | 'typecheck', timeoutMs }`
+  → `{ exitCode, frames, error? }`: FDR on `model`, a file `name` at the top of
+  a job whose `files` are the `.csp` files it includes, at their paths in the
+  workspace (the model's includes are rewritten to those paths). `frames` are
+  the lines `refines --format=framed_json` printed; the server reads them as it
+  reads refines' own output, so the explanation, the report, the lenses and the
+  graph are the same as after a local run. Check with FDR and the FDR lenses
+  are there without a local `refines`, for `.pj` and `.csp` files alike, and a
+  `.csp` file is type-checked on open and save.
+- `processj/compile { entry, files, mode: 'check' }` → `{ output, ok, error? }`:
+  the compiler on `entry` (as the compiler should read it, with the yield
+  annotations it needs) and the workspace files it imports, placed where the
+  compiler resolves the imports from. The output is parsed as a local run's
+  and published as compiler diagnostics. The server asks 1.5 s after a file is
+  opened or last edited, and when it is saved, one request at a time per file:
+  an edit cancels a request (`$/cancelRequest`), and the next waits for its answer.
+
+Run and Build are the page's (the worker answers them with a message), as is
+anything else that needs a process.
+
+A client whose files are in memory also uses three more messages:
+`processj/writeFiles { files: [{ uri, text }] }` and
+`processj/deleteFiles { uris }` write and delete files below the workspace
+folders (the files are then analysed again, as after
+`workspace/didChangeWatchedFiles`), `processj/readFile { uri }` → `{ text } | null`
+reads one back, and the server sends `processj/fileWritten { uri, text }` for
+every file it writes: a model from Convert to CSP or a check, a report, an
+export. The Node server does not accept them: its files are the editor's disk.
+
+`test/browser.test.ts` runs the built worker in a Node `vm` context with a Web
+Worker's globals only and drives it as a page does: its diagnostics against the
+Node server's over every example, ELK and the connection, the file messages,
+and FDR and the compiler through the two requests, answered from the
+recorded refines output and with canned compiler output.
+
 ## Layout
 
 ```
 src/server.ts       LSP wiring: documents, caches, debounced compiles, every request handler
+src/connection.ts   the connection to the editor and what the server may do where it runs (connection.browser.ts in a worker)
+src/remote.ts       the compiler and FDR on a client's runner: the jobs sent, and their answers read as a local run's
+src/browser/        the browser build: worker entry, in-memory file system and the other Node stand-ins, the bundled install
 src/parser/ast.ts   AST node types with source spans
 src/parser/parser.ts recursive-descent parser with recovery and "did you mean" suggestions
 src/format.ts       AST printer used for textDocument/formatting
@@ -1561,6 +1633,7 @@ test/fixtures/fdr/  refines output recorded for the explanation and graph tests 
                     test/fdr-recordings.ts reads them, and replays them as a stand-in refines for the server tests
 examples/           one program per diagnostic, self-describing and tested; dining_philosophers.pj is for FDR
 scripts/smoke.js    talks LSP over stdio to a real server, ends with a real program run
+scripts/build-browser.mjs the Web Worker build (dist/browser): the worker, the viewer page and a manifest
 scripts/bench.js    complete in-memory analysis timings on generated large files
 scripts/validate.js builds and runs every program, comparing the checker's verdict against reality
 scripts/parse-diff.js compares the parser's trees with the compiler's -showTree output, on files or generated programs
