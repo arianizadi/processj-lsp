@@ -1537,8 +1537,13 @@ browser IDE, into `dist/browser/`:
 | file | what |
 | --- | --- |
 | `processj-lsp.worker.js` | the server as one classic worker script (minified, with a source map), LSP over the worker's `postMessage` |
-| `graph-viewer.html` | the graph viewer page for `<iframe sandbox="allow-scripts">`: webview mode, fed by `postMessage` as VS Code's panel feeds it; a stand-in for `acquireVsCodeApi()` posts the page's messages to the parent as `{ pjViewer: message }`, starting with `{ type: 'ready' }` |
+| `graph-viewer.html` | the graph viewer page for `<iframe sandbox="allow-scripts">`: webview mode, fed by `postMessage` as VS Code's panel feeds it; a stand-in for `acquireVsCodeApi()` posts the page's messages to the parent as `{ pjViewer: message }`, starting with `{ type: 'ready' }`, and the parent's `{ type: 'theme', theme: 'light' \| 'dark' }` sets the page's theme (an iframe cannot see its embedder's) |
 | `manifest.json` | `{ version, commit, files }` |
+
+`npm install` builds it too (the `prepare` script runs `build:browser`), and
+so does npm when it installs the package from git, where `prepare` is the only
+script it runs: a site can depend on `github:arianizadi/processj-lsp#<branch>`
+and serve `node_modules/processj-lsp/dist/browser`.
 
 It is the same server. `scripts/build-browser.mjs` (esbuild) puts
 `src/connection.browser.ts` in place of `src/connection.ts` and the modules in
@@ -1565,7 +1570,10 @@ then answers two requests (`src/remote.ts`):
   workspace (the model's includes are rewritten to those paths). `frames` are
   the lines `refines --format=framed_json` printed; the server reads them as it
   reads refines' own output, so the explanation, the report, the lenses and the
-  graph are the same as after a local run. Check with FDR and the FDR lenses
+  graph are the same as after a local run. The includes are checked first as
+  for a local run (`src/csp/includes.ts`): in the browser an include must be a
+  relative path to a file of the workspace, and a refused one means the runner
+  is not asked. Check with FDR and the FDR lenses
   are there without a local `refines`, for `.pj` and `.csp` files alike, and a
   `.csp` file is type-checked on open and save.
 - `processj/compile { entry, files, mode: 'check' }` → `{ output, ok, error? }`:
