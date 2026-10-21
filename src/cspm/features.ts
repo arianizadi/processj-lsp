@@ -384,7 +384,7 @@ function summaryOf(report: VerificationReport, fileName: string): [MessageType, 
   const counts = !broken.length
     ? `${passed} of ${total} assertion${plural} ${total === 1 ? 'holds' : 'hold'}`
     : passed + failed.length === 0
-      ? `${total === 1 ? 'the assertion was' : `none of the ${total} assertions was`} decided`
+      ? `${total === 1 ? 'the assertion was not' : `none of the ${total} assertions was`} decided`
       : `${passed + failed.length} of ${total} assertion${plural} decided, ${passed} ${passed === 1 ? 'holds' : 'hold'}`;
   if (failed.length) return [MessageType.Warning, `FDR, ${fileName}: ${counts}; ${failed[0].label}: ${failed[0].counterexample?.summary ?? failed[0].message ?? 'fails'}`];
   if (broken.length) return [MessageType.Warning, `FDR, ${fileName}: ${counts}; ${broken[0].label}: ${broken[0].message ?? broken[0].status}`];

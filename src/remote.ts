@@ -129,12 +129,16 @@ export function refinesJob(model: RefinesModel, project: Project): { name: strin
   return { name, model: text, files: [...files.values()] };
 }
 
+/** What a runner's answer with no frames and no reason means: refines printed nothing it could read. */
+export const NO_FDR_ANSWER = 'FDR gave no answer: the runner returned none of its output';
+
 /** The FdrRun a runner's answer stands for: its frames are the lines refines printed. */
 export function fdrRunFromFrames(result: RunRefinesResult, durationMs: number): FdrRun {
   const frames = Array.isArray(result?.frames) ? result.frames : [];
   const parsed = parseFramedJson(frames.map((frame) => JSON.stringify(frame) ?? '').join('\n'));
   // The runner's reason for failing (a timeout, no FDR, a refused include) is said as refines' stderr would be.
-  const error = typeof result?.error === 'string' ? result.error : '';
+  // refines always prints a frame, so none at all is no answer, whatever the exit code (not "decided").
+  const error = typeof result?.error === 'string' && result.error ? result.error : frames.length ? '' : NO_FDR_ANSWER;
   return { ...parsed, timedOut: false, aborted: false, exitCode: typeof result?.exitCode === 'number' ? result.exitCode : null, durationMs, stderr: error };
 }
 

@@ -6,7 +6,9 @@
 import assert from 'node:assert/strict';
 import * as path from 'node:path';
 import { test } from 'node:test';
-import { compileJob, compilerOutput, fdrRunFromFrames, refinesJob, remoteOptions, remoteRefines, type Project, type RunRefinesParams, type RunRefinesResult } from '../src/remote';
+import { CspmDocument } from '../src/cspm/document';
+import { explainCspm } from '../src/cspm/explain';
+import { compileJob, compilerOutput, fdrRunFromFrames, NO_FDR_ANSWER, refinesJob, remoteOptions, remoteRefines, type Project, type RunRefinesParams, type RunRefinesResult } from '../src/remote';
 
 const ROOT = path.resolve('/w');
 const at = (...parts: string[]): string => path.join(ROOT, ...parts);
@@ -51,6 +53,17 @@ test('a runner\'s frames are read as refines\' output; its failure as refines\' 
   assert.deepEqual(run, { results: [{ assertion: 'P :[deadlock free]', passed: false, errors: [], states: 6, transitions: 9, counterexamples: [{ type: 'deadlock' }] }], errors: [], warnings: [], eventMap: { 1: 'a' }, version: '4.2.7', timedOut: false, aborted: false, exitCode: 0, durationMs: 42, stderr: '' });
   const failed = fdrRunFromFrames({ exitCode: -1, frames: [], error: 'Stopped: took longer than 120s.' }, 1);
   assert.deepEqual({ results: failed.results, errors: failed.errors, stderr: failed.stderr, exitCode: failed.exitCode }, { results: [], errors: [], stderr: 'Stopped: took longer than 120s.', exitCode: -1 });
+  // refines always prints a frame: none, even with exit code 0, is no answer rather than nothing to report.
+  const silent = fdrRunFromFrames({ exitCode: 0, frames: [] }, 1);
+  assert.deepEqual({ results: silent.results, errors: silent.errors, stderr: silent.stderr, exitCode: silent.exitCode }, { results: [], errors: [], stderr: NO_FDR_ANSWER, exitCode: 0 });
+});
+
+test('an FDR check the runner answered with no frames is not decided', () => {
+  const doc = new CspmDocument('file:///w/p.csp', 'channel a\nP = a -> Q\nassert P :[deadlock free]\n');
+  const report = explainCspm({ uri: doc.uri, text: doc.text, file: doc.file, globals: doc.globals, viewFor: (a) => doc.viewForAssertion(a), run: fdrRunFromFrames({ exitCode: 0, frames: [] }, 1) });
+  assert.equal(report.checks.length, 1);
+  assert.equal(report.checks[0].status, 'error');
+  assert.match(report.checks[0].message ?? '', /FDR gave no answer/);
 });
 
 test('a remote refines reports results as they would arrive, and a cancelled check ends without waiting', async () => {
