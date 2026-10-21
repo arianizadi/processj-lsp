@@ -1417,7 +1417,14 @@ async function runRemoteCheck(uri: string, signal: AbortSignal): Promise<void> {
   const fileOf = (reported: string): string => path.isAbsolute(reported) ? reported : path.dirname(reported) === '.' ? path.join(path.dirname(sourcePath), reported) : path.join(job.root, reported);
   const output = parseCompilerOutput(compilerOutput(result.output), '');
   const compiled = { sourcePath, yieldSourceMap: augmented.sourceMap };
-  const diagnostics = output.diagnostics.map((d) => makeDiagnostic(current, remapCompilerDiagnostic(compiled, d.file ? { ...d, file: fileOf(d.file) } : d), sourcePath));
+  // A project with imports is compiled on the runner merged into one unit, whose lines it maps back to their
+  // files. A line past the end of this document was mapped wrongly: it is said at the top, not put on a line.
+  const lines = current.lineCount - (current.getText().endsWith('\n') ? 1 : 0);
+  const diagnostics = output.diagnostics.map((d) => {
+    const raw = remapCompilerDiagnostic(compiled, d.file ? { ...d, file: fileOf(d.file) } : d);
+    if (raw.line < lines || !compilerDiagnosticTargetsBuffer(compiled, raw)) return makeDiagnostic(current, raw, sourcePath);
+    return makeDiagnostic(current, { ...raw, line: 0, startCol: undefined, endCol: undefined, message: `The compiler reports this at line ${raw.line + 1}, past the end of ${path.basename(sourcePath)}: ${raw.message}` }, sourcePath);
+  });
   if (output.crash) connection.console.error(`compiler crash on ${sourcePath}: ${output.crash}`);
   connection.console.log(`checked ${path.basename(sourcePath)} on the runner in ${Date.now() - started} ms: ${diagnostics.length} compiler diagnostic(s)`);
   compilerDiags.set(uri, { version, diagnostics });

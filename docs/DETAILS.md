@@ -1504,6 +1504,17 @@ install directory; only `codeLens` needs a restart because it is a capability.
 | `fdrWorkers`    | `1`     | `refines`' search workers: `1` finds the same deadlock and runtime-error counterexamples on every check (a termination or determinism counterexample can still vary); `0` uses every core, faster on big models |
 | `fdrShowGraph`  | `always` | after Check with FDR, open the graph on the result: `always`, `onFailure` (only a defect, a partial deadlock or a runtime error), or `never` (the text report opens instead, as it does whenever the graph is not shown) |
 
+The compiler runs without being asked (on open, after `debounceMs`, and on
+save; on every edit with `checkOnChange`) only for files inside a workspace
+folder (`rootUri` or `workspaceFolders`, links resolved). A file opened from
+elsewhere, such as a download or another project, gets the server's own
+analysis but no compiler diagnostics, and the log says so once
+(`not running the compiler on <file>: it is outside the workspace`). Run and
+Build still compile it. An editor started with no workspace folder at all
+(Neovim or Emacs on a single file) compiles every file, as before. Neovim's
+setup takes the folder with `.git` above a file as its root (`root_markers`),
+so a file in no repository has no root and is compiled as before.
+
 ## How diagnostics work
 
 The compiler has no library API and no "check only" mode, so the server writes
@@ -1581,8 +1592,12 @@ then answers two requests (`src/remote.ts`):
   annotations it needs) and the workspace files it imports, placed where the
   compiler resolves the imports from. The output is parsed as a local run's
   and published as compiler diagnostics. The server asks 1.5 s after a file is
-  opened or last edited, and when it is saved, one request at a time per file:
+  opened or last edited, and when it is saved, one request at a time per file
+  (inside the workspace only, as above):
   an edit cancels a request (`$/cancelRequest`), and the next waits for its answer.
+  The runner compiles a project with imports merged into one unit and maps
+  each message back to its file and line; a message at a line past the end of
+  the file is shown at its top, saying where the compiler put it.
 
 Run and Build are the page's (the worker answers them with a message), as is
 anything else that needs a process.

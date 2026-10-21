@@ -347,6 +347,8 @@ test('compiler diagnostics come from processj/compile: after a pause in typing, 
     const second = await worker.waitFor((m) => m.method === 'processj/compile', 5_000);
     assert.equal(second.params.files.find((file: any) => file.path === 'use_import.pj').text, edited);
     const line = edited.split('\n').findIndex((entry) => entry.includes('area('));
+    // A line the file does not have (the runner mapped a merged project's line wrongly): said at the top.
+    const past = edited.split('\n').length + 5;
     answers[1].answer({
       output: [
         '\x1b[2mprocessjc use_import.pj\x1b[0m',
@@ -354,6 +356,8 @@ test('compiler diagnostics come from processj/compile: after a pause in typing, 
         'Error number: 3058',
         'lib/geometry.pj:5: Something in the library.',
         'Error number: 3029',
+        `use_import.pj:${past}: No suitable procedure found.`,
+        'Error number: 3047',
         '\x1b[2mcompilation failed\x1b[0m',
         '',
       ].join('\n'),
@@ -361,10 +365,35 @@ test('compiler diagnostics come from processj/compile: after a pause in typing, 
     });
     const published = await worker.waitFor((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri && m.params.version === 2 && m.params.diagnostics.some((d: any) => d.source === 'processj'));
     const compiler = published.params.diagnostics.filter((d: any) => d.source === 'processj').map((d: any) => `${d.range.start.line} ${d.code} ${d.message}`);
-    assert.deepEqual(compiler, [`${line} 3058 Cannot assign value of type double to variable of type int.`, '0 3029 In geometry.pj:5: Something in the library.']);
+    assert.deepEqual(compiler, [
+      `${line} 3058 Cannot assign value of type double to variable of type int.`,
+      '0 3029 In geometry.pj:5: Something in the library.',
+      `0 3047 The compiler reports this at line ${past}, past the end of use_import.pj: No suitable procedure found.`,
+    ]);
     assert.ok(!worker.messages.some((m) => m.method === 'processj/compile' && m.params.files.some((file: any) => file.path === 'unrelated.pj')));
   } finally {
     for (const pending of answers) pending.answer({ output: '', ok: true });
+    await worker.close();
+  }
+});
+
+test('the compiler runs unasked only on files inside the workspace, and the log says why for one outside', async () => {
+  const { worker } = await startWorker();
+  const asked: string[] = [];
+  worker.onRequest('processj/compile', (params) => {
+    asked.push(params.entry);
+    return { output: '', ok: true };
+  });
+  try {
+    const text = 'public void main(string[] args) { }\n';
+    await open(worker, 'file:///elsewhere/outside.pj', text);
+    await worker.waitFor((m) => m.method === 'window/logMessage' && /^not running the compiler on \/elsewhere\/outside\.pj: it is outside the workspace/.test(m.params.message), 5_000);
+    await open(worker, `${WORKSPACE}/inside.pj`, text);
+    // Both waited out the same pause; only the file inside the workspace was sent.
+    await worker.waitFor((m) => m.method === 'processj/compile', 5_000);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.deepEqual(asked, ['inside.pj']);
+  } finally {
     await worker.close();
   }
 });
