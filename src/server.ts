@@ -90,6 +90,7 @@ import { containsPosition, localRenameConflict, namedTypeSpans, variableAt, vari
 import { build, formatReport, run } from './pipeline';
 import { buildConcurrencyGraph, type ConcurrencyGraph } from './concurrency';
 import { LiveViewerServer, publishVerification, verificationStore } from './graph/live';
+import { layoutSizeProblem } from './graph/layout';
 import { pathKey, stuckForGood } from './graph/overlay';
 import type { ViewerFocus } from './graph/payload';
 import { renderViewerHtml } from './graph/render-html';
@@ -2432,6 +2433,8 @@ async function stateMachine(uri: string, request: MachineRequest): Promise<Viewe
   const machine = machines.find((entry) => refOfMachine(entry) === request.ref);
   const incomplete = model.unsupported.length ? `the model is incomplete (${model.unsupported[0].message}${model.unsupported.length > 1 ? `, and ${model.unsupported.length - 1} more` : ''})` : undefined;
   if (!machine) return { key, error: `No state machine for this process${incomplete ? `: ${incomplete}` : ': the model does not run it'}.` };
+  const tooLarge = layoutSizeProblem(machine.states.length + 1, machine.transitions.length + 1);
+  if (tooLarge) return { key, error: `This state machine is too large to draw: ${tooLarge}.` };
   let layouts = machineLayouts.get(model);
   if (!layouts) machineLayouts.set(model, (layouts = new Map()));
   let layout = layouts.get(machine.key);

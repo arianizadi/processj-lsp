@@ -398,7 +398,8 @@ class Translation {
         if (range) {
           const lo = Number(range[1]);
           const hi = Number(range[2]);
-          if (lo <= hi) out.range = { lo, hi };
+          if (!Number.isSafeInteger(lo) || !Number.isSafeInteger(hi)) this.warnings.push({ message: `//@csp int ${range[1]}..${range[2]} has a bound too large to model; ignored`, at });
+          else if (lo <= hi) out.range = { lo, hi };
           else this.warnings.push({ message: `//@csp int ${lo}..${hi} is an empty range; ignored`, at });
           continue;
         }
@@ -973,12 +974,14 @@ class Translation {
     const { lo, hi } = this.data;
     const proc = root.decl.name.name;
     const names = (indices: number[]): string => listText(indices.map((i) => root.params[i].name));
+    // One value more than a parameter may take is enough to know there are too many combinations (checked below).
+    const most = MAX_INSTANCES * 4;
     const domain = (i: number): Array<number | boolean> | undefined => {
       const p = root.params[i];
       // An array of no channels gives no network to check (and this ProcessJ build hangs on its empty par for).
-      if (p.array) return range(1, Math.max(1, hi));
+      if (p.array) return range(1, Math.min(Math.max(1, hi), most + 1));
       if (p.type.k === 'bool') return [false, true];
-      return p.type.k === 'int' ? range(lo, hi) : undefined;
+      return p.type.k === 'int' ? range(lo, Math.min(hi, lo + most)) : undefined;
     };
     const fixed = fixedParams(root);
     const modelled = (indices: number[]): string => {

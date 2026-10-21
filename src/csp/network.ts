@@ -367,7 +367,13 @@ class Builder {
       if (local.region !== region || !local.array) continue;
       leaf.declared.add(local.cspm);
       const size = evaluate(local.array.size, this.known(inst, iterValues), this.input.intRange);
-      if (typeof size === 'number' && size >= 0) {
+      if (typeof size === 'number' && size > MAX_ARRAY_CHANNELS) {
+        // Checked before anything is built for its elements.
+        if (!this.unknownSizes.has(local)) {
+          this.unknownSizes.add(local);
+          this.unsupported.push({ message: `the channel array '${local.name}' has ${size} channels, more than the model lays out (${MAX_ARRAY_CHANNELS}): it is not modelled`, proc, at: local.ident.span });
+        }
+      } else if (typeof size === 'number' && size >= 0) {
         iterValues.set(local.array.len, size);
         this.arraySizes.set(local, Math.max(size, this.arraySizes.get(local) ?? 0));
       } else if (!this.unknownSizes.has(local)) {
@@ -498,7 +504,7 @@ class Builder {
       const r = par.regions[0];
       const slot = slots[0];
       const iter = par.iter!;
-      const values = iter.values ?? this.knownIterations(iter, this.known(inst, iterValues)) ?? range(this.input.intRange.lo, this.input.intRange.hi);
+      const values = iter.values ?? this.knownIterations(iter, this.known(inst, iterValues)) ?? range(this.input.intRange.lo, this.input.intRange.hi, this.input.maxProcesses);
       this.maxEnroll = Math.max(this.maxEnroll, values.length);
       const stmt = par.stmt as A.ForStmt;
       for (const v of values) {
@@ -717,7 +723,7 @@ class Builder {
     const hi = evaluate(iter.hi, env, this.input.intRange);
     if (typeof lo !== 'number' || typeof hi !== 'number') return undefined;
     const { lo: L, hi: H } = this.input.intRange;
-    return range(Math.max(lo, L), Math.min(hi, H));
+    return range(Math.max(lo, L), Math.min(hi, H), this.input.maxProcesses);
   }
 
   /** Record what this instance's fork of `par` carries (Network.forkDomains). */
@@ -1124,6 +1130,9 @@ class Builder {
 /** Deepest recursion through par the network unfolds (each level is at least one more process). */
 const MAX_UNFOLDING = 200;
 
+/** Most channels of one array the model lays out (as many as the evaluator's largest set). */
+const MAX_ARRAY_CHANNELS = 4096;
+
 class TooBig extends Error {
   constructor(readonly max: number, readonly recursion?: string) {
     super(`the program has more than ${max} processes${recursion ? ` (unfolding the recursion of '${recursion}' through par)` : ''}`);
@@ -1254,8 +1263,12 @@ function pathKey(path: ProcessPath): string {
   return path.map((s) => `${s.kind}@${s.site.span.start.line}:${s.site.span.start.col}${s.index !== undefined ? `[${s.index}]` : ''}`).join('/');
 }
 
-function range(lo: number, hi: number): number[] {
-  const out: number[] = [];
-  for (let i = lo; i <= hi; i++) out.push(i);
-  return out;
+/**
+ * The iterations `lo..hi` of a par for. Each is a process of its own, so a
+ * range with more than `max` values is too big before any of it is built.
+ */
+function range(lo: number, hi: number, max: number): number[] {
+  const count = Math.max(0, hi - lo + 1);
+  if (count > max) throw new TooBig(max);
+  return Array.from({ length: count }, (_, k) => lo + k);
 }

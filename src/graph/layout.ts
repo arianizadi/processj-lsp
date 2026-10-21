@@ -141,8 +141,40 @@ function elk(): Elk {
   return elkInstance;
 }
 
+/**
+ * Largest graph handed to the layout engine. Its time grows much faster than
+ * the graph (a dense view of 500 boxes and 1500 arrows takes seconds), and it
+ * runs in this thread with no deadline: a larger view gets the plain
+ * arrangement (fallbackLayout) instead.
+ */
+export const MAX_LAYOUT = Object.freeze({ nodes: 1500, edges: 1000 });
+
+/** Why a graph of this size is not given to the layout engine, or undefined when it may be. */
+export function layoutSizeProblem(nodes: number, edges: number): string | undefined {
+  if (nodes <= MAX_LAYOUT.nodes && edges <= MAX_LAYOUT.edges) return undefined;
+  return `${nodes} boxes and ${edges} arrows, more than the layout engine is given (${MAX_LAYOUT.nodes} boxes, ${MAX_LAYOUT.edges} arrows)`;
+}
+
+function elkSize(graph: ElkNode): { nodes: number; edges: number } {
+  let nodes = 0;
+  let edges = 0;
+  const stack: ElkNode[] = [graph];
+  while (stack.length) {
+    const node = stack.pop()!;
+    edges += node.edges?.length ?? 0;
+    for (const child of node.children ?? []) {
+      nodes++;
+      stack.push(child);
+    }
+  }
+  return { nodes, edges };
+}
+
 /** Lay out any graph with the same in-process ELK the views use (the state machines do). */
 export function runElk(graph: ElkNode): Promise<ElkNode> {
+  const size = elkSize(graph);
+  const problem = layoutSizeProblem(size.nodes, size.edges);
+  if (problem) return Promise.reject(new Error(`too large to lay out: ${problem}`));
   return elk().layout(graph);
 }
 
@@ -175,6 +207,9 @@ const GROUP_PADDING = `[top=${METRICS.groupHeader + 14},left=22,bottom=22,right=
 
 /** Lay out one view; `overrides` replaces individual ELK options (for experiments and tests). */
 export async function layoutView(view: NetworkView, overrides: Readonly<Record<string, string>> = {}): Promise<ViewLayout> {
+  // Checked before the graph is built for ELK.
+  const problem = layoutSizeProblem(view.nodes.length, view.edges.length);
+  if (problem) throw new Error(`too large to lay out: ${problem}`);
   const children = new Map<string, NetNode[]>();
   for (const node of view.nodes) {
     const key = node.parent ?? '';
@@ -222,7 +257,7 @@ export async function layoutView(view: NetworkView, overrides: Readonly<Record<s
     labels: edge.label ? [{ id: `${edge.id}:label`, text: edge.label, ...edgeLabelSize(edgeLabelText(edge)), layoutOptions: { 'elk.edgeLabels.inline': edge.from === edge.to ? 'false' : 'true', 'elk.edgeLabels.placement': 'CENTER' } }] : undefined,
   }));
   const graph: ElkNode = { id: `${view.id}:graph`, layoutOptions: { ...LAYOUT_OPTIONS, ...overrides }, children: roots, edges };
-  const result = await elk().layout(graph);
+  const result = await runElk(graph);
   return collect(view, result, depth, reversed);
 }
 

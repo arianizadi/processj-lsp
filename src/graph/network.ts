@@ -305,13 +305,35 @@ function viewIdOf(decl: A.ProcDecl, kind: NetworkView['kind']): string {
   return kind === 'program' ? 'view:program' : `view:${decl.name.name}:${decl.name.span.start.line}:${decl.name.span.start.col}`;
 }
 
+/**
+ * Processes a view holds at most, whatever the expansion depth: a program
+ * with more (thousands of explicit par branches) is not drawn, since the
+ * layout and the page could not cope with it.
+ */
+export const MAX_VIEW_PROCESSES = 1000;
+
+/** Thrown by an elaboration as soon as it passes its process limit, before it builds more. */
+class ViewTooLarge extends Error {}
+
 /** One view, shrinking the expansion depth until it fits the process budget. */
 function buildView(decl: A.ProcDecl, kind: NetworkView['kind'], shared: SharedAnalysis, options: NetworkOptions): NetworkView {
   const budget = options.maxProcesses ?? 100;
   let depth = options.maxDepth ?? 4;
   for (;;) {
-    const elaborator = new Elaborator(shared, depth);
-    const view = elaborator.view(decl, kind);
+    // A depth that passes the budget is given up as soon as it does; at depth 0 only the hard limit stops it.
+    const limit = depth === 0 ? Math.max(budget, MAX_VIEW_PROCESSES) : budget;
+    const elaborator = new Elaborator(shared, depth, limit);
+    let view: NetworkView;
+    try {
+      view = elaborator.view(decl, kind);
+    } catch (error) {
+      if (!(error instanceof ViewTooLarge)) throw error;
+      if (depth > 0) {
+        depth--;
+        continue;
+      }
+      return new Elaborator(shared, 0, limit).tooLarge(decl, kind);
+    }
     if (elaborator.processCount <= budget || depth === 0) {
       if (elaborator.processCount > budget) view.notes.push(`This view has ${elaborator.processCount} processes; calls are not expanded.`);
       else if (depth < (options.maxDepth ?? 4) && elaborator.collapsedForDepth) view.notes.push(`Calls nested deeper than ${depth} level${depth === 1 ? '' : 's'} are collapsed to keep the view readable; open the procedure's own view for its network.`);
@@ -1000,6 +1022,12 @@ function spawnCount(statements: readonly A.Stmt[]): number {
 /** How many stages of a recursion through par the drawing unfolds below its first call. */
 const MAX_DRAWN_STAGES = 8;
 
+/**
+ * Most channels of an array drawn for one element picked at run time (each
+ * gets an arrow), and most ports of a channel-array parameter.
+ */
+const MAX_ARRAY_CHOICE = 128;
+
 interface Frame {
   decl: A.ProcDecl;
   unit: NetworkUnit;
@@ -1069,30 +1097,51 @@ class Elaborator {
   /** The invocation a branch box stands for, while its statement is walked. */
   private ownedCall?: A.Invocation;
 
-  constructor(private readonly shared: SharedAnalysis, private readonly maxDepth: number) {
+  constructor(private readonly shared: SharedAnalysis, private readonly maxDepth: number, private readonly maxProcesses = Infinity) {
     this.hazards = new Map();
     for (const fact of shared.root.checked.channels) if (fact.hazard) this.hazards.set(fact.variable, fact.hazard);
   }
 
-  view(decl: A.ProcDecl, kind: NetworkView['kind']): NetworkView {
-    const unit = this.shared.root;
-    const uri = unit.uri;
+  private rootNode(decl: A.ProcDecl, kind: NetworkView['kind']): NetNode {
     const viewId = viewIdOf(decl, kind);
-    const rootId = `${viewId === 'view:program' ? 'n' : `n${decl.name.span.start.line}_${decl.name.span.start.col}`}:root`;
-    const signature = shortSignature(decl);
-    const root = this.addNode({
-      id: rootId,
+    return this.addNode({
+      id: `${viewId === 'view:program' ? 'n' : `n${decl.name.span.start.line}_${decl.name.span.start.col}`}:root`,
       kind: 'process',
-      label: kind === 'program' ? decl.name.name : signature,
+      label: kind === 'program' ? decl.name.name : shortSignature(decl),
       name: decl.name.name,
       badge: kind === 'program' ? undefined : 'proc',
-      source: { uri, span: decl.name.span },
+      source: { uri: this.shared.root.uri, span: decl.name.span },
       confidence: 'exact',
       path: [],
       procedure: decl.name.name,
       facts: this.procedureFacts(decl),
       operations: [],
     });
+  }
+
+  /** A view with more processes than can be drawn: its root alone, and a note saying why. */
+  tooLarge(decl: A.ProcDecl, kind: NetworkView['kind']): NetworkView {
+    const root = this.rootNode(decl, kind);
+    return {
+      id: viewIdOf(decl, kind),
+      kind,
+      procedure: decl.name.name,
+      label: kind === 'program' ? `${decl.name.name} (whole program)` : shortSignature(decl),
+      source: { uri: this.shared.root.uri, span: decl.name.span },
+      nodes: [root],
+      edges: [],
+      channels: [],
+      notes: [`This view has more than ${this.maxProcesses} processes even with no call expanded: it is too large to draw. Open the view of a procedure it calls.`],
+      instances: [],
+    };
+  }
+
+  view(decl: A.ProcDecl, kind: NetworkView['kind']): NetworkView {
+    const unit = this.shared.root;
+    const uri = unit.uri;
+    const viewId = viewIdOf(decl, kind);
+    const signature = shortSignature(decl);
+    const root = this.rootNode(decl, kind);
     const frame: Frame = { decl, unit, bindings: new Map(), instance: [], container: root.id, stack: [decl], depth: 0 };
     // A procedure whose arguments decide its network is drawn as it is checked: with the values its calls give.
     const args = kind === 'procedure' ? this.shared.options.procedureArguments?.(decl) : undefined;
@@ -1179,7 +1228,7 @@ class Elaborator {
       if (!variable) return;
       const type = variable.type;
       const length = args?.arrays[param.name.name];
-      if (isChanArrayType(type) && length !== undefined) {
+      if (isChanArrayType(type) && length !== undefined && length <= MAX_ARRAY_CHOICE) {
         // An array of channels of a known length: each channel is a port of its own (`chans[2]`).
         const array: ChanArray = { variable, unit: frame.unit, owner: [], container: frame.container, size: length };
         const end = type.k === 'array' && type.elem.k === 'chan' ? type.elem.end : undefined;
@@ -1271,6 +1320,8 @@ class Elaborator {
       if (size === undefined) return { unknown: exprLabel(expr) };
       if (typeof index !== 'number') {
         if (size === 0) return { unknown: exprLabel(expr) };
+        // Too many to draw one by one: one unknown element, not an arrow to each (the length comes from the source).
+        if (size > MAX_ARRAY_CHOICE) return { unknown: `${exprLabel(expr)} (one of the ${size} channels of '${array.array.variable.name}', too many to draw one by one)` };
         return { choice: Array.from({ length: size }, (_, k) => this.elementChannel(array.array, k).channel.id), label: `${array.array.variable.name}[${this.indexText(expr.index, frame)}]` };
       }
       return { channel: this.elementChannel(array.array, index).channel.id };
@@ -1634,7 +1685,7 @@ class Elaborator {
    * is itself a par is drawn as that par's container.
    */
   private processFor(statement: A.Stmt, role: 'branch' | 'iteration' | 'stmt', index: number, path: ProcessPath, frame: Frame, container: string, confidence: Confidence, env: Map<VarInfo, ConstValue>, loop?: { replicated?: { count?: number; text: string }; loop: A.ForStmt; bound: string; value?: string }): string {
-    this.processCount++;
+    if (++this.processCount > this.maxProcesses) throw new ViewTooLarge();
     let inner = statement;
     while (inner.kind === 'Block' && inner.stmts.length === 1) inner = inner.stmts[0];
     const uri = frame.unit.uri;

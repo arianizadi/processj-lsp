@@ -383,7 +383,10 @@ class ViewBuilder {
           continue;
         case 'if': {
           const cond = evaluate(current.cond, at);
-          if (cond.t !== 'bool') return { wrappers: [] };
+          if (cond.t !== 'bool') {
+            if (cond.t === 'unknown' && cond.limit) this.note(limitNote(this.text(current.cond.span), cond.why));
+            return { wrappers: [] };
+          }
           current = cond.v ? current.then : current.else;
           continue;
         }
@@ -581,7 +584,10 @@ class ViewBuilder {
     for (let guard = 0; guard < 16; guard++) {
       if (expr.k === 'if') {
         const cond = evaluate(expr.cond, env);
-        if (cond.t !== 'bool') break;
+        if (cond.t !== 'bool') {
+          if (cond.t === 'unknown' && cond.limit) this.note(limitNote(this.text(expr.cond.span), cond.why));
+          break;
+        }
         expr = cond.v ? expr.then : expr.else;
       } else if (expr.k === 'let') {
         env = letEnv(expr.decls, env);
@@ -866,6 +872,11 @@ class ViewBuilder {
 }
 
 /** Whether a process term is a composition the view would unfold (through hiding, renaming and the like). */
+/** Said when a condition was too large or too long to evaluate (the evaluator's bounds), not merely open. */
+function limitNote(condition: string, why: string): string {
+  return `The condition ${condition} was not evaluated (${why}): the process is drawn as written.`;
+}
+
 function composes(e: Ex, depth = 0): boolean {
   if (depth > 16) return false;
   switch (e.k) {
