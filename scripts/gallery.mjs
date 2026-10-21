@@ -82,13 +82,18 @@ const NOTES = {
   'test/fixtures/fifo/blocks_alt.pj': { title: 'FIFO, broken: a stage that never forwards', tags: ['deadlock'] },
   'test/fixtures/fifo/blocks_oob.pj': { title: 'FIFO, broken: one past the end' },
   'test/fixtures/fifo/blocks_skip.pj': { title: 'FIFO, broken: one stage short', tags: ['deadlock'] },
+  // `pj/par-for-body` says how this compiler runs a par for body, not that it cannot build it: this one builds
+  // and runs, and prints x=0 twice (as test/differential/par_for_body_statements.pj, the same program, says).
+  'examples/par_for_body.pj': { outcome: 'runs-wrong' },
+  // The file's comment says what stock ProcessJ does; the runtime of the IDE's runner waits without spinning.
+  'examples/deadlock_read.pj': { description: 'Nothing in `main` ever writes `c` or passes it to another process, so this read blocks forever. On the IDE\'s runner the program waits, idle, until the time limit; on ProcessJ\'s unpatched runtime its scheduler also keeps a core busy all that time.' },
   'examples/compiler_limits.pj': { description: 'Valid ProcessJ that this compiler cannot build: a record that contains itself, assigning null, a break inside a par branch, and channel reads where the compiler does not take them. The comment on each line says why.' },
   'examples/use_import.pj': { title: 'Importing a project file', tags: ['runs'] },
   'examples/yield_through_calls.pj': { title: 'Yield through calls' },
   'examples/bug_lookalikes.pj': { title: 'Compiler bug look-alikes' },
   'examples/pri_alt_skip.pj': { title: 'Pri alt with skip first' },
   'test/fixtures/fifo/blocks.pj': { title: 'FIFO of stages', description: 'A FIFO of forwarding stages joined by a channel array and started with par for, next to one built by recursion (altFIFO): the working version of the three broken ones beside it.' },
-  'test/fixtures/fifo/unbound.pj': { title: 'Networks set by arguments' },
+  'test/fixtures/fifo/unbound.pj': { title: 'Networks set by arguments', outcome: 'compiler-limit', description: 'Procedures whose arguments decide their network, and no call from main fixes them: checked on their own with every modelled value that elaborates, or with what a //@csp check names. This compiler cannot build it: javac rejects the Java it writes for the read that opens the par for body in stages ("illegal start of expression").' },
   'test/fixtures/verification/commstime_bounded.pj': { title: 'CommsTime, bounded', description: 'CommsTime with a consumer that stops after three values: the ring keeps going, delta\'s next write finds no reader, and everything stops. Check it with FDR to see the deadlock form.' },
   'test/fixtures/showtree/shapes.pj': { title: 'A tour of the syntax', description: 'Declarations, statements and expressions of nearly every form ProcessJ has, in a few lines (the parser\'s test program; it has no main).' },
   'test/fixtures/processj/alttest.pj': { title: 'Alt with skip', description: 'An alt that takes a value from a writer or, when none is ready, skips.' },
@@ -128,7 +133,7 @@ const NOTES = {
   'test/fixtures/processj/sharedread.pj': { title: 'Shared read end', outcome: 'compiler-limit', description: 'Three readers on the shared read end of a channel, one writer. This compiler crashes on it while writing the Java ("no such attribute: type"), so it cannot build it.' },
   'test/fixtures/processj/sharedwrite.pj': { title: 'Shared write end', description: 'Three writers on the shared write end of a channel, one reader.' },
   'test/fixtures/processj/silly.pj': { title: 'Reads in a loop condition', description: 'A for loop whose condition reads two channels, in a procedure without main.' },
-  'test/fixtures/processj/simple.pj': { title: 'Simple', description: 'A procedure that reads a channel, with most of the program commented out.' },
+  'test/fixtures/processj/simple.pj': { title: 'Simple', outcome: 'deadlocks', description: 'A procedure that reads a channel, with most of the program commented out. main hands it a channel that nothing writes, so the read waits for good: it builds, but never finishes.' },
   'test/fixtures/processj/simplepj.pj': { title: 'Simple rendezvous', outcome: 'error', description: `The basic rendezvous between two processes. ${OLD_SYNTAX}` },
   'test/fixtures/processj/SwitchDemo.pj': { title: 'Switch', description: 'Nested switch statements with empty cases, break and default.' },
   'test/fixtures/processj/test22.pj': { title: 'Protocols and records', description: 'Protocols with record fields and a record with a protocol field.' },
@@ -162,7 +167,7 @@ const OUTCOMES = {
 const EXPECT_TAGS = [
   [/^pj\/(par-deadlock|channel-self-deadlock|channel-no-writer|channel-no-reader|starving-loop|shared-unlocked-end)$/, 'deadlock'],
   [/^pj\/(type\/|channel-write-type$|channel-direction$)/, 'type error'],
-  [/^pj\/(compiler-limit|read-placement|call-as-condition|par-for-body)$/, 'compiler limit'],
+  [/^pj\/(compiler-limit|read-placement|call-as-condition)$/, 'compiler limit'],
   [/^pj\/parallel-usage$/, 'data race'],
   [/^pj\/needs-yield-annotation$/, 'yield'],
 ];

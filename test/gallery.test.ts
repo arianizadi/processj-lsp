@@ -160,6 +160,26 @@ test('categories by where a program lives; tags from its expect and outcome line
     assert.match(entry.description, said, stem);
   }
   assert.match(byId.get('test/differential/break_in_par.pj')!.description, /cannot build/);
+  // Measured as run jobs on the runner: unbound.pj has a main but javac rejects it, simple.pj waits for a write
+  // that never comes, and a par for body of two statements builds and runs as two processes (x=0 twice).
+  const unbound = byId.get('test/fixtures/fifo/unbound.pj')!;
+  assert.ok(unbound.entry && unbound.tags.includes('compiler limit') && !unbound.tags.includes('runs'), unbound.tags.join(', '));
+  assert.match(unbound.description, /cannot build it: javac rejects the Java it writes .*\("illegal start of expression"\)/);
+  const simple = byId.get('test/fixtures/processj/simple.pj')!;
+  assert.ok(simple.entry && simple.tags.includes('deadlock'), simple.tags.join(', '));
+  assert.match(simple.description, /never finishes/);
+  for (const id of ['examples/par_for_body.pj', 'test/differential/par_for_body_statements.pj']) {
+    const entry = byId.get(id)!;
+    assert.ok(entry.tags.includes('runs wrong') && !entry.tags.includes('compiler limit'), `${id}: ${entry.tags.join(', ')}`);
+  }
+  // pj/par-for-body says how a par for body runs, not that it does not build: par_for_shared builds too (and deadlocks).
+  const parForShared = byId.get('examples/par_for_shared.pj')!;
+  assert.ok(parForShared.tags.includes('deadlock') && !parForShared.tags.includes('compiler limit'), parForShared.tags.join(', '));
+  // On the runner's patched runtime a deadlocked program waits idle; only stock ProcessJ keeps a core busy.
+  const deadlockRead = byId.get('examples/deadlock_read.pj')!;
+  assert.ok(deadlockRead.tags.includes('deadlock'), deadlockRead.tags.join(', '));
+  assert.match(deadlockRead.description, /blocks forever\. On the IDE's runner the program waits, idle, until the time limit/);
+  for (const entry of gallery.entries) assert.doesNotMatch(entry.description, /pins a core|\bspins?\b/, entry.id);
   // A description that already says how it went is not followed by a sentence that says it again.
   assert.equal(byId.get('test/differential/alt_per_par_branch.pj')!.description, 'One alt per par branch is one alt per generated class, which builds and runs.');
   assert.match(byId.get('test/differential/shared_writers_locked.pj')!.description, /single reader process\. It builds and runs as written\.$/);
