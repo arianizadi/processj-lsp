@@ -60,6 +60,9 @@ const FEATURED = [
 /** The order of the Start here entries: the featured ones first, then by title. */
 const START_ORDER = FEATURED;
 
+/** Five classic programs are in ProcessJ's old syntax, which the runner's compiler does not parse. */
+const OLD_SYNTAX = 'It is written for an older ProcessJ, with `proc` before its procedures: this compiler stops at the first one with a syntax error.';
+
 /** Titles, descriptions, tags and outcomes better than the file's own (the classic programs have no comments). */
 const NOTES = {
   'examples/dining_philosophers.pj': { title: 'Dining philosophers' },
@@ -91,23 +94,23 @@ const NOTES = {
   'test/fixtures/processj/alttest.pj': { title: 'Alt with skip', description: 'An alt that takes a value from a writer or, when none is ready, skips.' },
   'test/fixtures/processj/arr.pj': { title: 'Array over a channel', description: 'A writer fills an int array with squares and sends the whole array over a channel; the reader prints it.' },
   'test/fixtures/processj/array.pj': { title: 'Array literals', description: 'Array literals in one, two and three dimensions, their .size, and a string\'s .length.' },
-  'test/fixtures/processj/barrierEx.pj': { title: 'Barrier', description: 'Two processes enrolled on a barrier with par enroll meet at b.sync().' },
+  'test/fixtures/processj/barrierEx.pj': { title: 'Barrier', outcome: 'error', description: `Two processes enrolled on a barrier with par enroll meet at b.sync(). ${OLD_SYNTAX}` },
   'test/fixtures/processj/bartest.pj': { title: 'Barrier, channel and timer', description: 'Two processes sync on a barrier, then one reads a channel while waiting on a timer in a par.' },
-  'test/fixtures/processj/binexpr.pj': { title: 'One expression', description: 'An arithmetic expression in main: the smallest program here.' },
+  'test/fixtures/processj/binexpr.pj': { title: 'One expression', outcome: 'error', description: `An arithmetic expression in main: the smallest program here. ${OLD_SYNTAX}` },
   'test/fixtures/processj/bytecode.pj': { title: 'Prefix process', description: 'A prefix process: it writes a first value, then copies its input to its output forever. It has no main.' },
   'test/fixtures/processj/car.pj': { title: 'Car record', description: 'A record with two string fields, made with a record literal and printed.' },
   'test/fixtures/processj/channelWR.pj': { title: 'Write and read', description: 'One process writes 4 on a channel, the other reads it and prints it: the basic rendezvous.' },
   'test/fixtures/processj/commstime.pj': { title: 'CommsTime', description: 'The CommsTime benchmark: prefix, delta, succ and consume pass a million numbers around a ring of channels.' },
   'test/fixtures/processj/Demo_matt.pj': { title: 'Read inside an expression', description: 'A par whose branches write and read one channel, the read inside an addition.' },
-  'test/fixtures/processj/Demo.pj': { title: 'Records, protocols and barriers', description: 'A larger demo: records, protocols that extend each other, channels that carry them, and two barriers.' },
+  'test/fixtures/processj/Demo.pj': { title: 'Records, protocols and barriers', outcome: 'error', description: `A larger demo: records, protocols that extend each other, channels that carry them, and two barriers. ${OLD_SYNTAX}` },
   'test/fixtures/processj/Demo2.pj': { title: 'Nested pars', description: 'Pars inside pars and procedures that start pars of their own: many processes print, in any order.' },
   'test/fixtures/processj/enrolledtest.pj': { title: 'Nested barrier enrolment', description: 'Three processes enrolled on one barrier through nested par enroll blocks sync, then print.' },
   'test/fixtures/processj/fibonacci.pj': { title: 'Fibonacci', description: 'A par for that starts ten writer and reader pairs on one channel (the Fibonacci step itself is commented out).' },
   'test/fixtures/processj/fortest.pj': { title: 'For loops', description: 'for loops with several variables, empty parts and break, and a par inside a loop body.' },
-  'test/fixtures/processj/fullAdder.pj': { title: 'Full adder', description: 'Logic gates as processes on boolean channels, wired into one-, four- and eight-bit adders that add two numbers.' },
+  'test/fixtures/processj/fullAdder.pj': { title: 'Full adder', outcome: 'compiler-limit', description: 'Logic gates as processes on boolean channels, wired into one-, four- and eight-bit adders that add two numbers. This compiler cannot build it: javac rejects the Java it writes ("unreachable statement").' },
   'test/fixtures/processj/Hello.pj': { title: 'Hello', description: 'Hello world from a par, next to two empty procedures.' },
   'test/fixtures/processj/iftest.pj': { title: 'If and else', description: 'Nested if and else if, and a for loop whose increment is in its condition.' },
-  'test/fixtures/processj/integrate.pj': { title: 'Integrator', description: 'A running-sum integrator built from delta, plus and prefix processes, in a sequential and a parallel version.' },
+  'test/fixtures/processj/integrate.pj': { title: 'Integrator', outcome: 'error', description: 'A running-sum integrator built from delta, plus and prefix processes, in a sequential and a parallel version. It prints with prlongln, which this standard library does not have, so the compiler rejects it ("Procedure \'prlongln\' not found").' },
   'test/fixtures/processj/localDecl.pj': { title: 'Local declaration', description: 'A local declaration and an empty endless loop, in a procedure without main.' },
   'test/fixtures/processj/mandelbrot.pj': { title: 'Mandelbrot set', description: 'The Mandelbrot set with nested par for loops, one process per pixel, written to a PGM image with image.pgm.' },
   'test/fixtures/processj/mandelbrot2.pj': { title: 'Mandelbrot set, large', description: 'The Mandelbrot set at 4000 by 3000 pixels, one process per pixel: twelve million processes, more than a sandbox has room for.' },
@@ -115,25 +118,30 @@ const NOTES = {
   'test/fixtures/processj/NetworkProc.pj': { title: 'Network with a kill switch', description: 'A producer, an integrator and a consumer that a killer process stops through kill channels and alts.' },
   'test/fixtures/processj/parExp.pj': { title: 'Par of calls', description: 'A par of two calls to empty procedures.' },
   'test/fixtures/processj/protocols.pj': { title: 'Protocol inheritance', description: 'A protocol that extends another with a case of its own, and a literal of that case.' },
-  'test/fixtures/processj/protocolSwitch.pj': { title: 'Switch on a protocol', description: 'A switch on a protocol value\'s case, reading the fields of the case it holds.' },
+  'test/fixtures/processj/protocolSwitch.pj': { title: 'Switch on a protocol', outcome: 'error', description: `A switch on a protocol value's case, reading the fields of the case it holds. ${OLD_SYNTAX}` },
   'test/fixtures/processj/readEx.pj': { title: 'Read into a variable', description: 'A writer sends 6 and the reader reads it into a variable declared before, then prints it.' },
   'test/fixtures/processj/recordchan.pj': { title: 'Record over a channel', description: 'A record sent over a channel; the reader prints its fields.' },
   'test/fixtures/processj/santa.pj': { title: 'Santa Claus problem', description: 'Santa, his reindeer and his elves, synchronised with barriers, shared channels and protocols, each process started by hand in main.' },
   'test/fixtures/processj/santapar.pj': { title: 'Santa Claus problem, par for', description: 'The Santa Claus problem with the reindeer and the elves started by par for loops with enroll.' },
   'test/fixtures/processj/santatest.pj': { title: 'Santa\'s protocols', description: 'A protocol that extends another without new cases, and a shared write channel that carries it.' },
-  'test/fixtures/processj/sharedchan.pj': { title: 'Shared channel', description: 'Three readers and two writers on one channel shared at both ends.' },
-  'test/fixtures/processj/sharedread.pj': { title: 'Shared read end', description: 'Three readers on the shared read end of a channel, one writer.' },
+  'test/fixtures/processj/sharedchan.pj': { title: 'Shared channel', outcome: 'compiler-limit', description: 'Three readers and two writers on one channel shared at both ends. This compiler crashes on it while writing the Java ("no such attribute: type"), so it cannot build it.' },
+  'test/fixtures/processj/sharedread.pj': { title: 'Shared read end', outcome: 'compiler-limit', description: 'Three readers on the shared read end of a channel, one writer. This compiler crashes on it while writing the Java ("no such attribute: type"), so it cannot build it.' },
   'test/fixtures/processj/sharedwrite.pj': { title: 'Shared write end', description: 'Three writers on the shared write end of a channel, one reader.' },
   'test/fixtures/processj/silly.pj': { title: 'Reads in a loop condition', description: 'A for loop whose condition reads two channels, in a procedure without main.' },
   'test/fixtures/processj/simple.pj': { title: 'Simple', description: 'A procedure that reads a channel, with most of the program commented out.' },
-  'test/fixtures/processj/simplepj.pj': { title: 'Simple rendezvous', description: 'The basic rendezvous between two processes, with the procedures declared as proc.' },
+  'test/fixtures/processj/simplepj.pj': { title: 'Simple rendezvous', outcome: 'error', description: `The basic rendezvous between two processes. ${OLD_SYNTAX}` },
   'test/fixtures/processj/SwitchDemo.pj': { title: 'Switch', description: 'Nested switch statements with empty cases, break and default.' },
   'test/fixtures/processj/test22.pj': { title: 'Protocols and records', description: 'Protocols with record fields and a record with a protocol field.' },
   'test/fixtures/processj/timer.pj': { title: 'Timer', description: 'A timeout on a timer, then the time read and printed.' },
   'test/fixtures/processj/verySimple.pj': { title: 'Straight-line code', description: 'Many boolean and int variables declared and assigned in turn, as generated code might be.' },
   // `// outcome: runs` in these two is for ProcessJ's alt_timer_update branch, which this checker follows. The
   // runner the web IDE uses builds with ProcessJ's main branch (65cfe7e), where javac rejects both.
+  // The classic programs above that carry an outcome do not build on the runner either (the first message the
+  // compiler or javac gives is in each description).
   'test/differential/alt_timeout_guard.pj': { outcome: 'compiler-limit', description: 'A timer read inside an alt timeout guard. ProcessJ\'s alt_timer_update branch builds and runs it and prints "read 1" (since commit 179847f, "Fix: Timer reads in channel guards"); on its main branch, which the IDE\'s runner builds with, javac rejects the generated Java ("illegal start of expression").' },
+  // `// outcome: runs-wrong` is what ProcessJ's own runtime did: a garbage collection could end the par early.
+  // On the patched runtime the IDE's runner uses, the program deadlocks as its code says.
+  'test/differential/par_ends_early_gc.pj': { outcome: 'deadlocks', description: 'The par\'s second branch reads a channel that main writes only after the par. On the IDE\'s runner the program prints "quick done" and then waits for good, as the code says; on ProcessJ\'s unpatched runtime a garbage collection could end the par early, and it went on to print "after par" and "read 1".' },
   'test/differential/two_alts_one_process.pj': { outcome: 'compiler-limit', description: 'Two alts one after another in one process. ProcessJ\'s alt_timer_update branch builds and runs it; on its main branch, which the IDE\'s runner builds with, javac rejects the second alt ("variable __booleanGuards1 is already defined in method run()"). A second replicated alt in one process fails on both (pj/multiple-alts).' },
 };
 

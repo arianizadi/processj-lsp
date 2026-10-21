@@ -1908,6 +1908,15 @@ in which the consumer has ended and the producer waits to write; for
 where the model has one loop running forever) the report says the compiled
 program differs from the model, so the hang may have another cause.
 
+The "real program" column is what a ProcessJ install's own runtime did. The
+web IDE's runner runs programs on a patched copy of that runtime (processj-ide,
+`runner/sandbox/patches`), where an exception that escapes a process ends the
+program at once with exit code 1. There `break_after_nested_do.pj`,
+`break_after_nested_for.pj`, `blocks_oob.pj` and `channel_array_assigned.pj`
+throw their exception and stop within about a second instead of hanging after
+it, and `par_ends_early_gc.pj`, whose par a garbage collection can end early
+on the unpatched runtime, prints "quick done" and deadlocks as its code says.
+
 `node scripts/fdr-validate.js --procedures [dirs or files]` checks every
 procedure with a body (but `main`) on its own instead, as Check with FDR on that
 procedure does, and prints a row per procedure: each check's verdict (`RANGE`

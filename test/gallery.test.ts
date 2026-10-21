@@ -118,19 +118,46 @@ test('categories by where a program lives; tags from its expect and outcome line
   assert.equal(byId.get('test/fixtures/processj/fullAdder.pj')!.title, 'Full adder');
   assert.equal(byId.get('test/fixtures/processj/Hello.pj')!.entry, 'Hello.pj');
 
-  // Every differential program has its outcome as a tag and a sentence, but two whose outcome line is for
-  // ProcessJ's alt_timer_update branch: the IDE's runner builds with its main branch, where javac rejects them.
+  // Every differential program has its outcome as a tag and a sentence, but where the IDE's runner does
+  // otherwise: two whose outcome line is for ProcessJ's alt_timer_update branch (the runner builds with its
+  // main branch, where javac rejects them), and one whose par a garbage collection ended early on ProcessJ's
+  // own runtime (on the runner's patched one it deadlocks as written).
   const outcomeTag: Record<string, string> = { runs: 'runs', 'runs-wrong': 'runs wrong', error: 'build error', 'compiler-limit': 'compiler limit', deadlocks: 'deadlock' };
-  const onTheRunner: Record<string, string> = { 'test/differential/alt_timeout_guard.pj': 'compiler-limit', 'test/differential/two_alts_one_process.pj': 'compiler-limit' };
+  const altsOnTheRunner = ['test/differential/alt_timeout_guard.pj', 'test/differential/two_alts_one_process.pj'];
+  const onTheRunner: Record<string, string> = { ...Object.fromEntries(altsOnTheRunner.map((id) => [id, 'compiler-limit'])), 'test/differential/par_ends_early_gc.pj': 'deadlocks' };
   for (const entry of gallery.entries.filter((e) => e.category === 'corners')) {
     const outcome = onTheRunner[entry.id] ?? /^\/\/ outcome:\s*(\S+)/.exec(gallery.sources[entry.id])![1];
     assert.ok(entry.tags.includes(outcomeTag[outcome]), `${entry.id}: ${outcome} in ${entry.tags.join(', ')}`);
   }
-  for (const id of Object.keys(onTheRunner)) {
+  for (const id of altsOnTheRunner) {
     const entry = byId.get(id)!;
     assert.ok(!entry.tags.includes('runs'), `${id}: ${entry.tags.join(', ')}`);
     assert.match(entry.description, /alt_timer_update branch builds and runs it.*main branch, which the IDE's runner builds with, javac rejects/);
     assert.doesNotMatch(entry.description, /the checker says so|builds and runs as written/);
+  }
+  const gc = byId.get('test/differential/par_ends_early_gc.pj')!;
+  assert.ok(!gc.tags.includes('runs wrong'), gc.tags.join(', '));
+  assert.match(gc.description, /prints "quick done" and then waits for good/);
+  // An exception ends the program on the runner (its runtime is patched): no claim that it never finishes.
+  const assigned = byId.get('test/differential/channel_array_assigned.pj')!;
+  assert.ok(!assigned.tags.includes('deadlock'), assigned.tags.join(', '));
+  assert.doesNotMatch(assigned.description, /never finishes/);
+  // The classic programs the runner's compiler cannot build say so, with the first message it gives.
+  const notBuilt: Record<string, [string, RegExp]> = {
+    barrierEx: ['build error', /older ProcessJ, with `proc`.*syntax error/],
+    binexpr: ['build error', /older ProcessJ, with `proc`.*syntax error/],
+    Demo: ['build error', /older ProcessJ, with `proc`.*syntax error/],
+    simplepj: ['build error', /older ProcessJ, with `proc`.*syntax error/],
+    protocolSwitch: ['build error', /older ProcessJ, with `proc`.*syntax error/],
+    sharedread: ['compiler limit', /crashes on it .*"no such attribute: type"/],
+    sharedchan: ['compiler limit', /crashes on it .*"no such attribute: type"/],
+    integrate: ['build error', /"Procedure 'prlongln' not found"/],
+    fullAdder: ['compiler limit', /javac rejects the Java it writes \("unreachable statement"\)/],
+  };
+  for (const [stem, [tag, said]] of Object.entries(notBuilt)) {
+    const entry = byId.get(`test/fixtures/processj/${stem}.pj`)!;
+    assert.ok(entry.tags.includes(tag) && !entry.tags.includes('runs'), `${stem}: ${entry.tags.join(', ')}`);
+    assert.match(entry.description, said, stem);
   }
   assert.match(byId.get('test/differential/break_in_par.pj')!.description, /cannot build/);
   // A description that already says how it went is not followed by a sentence that says it again.
