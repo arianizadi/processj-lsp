@@ -82,6 +82,33 @@ export interface OverlayStep {
   caveat?: string;
 }
 
+/**
+ * One step of the replay of how a run locked up, after its trace: a process
+ * entering the wait it never leaves, a link of a circular wait closing, or the
+ * dead end everything else waits behind. Each says only what the report does.
+ */
+export interface OverlayFormationStep {
+  kind: 'stuck' | 'cycle' | 'dead-end';
+  /** The boxes it is about: the process that becomes stuck, the two ends of a link, the processes at the dead end. */
+  nodes: string[];
+  /** The processes (pathKey) that become stuck at this step: one, or several drawn on the same box. */
+  keys: string[];
+  /** For `stuck`: index of the last trace step the process took part in; absent when it took part in none. */
+  after?: number;
+  /** Arrows this step adds: the operations it waits on (stuck, dead end), the link's (cycle). */
+  edges: string[];
+  /** Boxes of the processes it waits for. */
+  partners: string[];
+  /** For `cycle`: which circle of OverlayModel.cycles of the first instance, and how many of its links are closed now. */
+  cycle?: number;
+  link?: number;
+  /** `philosopher(1, …) stuck at line 28`. */
+  title: string;
+  /** Who, what it waits for, at which line, and whom that depends on. */
+  caption: string;
+  at?: SourceRef;
+}
+
 export interface OverlayModel {
   view: string;
   /** Index of the report in the list given to `buildOverlays`. */
@@ -109,6 +136,11 @@ export interface OverlayModel {
   caveats: string[];
   /** Plain-words account of the final state, one sentence per entry. */
   story: string[];
+  /**
+   * How an FDR run that ends stuck locked up, step by step after its trace
+   * (formationSteps); empty for any other result.
+   */
+  formation: OverlayFormationStep[];
   /** What the report names that is not drawn in this view. */
   unplaced: string[];
   /** The report's paths were mapped onto an expanded call of the checked procedure. */
@@ -199,8 +231,17 @@ function overlayFor(model: NetworkModel, view: NetworkView, report: Verification
     ending: endingOf(counterexample),
     caveats: [...(counterexample.caveats ?? [])],
     story: [],
+    formation: [],
     unplaced: [],
     relocated: instances[0] ? `${check.target.name} as called here` : undefined,
+  };
+  // Where each blocked process and each link of a circle is drawn, over every instance: for the formation replay.
+  const drawnStuck = new Map<ProcessSnapshot, DrawnPart>();
+  const drawnLinks = new Map<string, DrawnPart>();
+  const drawnPart = <K>(parts: Map<K, DrawnPart>, key: K): DrawnPart => {
+    let part = parts.get(key);
+    if (!part) parts.set(key, (part = { nodes: [], edges: [], partners: [] }));
+    return part;
   };
   const unplacedSeen = new Set<string>();
   const unplaced = (text: string): void => {
@@ -226,6 +267,10 @@ function overlayFor(model: NetworkModel, view: NetworkView, report: Verification
         continue;
       }
       const waits = snapshot.waits ?? [];
+      if (snapshot.status === 'blocked') {
+        const part = drawnPart(drawnStuck, snapshot);
+        if (!part.nodes.includes(placed.node.id)) part.nodes.push(placed.node.id);
+      }
       const rootCause = (wait: WaitInfo): boolean => !wait.partner || (wait.partner.state !== 'blocked-elsewhere' && !(lasso && wait.partner.state === 'not-ready')) || inCycle(snapshot.process);
       overlay.processes.push({
         node: placed.node.id,
@@ -253,6 +298,12 @@ function overlayFor(model: NetworkModel, view: NetworkView, report: Verification
         }
         const partner = wait.partner?.process ? placeProcess(wait.partner.process) : undefined;
         const edge = channel ? edgeAt(view, channel, placed.node.id, partner?.node.id) : undefined;
+        if (snapshot.status === 'blocked') {
+          const part = drawnPart(drawnStuck, snapshot);
+          if (edge && !part.edges.includes(edge.id)) part.edges.push(edge.id);
+          // A par waits for all its branches; the report names only the first as its partner.
+          if (partner && wait.operation !== 'other' && !part.partners.includes(partner.node.id)) part.partners.push(partner.node.id);
+        }
         // Checked on its own, a procedure's port has the producer's model of a caller on its other side;
         // drawn here, that side is a real process the result says nothing about.
         const alone = instance && !wait.partner?.process && isPort(wait.channel) ? `${report.producer === 'fdr' ? "FDR's" : "the checker's"} check of ${check.target.name} on its own` : undefined;
@@ -274,7 +325,7 @@ function overlayFor(model: NetworkModel, view: NetworkView, report: Verification
       }
     }
 
-    for (const cycle of counterexample.cycles ?? []) {
+    (counterexample.cycles ?? []).forEach((cycle, cycleIndex) => {
       const nodes: string[] = [];
       const edges: string[] = [];
       cycle.forEach((entry, index) => {
@@ -285,13 +336,18 @@ function overlayFor(model: NetworkModel, view: NetworkView, report: Verification
         const nextPlaced = placeProcess(next.process);
         const channel = placeChannel(entry.channel);
         if (entry.channel && !channel) unplaced(`the circular wait on '${entry.channel.name}': the channel is not drawn in this view`);
+        const link = drawnPart(drawnLinks, `${cycleIndex}:${index}`);
+        for (const id of [placed?.node.id, nextPlaced?.node.id]) if (id && !link.nodes.includes(id)) link.nodes.push(id);
         if (placed && channel) {
-          for (const id of routeBetween(view, channel, placed.node.id, nextPlaced?.node.id)) if (!edges.includes(id)) edges.push(id);
+          for (const id of routeBetween(view, channel, placed.node.id, nextPlaced?.node.id)) {
+            if (!edges.includes(id)) edges.push(id);
+            if (!link.edges.includes(id)) link.edges.push(id);
+          }
         }
       });
       // Named as the boxes are drawn (`delta(d, a, b)`, shorter than the call as written).
       overlay.cycles.push({ nodes, edges, label: cycleLabel(cycle.map((entry) => placeProcess(entry.process)?.node.name ?? entry.process.label)) });
-    }
+    });
 
     if (instanceIndex === 0) {
       for (const step of counterexample.steps) {
@@ -339,6 +395,12 @@ function overlayFor(model: NetworkModel, view: NetworkView, report: Verification
   });
 
   overlay.story = story(counterexample, check);
+  // How FDR's run locked up, after its trace. The checker's results are proofs, not runs: nothing happens in an order.
+  if (report.producer === 'fdr' && overlay.ending === 'stuck') {
+    // Placed on a call, a procedure checked on its own waits on its environment at its ports, as the waits say.
+    const alone = (wait: WaitInfo): string | undefined => (instances[0] && !wait.partner?.process && isPort(wait.channel) ? `FDR's check of ${check.target.name} on its own` : undefined);
+    overlay.formation = formationSteps(counterexample, drawnStuck, drawnLinks, alone);
+  }
   // Nothing at all landed in this view: it is not a view of this result.
   if (!overlay.processes.length && !overlay.steps.some((step) => step.participants.some((participant) => participant.node))) return undefined;
   return overlay;
@@ -801,6 +863,225 @@ function partnerSentence(wait: WaitInfo): string {
     case 'blocked-elsewhere': return `${who ?? `its ${partnerSide(wait)}`} is blocked elsewhere`;
     case 'not-ready': return `${who ?? `its ${partnerSide(wait)}`} is not ready`;
   }
+}
+
+/** Where one blocked process, or one link of a circle, is drawn: its boxes, the arrows it waits on, and its partners' boxes. */
+export interface DrawnPart {
+  nodes: string[];
+  edges: string[];
+  partners: string[];
+}
+
+/** Stuck processes beyond this are told one trace step at a time rather than one process at a time. */
+const MAX_STUCK_STEPS = 40;
+/** Links of circles beyond this close a whole circle per step. */
+const MAX_LINK_STEPS = 24;
+/** Circles beyond this are told one by one up to here, then the rest in one step. */
+const MAX_CYCLE_STEPS = 12;
+/** Longest circle a caption names in full; a longer one names calls by their first argument, then only counts. */
+const CHAIN = 170;
+
+/**
+ * How a run that ends stuck locked up, told after its trace: one step per
+ * blocked process, in the order each entered the wait it never leaves (just
+ * after the last trace step it took part in; one that took part in none
+ * first; ties in the report's order), processes drawn on one box that entered
+ * it after the same step together; then each circular wait closing link by
+ * link; then, where waits end at a partner that finished or never comes, that
+ * dead end. The last step says who is stuck behind it all and, in a deadlock,
+ * that nobody can move. Captions say only what the report does: the wait, its
+ * line, and the partner's own wait.
+ */
+export function formationSteps(counterexample: Counterexample, drawnStuck: ReadonlyMap<ProcessSnapshot, DrawnPart> = new Map(), drawnLinks: ReadonlyMap<string, DrawnPart> = new Map(), alone: (wait: WaitInfo) => string | undefined = () => undefined): OverlayFormationStep[] {
+  const blocked = counterexample.final.filter((snapshot) => snapshot.status === 'blocked');
+  if (!blocked.length) return [];
+  const drawn = (snapshot: ProcessSnapshot): DrawnPart => drawnStuck.get(snapshot) ?? { nodes: [], edges: [], partners: [] };
+  const lastStep = (snapshot: ProcessSnapshot): number | undefined => {
+    let last: number | undefined;
+    counterexample.steps.forEach((step, index) => {
+      if (step.participants.some((participant) => samePath(participant.process.path, snapshot.process.path))) last = index;
+    });
+    return last;
+  };
+  const after = new Map(blocked.map((snapshot) => [snapshot, lastStep(snapshot)]));
+  const order = [...blocked].sort((a, b) => (after.get(a) ?? -1) - (after.get(b) ?? -1) || counterexample.final.indexOf(a) - counterexample.final.indexOf(b));
+  // Processes drawn on one box that got stuck after the same step are one step: the drawing cannot tell them apart.
+  const byBox = (snapshot: ProcessSnapshot): string => `${after.get(snapshot) ?? ''}|${[...drawn(snapshot).nodes].sort().join(',') || counterexample.final.indexOf(snapshot)}`;
+  const byStep = (snapshot: ProcessSnapshot): string => String(after.get(snapshot) ?? '');
+  const group = (key: (snapshot: ProcessSnapshot) => string): ProcessSnapshot[][] => {
+    const groups = new Map<string, ProcessSnapshot[]>();
+    for (const snapshot of order) groups.set(key(snapshot), [...(groups.get(key(snapshot)) ?? []), snapshot]);
+    return [...groups.values()];
+  };
+  let groups = group(byBox);
+  const crowded = groups.length > MAX_STUCK_STEPS;
+  if (crowded) groups = group(byStep);
+  const traced = counterexample.steps.length > 0;
+  const steps: OverlayFormationStep[] = groups.map((members) => {
+    const first = members[0];
+    const parts = members.map(drawn);
+    const nodes = unique(parts.flatMap((part) => part.nodes));
+    const at = first.waits?.[0]?.at ?? first.at;
+    const where = at ? ` at line ${at.span.start.line + 1}` : '';
+    const when = whenStuck(after.get(first), traced);
+    const rest = members.slice(1).map((snapshot) => nameOf(snapshot.process));
+    let caption = stuckCaption(first, counterexample, when, alone);
+    if (crowded && members.length > 1) caption = `${members.length} processes are stuck${when}: ${names(members.map((snapshot) => nameOf(snapshot.process)), 6)}.`;
+    else if (rest.length) caption += ` On the same box, ${names(rest, 4)} ${rest.length === 1 ? 'is' : 'are'} stuck too.`;
+    return {
+      kind: 'stuck',
+      nodes,
+      keys: members.map((snapshot) => pathKey(snapshot.process.path)),
+      ...(after.get(first) !== undefined ? { after: after.get(first) } : {}),
+      edges: unique(parts.flatMap((part) => part.edges)),
+      partners: unique(parts.flatMap((part) => part.partners)).filter((id) => !nodes.includes(id)),
+      title: crowded && members.length > 1 ? `${members.length} processes stuck` : `${nameOf(first.process)}${rest.length ? ` and ${rest.length} more` : ''} stuck${where}`,
+      caption,
+      ...(at ? { at } : {}),
+    };
+  });
+
+  // The circles, closing link by link (a whole circle a step when there are too many links).
+  const cycles = (counterexample.cycles ?? []).map((cycle, index) => ({ cycle, index })).filter((entry) => entry.cycle.length > 1);
+  const linkOf = (cycle: number, link: number): DrawnPart => drawnLinks.get(`${cycle}:${link}`) ?? { nodes: [], edges: [], partners: [] };
+  const numbered = (index: number): string => (cycles.length > 1 ? ` ${index + 1} of ${cycles.length}` : '');
+  const linkSteps = cycles.reduce((sum, entry) => sum + entry.cycle.length, 0) <= MAX_LINK_STEPS;
+  cycles.forEach(({ cycle, index }, position) => {
+    if (!linkSteps && position >= MAX_CYCLE_STEPS) return;
+    const keys = cycle.map((entry) => pathKey(entry.process.path));
+    if (!linkSteps) {
+      const rest = position === MAX_CYCLE_STEPS - 1 && cycles.length > MAX_CYCLE_STEPS ? cycles.slice(position) : [{ cycle, index }];
+      const links = rest.flatMap((entry) => entry.cycle.map((_, link) => linkOf(entry.index, link)));
+      steps.push({
+        kind: 'cycle',
+        nodes: unique(links.flatMap((link) => link.nodes)),
+        keys: unique(rest.flatMap((entry) => entry.cycle.map((member) => pathKey(member.process.path)))),
+        edges: unique(links.flatMap((link) => link.edges)),
+        partners: [],
+        cycle: index,
+        link: cycle.length,
+        title: rest.length > 1 ? `${rest.length} more circular waits` : `circular wait${numbered(position)}`,
+        caption: rest.length > 1 ? `${rest.length} more circular waits like these.` : `Circular wait${numbered(position)}: ${chain(cycle.map((entry) => nameOf(entry.process)))}.`,
+      });
+      return;
+    }
+    cycle.forEach((entry, link) => {
+      const next = cycle[(link + 1) % cycle.length];
+      const part = linkOf(index, link);
+      const closed = link === cycle.length - 1;
+      steps.push({
+        kind: 'cycle',
+        nodes: part.nodes,
+        keys: unique([keys[link], keys[(link + 1) % keys.length]]),
+        edges: part.edges,
+        partners: part.nodes.slice(1),
+        cycle: index,
+        link: link + 1,
+        title: closed ? `circular wait${numbered(position)} closed` : `circle${numbered(position)}, link ${link + 1} of ${cycle.length}`,
+        caption: closed
+          ? `Circular wait${numbered(position)}: ${chain(cycle.map((member) => nameOf(member.process)))}.`
+          : `Closing the circle${numbered(position)}, link ${link + 1} of ${cycle.length}: ${nameOf(entry.process)} waits for ${nameOf(next.process)}${entry.channel ? ` on ${entry.channel.name}` : ''}.`,
+      });
+    });
+  });
+
+  // Where the waits end without a circle: a partner that finished, never comes, or cannot answer.
+  const circled = (snapshot: ProcessSnapshot): boolean => cycles.some((entry) => entry.cycle.some((member) => samePath(member.process.path, snapshot.process.path)));
+  const deadEnd = (wait: WaitInfo, snapshot: ProcessSnapshot): boolean => !wait.partner || wait.partner.state !== 'blocked-elsewhere' || (!!wait.partner.process && samePath(wait.partner.process.path, snapshot.process.path));
+  const roots = blocked.filter((snapshot) => !circled(snapshot) && (!(snapshot.waits ?? []).length || (snapshot.waits ?? []).some((wait) => deadEnd(wait, snapshot))));
+  const behind = blocked.filter((snapshot) => !circled(snapshot) && !roots.includes(snapshot));
+  if (roots.length) {
+    const parts = roots.map(drawn);
+    const nodes = unique(parts.flatMap((part) => part.nodes));
+    const told = roots.slice(0, 3).map((snapshot) => deadEndSentence(snapshot, (snapshot.waits ?? []).find((wait) => deadEnd(wait, snapshot)), alone));
+    steps.push({
+      kind: 'dead-end',
+      nodes,
+      keys: roots.map((snapshot) => pathKey(snapshot.process.path)),
+      edges: unique(parts.flatMap((part) => part.edges)),
+      partners: unique(parts.flatMap((part) => part.partners)).filter((id) => !nodes.includes(id)),
+      title: roots.length > 1 ? 'dead ends' : 'dead end',
+      caption: `${roots.length > 1 ? 'Dead ends' : 'Dead end'}: ${told.join('; ')}${roots.length > 3 ? `; and ${roots.length - 3} more` : ''}.`,
+    });
+  }
+  // The last step says who waits behind it all, and that in the end nothing at all can move.
+  const last = steps[steps.length - 1];
+  if (last.kind !== 'stuck' && behind.length) last.caption += ` ${names(behind.map((snapshot) => nameOf(snapshot.process)), 4)} ${behind.length === 1 ? 'is' : 'are'} stuck behind ${cycles.length && roots.length ? 'these' : roots.length === 1 || (!roots.length && cycles.length === 1) ? 'it' : 'them'}.`;
+  if (counterexample.final.every((snapshot) => snapshot.status === 'blocked' || snapshot.status === 'terminated')) last.caption += ' Nobody can move.';
+  return steps;
+}
+
+function unique<T>(values: readonly T[]): T[] {
+  return [...new Set(values)];
+}
+
+/** ` after step 4`, ` from the start` (a run with steps), or nothing (a result that is no run). */
+function whenStuck(after: number | undefined, traced: boolean): string {
+  return after !== undefined ? ` after step ${after + 1}` : traced ? ' from the start' : '';
+}
+
+/** `a → b → c → a`, shortened like the circle's callout when it is long. */
+function chain(list: readonly string[]): string {
+  const ring = (entries: readonly string[]): string => [...entries, entries[0]].join(' → ');
+  if (ring(list).length <= CHAIN) return ring(list);
+  const short = list.map(firstArgument);
+  return ring(short).length <= CHAIN ? ring(short) : `a circle of ${list.length} processes, each waiting for the next`;
+}
+
+/** What a wait waits for, after `waits`: `to write true on right (p1f2)`, `at its par for a and b to finish`. */
+function waitRest(wait: WaitInfo): string {
+  if (wait.detail.startsWith('waits ')) return wait.detail.slice('waits '.length);
+  return wait.channel ? `to ${VERB[wait.operation]} ${wait.channel.name}` : wait.detail;
+}
+
+/**
+ * A process entering its last wait: `philosopher(1, …) is stuck at line 28
+ * after step 2: it waits to write true on right (p1f2), whose reader
+ * chopstick(p2f2.read, …) is itself waiting to read left (p2f2) for
+ * philosopher(2, …).`
+ */
+function stuckCaption(snapshot: ProcessSnapshot, counterexample: Counterexample, when = '', alone: (wait: WaitInfo) => string | undefined = () => undefined): string {
+  const who = nameOf(snapshot.process);
+  const waits = snapshot.waits ?? [];
+  const at = waits[0]?.at ?? snapshot.at;
+  const head = `${who} is stuck${at ? ` at line ${at.span.start.line + 1}` : ''}${when}`;
+  if (!waits.length) return `${head}: ${snapshot.description}.`;
+  if (waits.length > 1) return `${head}: it waits in an alt for ${waits.map(waitText).join(' or ')} (${waits.map((wait) => `${waitText(wait)}: ${shortReason(wait, counterexample, snapshot.process)}`).join('; ')}).`;
+  const environment = alone(waits[0]);
+  return `${head}: it waits ${waitRest(waits[0])}${environment ? `; in ${environment}, ${environmentText(waits[0])} there` : dependency(waits[0], snapshot, counterexample)}.`;
+}
+
+/** Whom a wait depends on: the partner and what that partner waits for in turn, or why no partner comes. */
+function dependency(wait: WaitInfo, snapshot: ProcessSnapshot, counterexample: Counterexample): string {
+  const partner = wait.partner;
+  const side = partnerSide(wait);
+  // A par's wait names the branches it waits for; a timer has no partner.
+  if (wait.operation === 'other' || (wait.operation === 'timeout' && !partner)) return '';
+  if (!partner) return `, and no ${side} can come`;
+  if (partner.process && samePath(partner.process.path, snapshot.process.path)) return `; ${partner.detail || `its ${side} is this same process`}`;
+  if (partner.state !== 'blocked-elsewhere') return `; ${partnerSentence(wait)}`;
+  if (!partner.process) return `; ${partner.detail || `its ${side} is blocked elsewhere`}`;
+  const name = nameOf(partner.process);
+  const theirs = counterexample.final.find((entry) => samePath(entry.process.path, partner.process!.path))?.waits ?? [];
+  if (!theirs.length) return `, whose ${side} ${name} is blocked elsewhere`;
+  if (theirs.length > 1) return `, whose ${side} ${name} is itself waiting in an alt for ${theirs.map(waitText).join(' or ')}`;
+  const next = theirs[0].operation !== 'other' ? theirs[0].partner?.process : undefined;
+  const whom = next ? ` for ${samePath(next.path, snapshot.process.path) ? 'it' : nameOf(next)}` : '';
+  return `, whose ${side} ${name} is itself waiting ${waitRest(theirs[0])}${whom}`;
+}
+
+/** `main can never read c at line 8: nothing in the program writes c`. */
+function deadEndSentence(snapshot: ProcessSnapshot, wait: WaitInfo | undefined, alone: (wait: WaitInfo) => string | undefined): string {
+  const who = nameOf(snapshot.process);
+  if (!wait) return snapshot.description;
+  const at = wait.at ?? snapshot.at;
+  const where = at ? ` at line ${at.span.start.line + 1}` : '';
+  const environment = alone(wait);
+  const why = environment ? `in ${environment}, ${environmentText(wait)} there` : wait.partner ? partnerSentence(wait) : `no ${partnerSide(wait)} can come`;
+  if ((snapshot.waits ?? []).length > 1) return `${who} can never complete its alt${where}: ${waitText(wait)}: ${why}`;
+  const rest = waitRest(wait);
+  const doing = rest.startsWith('to ') ? rest.slice('to '.length) : wait.operation === 'other' ? 'finish its par' : waitText(wait);
+  return `${who} can never ${doing}${where}: ${why}`;
 }
 
 /** Every check of every report, for verdict chips (with or without a counterexample). */
