@@ -150,6 +150,8 @@ function outcome(input: CspmExplainInput, a: Assertion, r: FdrResult | undefined
     if (run.aborted) return { ...base, status: 'cancelled', message: 'the check was cancelled' };
     if (run.timedOut) return { ...base, status: 'timeout', message: `FDR did not finish within ${(run.durationMs / 1000).toFixed(run.durationMs < 10_000 ? 1 : 0)} s: the model may have more states than FDR can explore in that time (allow more time with fdrTimeoutMs)` };
     if (run.memoryExceeded) return { ...base, status: 'timeout', message: `FDR was stopped after using more than ${Math.round(run.memoryExceeded / 1024 ** 2)} MB of memory (allow more with fdrMemoryMb)` };
+    if (run.busy) return { ...base, status: 'skipped', message: run.busy };
+    if (run.outputExceeded) return { ...base, status: 'error', message: `FDR was stopped after writing ${Math.round(run.outputExceeded / 1e6)} million characters of output: its counterexamples are too large to read` };
     if (run.errors.length) return { ...base, status: 'error', message: `FDR could not check this file: ${tidy(run.errors[0])}` };
     return { ...base, status: 'error', message: run.results.length ? "FDR did not report this assertion (its result is missing from refines' output)" : `FDR could not check this: ${run.stderr.trim() || `refines exited with code ${run.exitCode}`}` };
   }

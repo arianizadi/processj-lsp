@@ -9,8 +9,11 @@
  * It never guesses. Whatever it cannot compute (an unbounded or huge set, a
  * library function it does not know, a value that depends on an input) is
  * `unknown`, with the reason; callers say so instead of drawing more than
- * the file establishes. Evaluation is bounded (sets of at most MAX_SET
- * values, a step budget), so a recursive definition cannot hang the server.
+ * the file establishes. Evaluation is bounded (sets and sequences of at
+ * most MAX_SET values, integers JavaScript holds exactly, a step budget that
+ * also pays for the values built, a nesting limit), so neither a recursive
+ * definition nor a tiny expression that builds a huge value can hang the
+ * server or exhaust its memory.
  */
 import type { Decl, Definition, Ex, Stmt } from './ast';
 
@@ -37,7 +40,8 @@ export type Value =
   | { t: 'proc'; expr: Ex; env: Env; name?: string }
   | { t: 'fn'; name: string; clauses: Clause[]; env: Env; applied: Value[][] }
   | { t: 'builtin'; name: string }
-  | { t: 'unknown'; why: string };
+  /** `limit`: not computed because a bound of the evaluator was reached (not because the file leaves it open). */
+  | { t: 'unknown'; why: string; limit?: true };
 
 export interface Clause {
   params: Ex[][];
@@ -45,10 +49,18 @@ export interface Clause {
   def?: Definition;
 }
 
-/** Largest set the evaluator enumerates. */
+/** Largest set or sequence the evaluator enumerates. */
 export const MAX_SET = 4096;
 
+/** Values built or visited per step of the budget: a range of 4096 integers costs 256 steps. */
+const VALUES_PER_STEP = 16;
+
+/** Deepest nesting of function applications followed (deeper ones would overflow the stack). */
+const MAX_NESTING = 500;
+
 const UNKNOWN = (why: string): Value => ({ t: 'unknown', why });
+/** A value left unknown because it is too large to compute, or computing it took too long. */
+const LIMIT = (why: string): Value => ({ t: 'unknown', why, limit: true });
 
 export interface ChannelInfo {
   name: string;
@@ -74,6 +86,8 @@ export class Globals {
   private readonly computing = new Set<string>();
   /** Evaluation steps left (shared by every evaluation of one build). */
   budget = 200_000;
+  /** Function applications being evaluated, innermost last. */
+  nesting = 0;
 
   constructor(decls: readonly Decl[], private readonly text?: string) {
     this.env = new Env(this);
@@ -158,8 +172,8 @@ export class Globals {
         for (const field of fields) {
           const set = typeSet(evaluate(field, this.env), this);
           if (set.t !== 'set') return UNKNOWN(`the values of ${name} (${set.t === 'unknown' ? set.why : 'not a finite set'})`);
+          if (rows.length * set.items.length > MAX_SET) return UNKNOWN(`${name} has too many values`);
           rows = rows.flatMap((row) => set.items.map((item) => [...row, item]));
-          if (rows.length > MAX_SET) return UNKNOWN(`${name} has too many values`);
         }
         for (const row of rows) out.push(dotOf(ctor, row));
       }
@@ -301,6 +315,29 @@ export function sameValue(a: Value, b: Value): boolean {
   return show(a) === show(b);
 }
 
+/** The keys of a set's or sequence's values, computed once per value list (membership is then one lookup). */
+const keyCache = new WeakMap<readonly Value[], Set<string>>();
+
+function keysOf(items: readonly Value[]): Set<string> {
+  let keys = keyCache.get(items);
+  if (!keys) {
+    keys = new Set(items.map(show));
+    keyCache.set(items, keys);
+  }
+  return keys;
+}
+
+/** Debit the step budget for building or visiting `values` values; false when it has run out. */
+function spend(globals: Globals, values: number): boolean {
+  globals.budget -= Math.ceil(values / VALUES_PER_STEP);
+  return globals.budget >= 0;
+}
+
+/** An integer result, or unknown when JavaScript cannot hold it exactly (CSPm's own integers are smaller still). */
+function intOf(v: number): Value {
+  return Number.isSafeInteger(v) ? { t: 'int', v } : LIMIT('an integer too large for the graph to compute with');
+}
+
 function setOf(items: Value[]): Value {
   const seen = new Map<string, Value>();
   for (const item of items) seen.set(show(item), item);
@@ -337,8 +374,8 @@ export function typeSet(v: Value, globals: Globals): Value {
     for (const item of v.items) {
       const set = typeSet(item, globals);
       if (set.t !== 'set') return UNKNOWN('a tuple type with a part that is not a finite set');
+      if (rows.length * set.items.length > MAX_SET) return UNKNOWN('too many values');
       rows = rows.flatMap((row) => set.items.map((value) => [...row, value]));
-      if (rows.length > MAX_SET) return UNKNOWN('too many values');
     }
     return setOf(rows.map((items) => ({ t: 'tuple', items })));
   }
@@ -426,9 +463,9 @@ function unionEvents(a: Extract<Value, { t: 'events' }>, b: Extract<Value, { t: 
 /** Evaluate a value expression. Process terms evaluate to closures. Never throws. */
 export function evaluate(e: Ex, env: Env): Value {
   const globals = env.globals;
-  if (--globals.budget < 0) return UNKNOWN('the evaluation budget ran out');
+  if (--globals.budget < 0) return LIMIT('the evaluation budget ran out');
   switch (e.k) {
-    case 'num': return { t: 'int', v: e.value };
+    case 'num': return Number.isSafeInteger(e.value) ? { t: 'int', v: e.value } : LIMIT(`the integer ${e.value} is too large for the graph to compute with`);
     case 'bool': return { t: 'bool', v: e.value };
     case 'str': return { t: 'str', v: e.value };
     case 'name': return env.get(e.name) ?? UNKNOWN(e.name.includes('::') ? `${e.name} is exported by a module, which the graph does not read` : `${e.name} is not defined in this file`);
@@ -440,7 +477,7 @@ export function evaluate(e: Ex, env: Env): Value {
     case 'tuple': return tupleOf(e.items.map((item) => evaluate(item, env)));
     case 'un': {
       const arg = evaluate(e.arg, env);
-      if (e.op === '-') return arg.t === 'int' ? { t: 'int', v: -arg.v } : unknownOf(arg, 'a negated value that is not an integer');
+      if (e.op === '-') return arg.t === 'int' ? intOf(-arg.v) : unknownOf(arg, 'a negated value that is not an integer');
       if (e.op === 'not') return arg.t === 'bool' ? { t: 'bool', v: !arg.v } : unknownOf(arg, 'a negated condition that is not a boolean');
       return arg.t === 'seq' ? { t: 'int', v: arg.items.length } : arg.t === 'set' ? { t: 'int', v: arg.items.length } : unknownOf(arg, 'the length of something that is not a sequence');
     }
@@ -457,9 +494,11 @@ export function evaluate(e: Ex, env: Env): Value {
       if (from.t !== 'int') return unknownOf(from, 'a range that does not start at an integer');
       if (!to) return UNKNOWN(`the infinite range ${from.v}..`);
       if (to.t !== 'int') return unknownOf(to, 'a range that does not end at an integer');
-      if (to.v - from.v + 1 > MAX_SET) return UNKNOWN(`the range ${from.v}..${to.v} has too many values`);
-      const items: Value[] = [];
-      for (let n = from.v; n <= to.v; n++) items.push({ t: 'int', v: n });
+      // Counted, not stepped to the end: both ends are exact integers, so `from + k` is too.
+      const count = Math.max(0, to.v - from.v + 1);
+      if (count > MAX_SET) return UNKNOWN(`the range ${from.v}..${to.v} has too many values`);
+      if (!spend(globals, count)) return LIMIT('the evaluation budget ran out');
+      const items: Value[] = Array.from({ length: count }, (_, k) => ({ t: 'int', v: from.v + k }));
       return e.seq ? { t: 'seq', items } : { t: 'set', items };
     }
     case 'seq': return { t: 'seq', items: e.items.map((item) => evaluate(item, env)) };
@@ -560,7 +599,7 @@ function binary(op: string, l: Ex, r: Ex, env: Env): Value {
       if (left.t !== 'int' || right.t !== 'int') return UNKNOWN(`arithmetic on something that is not an integer`);
       if ((op === '/' || op === '%') && right.v === 0) return UNKNOWN('division by zero');
       const v = op === '+' ? left.v + right.v : op === '-' ? left.v - right.v : op === '*' ? left.v * right.v : op === '/' ? Math.trunc(left.v / right.v) : ((left.v % right.v) + Math.abs(right.v)) % Math.abs(right.v);
-      return { t: 'int', v };
+      return intOf(v);
     }
     case '==': return { t: 'bool', v: sameValue(left, right) };
     case '!=': return { t: 'bool', v: !sameValue(left, right) };
@@ -571,7 +610,11 @@ function binary(op: string, l: Ex, r: Ex, env: Env): Value {
       }
       if (left.t === 'set' && right.t === 'set') {
         // Subset comparisons.
-        const sub = (a: Value[], b: Value[]): boolean => a.every((x) => b.some((y) => sameValue(x, y)));
+        if (!spend(env.globals, left.items.length + right.items.length)) return LIMIT('the evaluation budget ran out');
+        const sub = (a: Value[], b: Value[]): boolean => {
+          const keys = keysOf(b);
+          return a.every((x) => keys.has(show(x)));
+        };
         const v = op === '<=' ? sub(left.items, right.items) : op === '>=' ? sub(right.items, left.items) : op === '<' ? sub(left.items, right.items) && left.items.length < right.items.length : sub(right.items, left.items) && right.items.length < left.items.length;
         return { t: 'bool', v };
       }
@@ -582,6 +625,9 @@ function binary(op: string, l: Ex, r: Ex, env: Env): Value {
       return { t: 'bool', v: op === 'and' ? left.v && right.v : left.v || right.v };
     case '^':
       if (left.t !== 'seq' || right.t !== 'seq') return UNKNOWN('concatenation of something that is not a sequence');
+      // Checked before the copy: `xs ^ xs` doubles a sequence with one step.
+      if (left.items.length + right.items.length > MAX_SET) return LIMIT('a sequence too long for the graph to compute');
+      if (!spend(env.globals, left.items.length + right.items.length)) return LIMIT('the evaluation budget ran out');
       return { t: 'seq', items: [...left.items, ...right.items] };
     default:
       return UNKNOWN(`the operator ${op}`);
@@ -605,6 +651,8 @@ export function comprehend(stmts: readonly Stmt[], env: Env, body: (env: Env) =>
     const source = typeSet(evaluate(stmt.source, current), current.globals);
     const items = source.t === 'set' || source.t === 'seq' ? source.items : undefined;
     if (!items) return source.t === 'unknown' ? source.why : `${show(source)} is not a finite set`;
+    // Values a generator skips (a pattern that does not match) cost no evaluation step of their own.
+    if (!spend(current.globals, items.length)) return 'the evaluation budget ran out';
     for (const item of items) {
       const bound = new Map<string, Value>();
       if (match(stmt.pattern, item, current.globals, bound) !== 'yes') continue;
@@ -632,8 +680,14 @@ export function applyValue(fn: Value, args: Value[], e: Ex | undefined, env: Env
     if (applied.length < arity) return { ...fn, applied };
     const chosen = chooseClause(fn, applied, globals);
     if (typeof chosen === 'string') return UNKNOWN(chosen);
-    const value = isProcessExpr(chosen.clause.body, globals) ? { t: 'proc' as const, expr: chosen.clause.body, env: chosen.env, name: `${fn.name}${applied.map((group) => `(${group.map(show).join(', ')})`).join('')}` } : evaluate(chosen.clause.body, chosen.env);
-    return value;
+    if (isProcessExpr(chosen.clause.body, globals)) return { t: 'proc', expr: chosen.clause.body, env: chosen.env, name: `${fn.name}${applied.map((group) => `(${group.map(show).join(', ')})`).join('')}` };
+    if (globals.nesting >= MAX_NESTING) return LIMIT(`${fn.name} recurses deeper than the graph follows`);
+    globals.nesting++;
+    try {
+      return evaluate(chosen.clause.body, chosen.env);
+    } finally {
+      globals.nesting--;
+    }
   }
   if (fn.t === 'dot') {
     // `c(x)` is not CSPm; a constructor or channel applied: unknown.
@@ -783,8 +837,9 @@ function library(name: string, args: Value[], e: Ex | undefined, env: Env, globa
       const s = sets();
       if (!s || s.length !== 2) return UNKNOWN(`${name} of something that is not a finite set`);
       const [a, b] = s;
-      const has = (list: Value[], v: Value): boolean => list.some((x) => sameValue(x, v));
-      return setOf(name === 'union' ? [...a, ...b] : name === 'inter' ? a.filter((v) => has(b, v)) : a.filter((v) => !has(b, v)));
+      if (!spend(globals, a.length + b.length)) return LIMIT('the evaluation budget ran out');
+      const inB = keysOf(b);
+      return setOf(name === 'union' ? [...a, ...b] : name === 'inter' ? a.filter((v) => inB.has(show(v))) : a.filter((v) => !inB.has(show(v))));
     }
     case 'Union': case 'Inter': {
       if (missing) return missing;
@@ -806,12 +861,12 @@ function library(name: string, args: Value[], e: Ex | undefined, env: Env, globa
       const set = typeSet(s, globals);
       if (set.t !== 'set' && s.t !== 'seq') return UNKNOWN('member of something that is not a finite set');
       const items = s.t === 'seq' ? s.items : (set as Extract<Value, { t: 'set' }>).items;
-      return { t: 'bool', v: items.some((x) => sameValue(x, v)) };
+      return { t: 'bool', v: keysOf(items).has(show(v)) };
     }
     case 'elem': {
       if (missing) return missing;
       const [v, s] = args;
-      return s.t === 'seq' ? { t: 'bool', v: s.items.some((x) => sameValue(x, v)) } : UNKNOWN('elem of something that is not a sequence');
+      return s.t === 'seq' ? { t: 'bool', v: keysOf(s.items).has(show(v)) } : UNKNOWN('elem of something that is not a sequence');
     }
     case 'card': case 'length': case '#': {
       if (missing) return missing;
@@ -831,6 +886,9 @@ function library(name: string, args: Value[], e: Ex | undefined, env: Env, globa
       if (missing) return missing;
       const v = args[0];
       if (v.t !== 'seq' || !v.items.every((item) => item.t === 'seq')) return UNKNOWN('concat of something that is not a sequence of sequences');
+      const length = v.items.reduce((sum, item) => sum + (item as Extract<Value, { t: 'seq' }>).items.length, 0);
+      if (length > MAX_SET) return LIMIT('a sequence too long for the graph to compute');
+      if (!spend(globals, length)) return LIMIT('the evaluation budget ran out');
       return { t: 'seq', items: v.items.flatMap((item) => (item as Extract<Value, { t: 'seq' }>).items) };
     }
     case 'productions': {
@@ -842,6 +900,7 @@ function library(name: string, args: Value[], e: Ex | undefined, env: Env, globa
       if (missing) return missing;
       const set = typeSet(args[0], globals);
       if (set.t !== 'set' || set.items.length > 12) return UNKNOWN('the subsets of a large or unknown set');
+      if (!spend(globals, set.items.length << set.items.length)) return LIMIT('the evaluation budget ran out');
       const subsets: Value[] = [];
       for (let mask = 0; mask < 1 << set.items.length; mask++) subsets.push({ t: 'set', items: set.items.filter((_, i) => mask & (1 << i)) });
       return { t: 'set', items: subsets };

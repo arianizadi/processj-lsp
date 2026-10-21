@@ -49,6 +49,8 @@ export interface CspmHost {
   refines(): string | undefined;
   /** refines elsewhere (the browser IDE's runner), used instead of refines() when there is one. */
   runner?(): RefinesRunner | undefined;
+  /** The workspace roots: a file's includes may name only files inside them (src/csp/includes.ts). */
+  includeRoots(): readonly string[];
   refinesMissing(): string;
   fdr(): { timeoutMs: number; memoryMb: number; workers: number; showGraph: 'onFailure' | 'always' | 'never' };
   writeReport(name: string, content: string): string;
@@ -183,7 +185,7 @@ export class CspmFeatures {
     this.typechecks.set(doc.uri, controller);
     const version = doc.version;
     const parsed = this.document(doc);
-    void typecheckCspm(parsed, 'runner' in backend ? backend.runner : backend.refines, { signal: controller.signal })
+    void typecheckCspm(parsed, 'runner' in backend ? backend.runner : backend.refines, { signal: controller.signal, includeRoots: this.host.includeRoots() })
       .then((errors) => {
         if (controller.signal.aborted) return;
         const current = this.host.open(doc.uri);
@@ -302,6 +304,7 @@ export class CspmFeatures {
         ...(settings.workers ? { workers: settings.workers } : {}),
         // The copy FDR runs; a local run rewrites it with its includes made absolute.
         cspFile: this.host.writeReport(this.host.scopedReportName(uri, `fdr/${fileName.replace(/[^A-Za-z0-9_.-]/g, '_')}`), parsed.text),
+        includeRoots: this.host.includeRoots(),
         onProgress: (done, total, label, raw) => progress?.report(Math.round((done / total) * 100), `${label}: ${raw.passed === true ? 'holds' : raw.passed === false ? 'fails' : 'no verdict'} (${done}/${total})`),
       });
       if (result.run?.aborted) {

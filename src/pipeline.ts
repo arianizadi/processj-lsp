@@ -77,6 +77,11 @@ async function buildInSandbox(install: Install, sb: Sandbox, opts: { timeoutMs?:
     result.aborted = true;
     return true;
   };
+  // A library pragma that would make the compiler write outside the sandbox: it is not run.
+  if (sb.refused) {
+    stages.push({ name: 'ProcessJc', ok: false, durationMs: 0, output: sb.refused.message });
+    return result;
+  }
 
   // 1. ProcessJ compiler: exit code is unreliable, so we look for the success banner.
   const pjc = await exec(install.javaBin, processjcArgs(install, sb), { cwd: sb.root, ...common });

@@ -5,7 +5,7 @@
  * The page itself only arranges, animates and exports these.
  */
 import { isPathPrefix, samePath, type VerificationReport } from '../verification';
-import { fallbackLayout, layoutView, type ViewLayout } from './layout';
+import { fallbackLayout, layoutSizeProblem, layoutView, type ViewLayout } from './layout';
 import { countText, viewProcesses, type Confidence, type NetNode, type NetworkModel, type NetworkView, type NetworkViewStub } from './network';
 import { buildOverlays, verdictChips, type OverlayModel, type VerdictChip } from './overlay';
 import { excalidrawInput, type ExcalidrawInput } from './render-excalidraw';
@@ -210,8 +210,16 @@ export interface PayloadInput {
 
 export const DEFAULT_BUDGET = Object.freeze({ views: 40, nodes: 2500 });
 
-/** Lay out one view, falling back to a plain arrangement if the layout engine fails. */
+/** Lay out one view, falling back to a plain arrangement if the layout engine fails or the view is too large for it. */
 export async function layoutOrFallback(view: NetworkView, notes?: string[]): Promise<ViewLayout> {
+  const tooLarge = layoutSizeProblem(view.nodes.length, view.edges.length);
+  if (tooLarge) {
+    // Said on the view itself too: a page that asks for one view at a time has no other place for it.
+    const note = `${view.label} is too large to lay out (${tooLarge}); a plain arrangement is shown instead.`;
+    if (!view.notes.includes(note)) view.notes.push(note);
+    notes?.push(note);
+    return fallbackLayout(view);
+  }
   try {
     return await layoutView(view);
   } catch (error) {

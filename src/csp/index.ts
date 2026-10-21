@@ -56,4 +56,5 @@ export {
 } from './fdr';
 export { explain, matchResults, normalizeAssertion, processNames, sameChannel, specErrors, type ExplainOptions } from './explain';
 export { checkWithFdr, type FdrCheck, type FdrCheckRequest } from './check';
+export { includePolicy, includeProblemsText, includesIn, prepareIncludes, type IncludedFile, type IncludePolicy, type IncludeProblem, type PreparedModel } from './includes';
 export { fdrDiagnostics, formatFdrReport, isPartialDeadlock, lensVerdict, type FdrDiagnostic, type ReportContext } from './report';

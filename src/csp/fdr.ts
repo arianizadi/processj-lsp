@@ -45,6 +45,10 @@ export interface FdrRun {
   aborted: boolean;
   /** refines was stopped for using more memory than allowed: how much it was using (bytes). */
   memoryExceeded?: number;
+  /** refines was stopped because its output passed the limit (OUTPUT_LIMITS): how much it had written (characters). */
+  outputExceeded?: number;
+  /** refines was not started because too many runs were already waiting (fdrQueue): why, to show. */
+  busy?: string;
   exitCode: number | null;
   durationMs: number;
   stderr: string;
@@ -146,6 +150,68 @@ export interface RefinesModel {
  */
 export type RefinesRunner = (model: RefinesModel, opts: RunOptions) => Promise<FdrRun>;
 
+/**
+ * What one refines may write before it is stopped: in all (what is kept of
+ * its output anyway), and in one line, which is held whole until it ends.
+ * A counterexample past these is too large to read.
+ */
+export const OUTPUT_LIMITS = Object.freeze({ total: 50_000_000, line: 16_000_000 });
+
+/**
+ * Every refines this process starts waits its turn here: at most
+ * `concurrency` run at once whatever starts them (type checks on open and
+ * save, checks of any document), at most `waiting` wait, and a run past that
+ * is turned away (FdrRun.busy) rather than queued without bound.
+ */
+const fdrQueue = { concurrency: 2, waiting: 16, running: 0, waiters: [] as Array<() => void> };
+
+/** Change the queue's limits (settings, tests). */
+export function configureFdrQueue(limits: { concurrency?: number; waiting?: number }): void {
+  if (limits.concurrency !== undefined) fdrQueue.concurrency = Math.max(1, Math.floor(limits.concurrency));
+  if (limits.waiting !== undefined) fdrQueue.waiting = Math.max(0, Math.floor(limits.waiting));
+  while (fdrQueue.running < fdrQueue.concurrency && fdrQueue.waiters.length) fdrQueue.waiters.shift()!();
+}
+
+/** How many refines run and wait now. */
+export function fdrQueueState(): { running: number; waiting: number } {
+  return { running: fdrQueue.running, waiting: fdrQueue.waiters.length };
+}
+
+/** A turn to run refines: its release, or why there is none (aborted while waiting, or too many waiting). */
+function fdrTurn(signal?: AbortSignal): Promise<(() => void) | 'aborted' | 'busy'> {
+  if (signal?.aborted) return Promise.resolve('aborted');
+  let released = false;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    fdrQueue.running--;
+    if (fdrQueue.running < fdrQueue.concurrency) fdrQueue.waiters.shift()?.();
+  };
+  if (fdrQueue.running < fdrQueue.concurrency) {
+    fdrQueue.running++;
+    return Promise.resolve(release);
+  }
+  if (fdrQueue.waiters.length >= fdrQueue.waiting) return Promise.resolve('busy');
+  return new Promise((resolve) => {
+    const start = (): void => {
+      signal?.removeEventListener('abort', onAbort);
+      fdrQueue.running++;
+      resolve(release);
+    };
+    const onAbort = (): void => {
+      const index = fdrQueue.waiters.indexOf(start);
+      if (index >= 0) fdrQueue.waiters.splice(index, 1);
+      resolve('aborted');
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    fdrQueue.waiters.push(start);
+  });
+}
+
+function notRun(fields: Partial<FdrRun>): FdrRun {
+  return { results: [], errors: [], warnings: [], eventMap: {}, timedOut: false, aborted: false, exitCode: null, durationMs: 0, stderr: '', ...fields };
+}
+
 /** The memory refines may use when no limit is given: half of this machine's, at most 8 GB. */
 export function defaultMemoryLimit(): number {
   return Math.min(Math.floor(os.totalmem() / 2), 8 * 1024 ** 3);
@@ -168,9 +234,22 @@ function groupMemory(pgid: number): Promise<number | undefined> {
 
 /**
  * Run `refines` on a CSPm file and parse its framed JSON output. The process
- * group is killed on timeout, on abort and when it uses more memory than allowed.
+ * group is killed on timeout, on abort, when it uses more memory than
+ * allowed and when its output passes OUTPUT_LIMITS. Runs wait their turn in
+ * the process-wide queue (fdrQueue).
  */
 export async function runRefines(refines: string, file: string, opts: RunOptions = {}): Promise<FdrRun> {
+  const turn = await fdrTurn(opts.signal);
+  if (turn === 'aborted') return notRun({ aborted: true });
+  if (turn === 'busy') return notRun({ busy: `FDR is busy: ${fdrQueue.running} checks are running and ${fdrQueue.waiters.length} are waiting. Run this one again when they have finished.` });
+  try {
+    return await runRefinesNow(refines, file, opts);
+  } finally {
+    turn();
+  }
+}
+
+async function runRefinesNow(refines: string, file: string, opts: RunOptions): Promise<FdrRun> {
   const args = ['--format=framed_json', '-q'];
   if (opts.typecheckOnly) args.push('--typecheck');
   else if (opts.divide !== false) args.push('--divide');
@@ -183,7 +262,18 @@ export async function runRefines(refines: string, file: string, opts: RunOptions
   const times: number[] = [];
   let pending = '';
   let seen = 0;
+  let received = 0;
+  let outputExceeded: number | undefined;
+  const stop = new AbortController();
+  const tooMuch = (): void => {
+    outputExceeded = received;
+    pending = '';
+    stop.abort();
+  };
   const onStdout = (chunk: string): void => {
+    if (outputExceeded !== undefined) return;
+    received += chunk.length;
+    if (received > OUTPUT_LIMITS.total) return tooMuch();
     pending += chunk;
     for (let nl = pending.indexOf('\n'); nl >= 0; nl = pending.indexOf('\n')) {
       const line = pending.slice(0, nl);
@@ -198,10 +288,11 @@ export async function runRefines(refines: string, file: string, opts: RunOptions
       }
       last = now;
     }
+    // The rest of a line is kept until the line ends: one that never does would grow without bound.
+    if (pending.length > OUTPUT_LIMITS.line) tooMuch();
   };
   // A watchdog on refines' memory: it polls the process group and stops it past the limit.
   const limit = opts.memoryLimit ?? defaultMemoryLimit();
-  const stop = new AbortController();
   const onAbort = (): void => stop.abort();
   if (opts.signal?.aborted) stop.abort();
   opts.signal?.addEventListener('abort', onAbort, { once: true });
@@ -225,7 +316,7 @@ export async function runRefines(refines: string, file: string, opts: RunOptions
   };
   let r;
   try {
-    r = await exec(refines, args, { cwd: path.dirname(file), timeoutMs: opts.timeoutMs ?? 60_000, signal: stop.signal, maxOutput: 50_000_000, onStdout, onSpawn });
+    r = await exec(refines, args, { cwd: path.dirname(file), timeoutMs: opts.timeoutMs ?? 60_000, signal: stop.signal, maxOutput: OUTPUT_LIMITS.total, onStdout, onSpawn });
   } finally {
     if (watchdog) clearInterval(watchdog);
     opts.signal?.removeEventListener('abort', onAbort);
@@ -234,7 +325,16 @@ export async function runRefines(refines: string, file: string, opts: RunOptions
   parsed.results.forEach((result, i) => {
     if (times[i] !== undefined) result.ms = times[i];
   });
-  return { ...parsed, timedOut: r.timedOut, aborted: r.aborted && memoryExceeded === undefined, ...(memoryExceeded !== undefined ? { memoryExceeded } : {}), exitCode: r.exitCode, durationMs: r.durationMs, stderr: r.stderr };
+  return {
+    ...parsed,
+    timedOut: r.timedOut,
+    aborted: r.aborted && memoryExceeded === undefined && outputExceeded === undefined,
+    ...(memoryExceeded !== undefined ? { memoryExceeded } : {}),
+    ...(outputExceeded !== undefined ? { outputExceeded } : {}),
+    exitCode: r.exitCode,
+    durationMs: r.durationMs,
+    stderr: r.stderr,
+  };
 }
 
 /** Parse refines' framed JSON (one object per line; a cancelled run may leave a truncated last line). */

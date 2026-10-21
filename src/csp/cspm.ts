@@ -391,7 +391,11 @@ export function rangeText(lo: number, hi: number): string {
   return braces('{', `${lo}..${hi}`, '}');
 }
 
-/** Source text made safe for a CSPm `--` comment (no block-comment delimiters, one line). */
+/**
+ * Text made safe for a CSPm `--` comment: one line (line breaks and every
+ * other control character become spaces, so a file name cannot end the
+ * comment and add statements to the model), no block-comment delimiters.
+ */
 export function commentText(text: string): string {
-  return text.replace(/\s+/g, ' ').replace(/\{-/g, '{ -').replace(/-\}/g, '- }').trim();
+  return text.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ').replace(/\s+/g, ' ').replace(/\{-/g, '{ -').replace(/-\}/g, '- }').trim();
 }

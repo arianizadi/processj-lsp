@@ -9,8 +9,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makePrivateDir, removePrivateDir } from '../compiler';
-import { absoluteIncludes } from '../csp/check';
 import { findRefines, refinesNotFoundMessage, runRefines, type FdrResult, type FdrRun, type RefinesRunner, type RunOptions } from '../csp/fdr';
+import { includePolicy, includeProblemsText, prepareIncludes, type PreparedModel } from '../csp/includes';
 import type { Span } from '../parser/ast';
 import type { VerificationReport } from '../verification';
 import type { CspmDocument } from './document';
@@ -27,6 +27,8 @@ export interface CspmCheckRequest {
   workers?: number;
   /** Where to write the copy FDR runs (kept); a private temporary directory otherwise. */
   cspFile?: string;
+  /** Where includes may resolve (the workspace roots); default: the document's directory (src/csp/includes.ts). */
+  includeRoots?: readonly string[];
   onProgress?: (done: number, total: number, label: string, result: FdrResult) => void;
 }
 
@@ -44,6 +46,12 @@ export function documentDirectory(uri: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** The document's text as FDR runs it, its includes checked against the workspace (src/csp/includes.ts). */
+export function prepareDocument(document: CspmDocument, roots: readonly string[] | undefined): PreparedModel {
+  const base = documentDirectory(document.uri);
+  return prepareIncludes(document.text, base, includePolicy(roots, base));
 }
 
 /** Check a CSPm document's own assertions with FDR and explain the answers. */
@@ -71,20 +79,22 @@ export async function checkCspmWithFdr(req: CspmCheckRequest): Promise<CspmCheck
       if (a) req.onProgress?.(++done, assertions.length, a.text, result);
     },
   };
-  const base = documentDirectory(doc.uri);
+  const refines = req.runner ? undefined : req.refines ?? findRefines();
+  if (!req.runner && !refines) return { report: explainOf(undefined, refinesNotFoundMessage()) };
+  const prepared = prepareDocument(doc, req.includeRoots);
+  if (prepared.problems.length) return { report: explainOf(undefined, includeProblemsText(prepared.problems)) };
   if (req.runner) {
+    const base = documentDirectory(doc.uri);
     const name = req.cspFile ? path.basename(req.cspFile) : safeName(doc.title);
     const run = await req.runner({ text: doc.text, name, ...(base ? { includeBase: base } : {}) }, options);
     return { report: explainOf(run), run, ...(req.cspFile ? { cspFile: req.cspFile } : {}) };
   }
-  const refines = req.refines ?? findRefines();
-  if (!refines) return { report: explainOf(undefined, refinesNotFoundMessage()) };
   const temp = req.cspFile ? undefined : makePrivateDir('processj-fdr-csp-');
   const file = req.cspFile ?? path.join(temp!, safeName(doc.title));
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, base ? absoluteIncludes(doc.text, base) : doc.text);
-    const run = await runRefines(refines, file, options);
+    fs.writeFileSync(file, prepared.text);
+    const run = await runRefines(refines!, file, options);
     return { report: explainOf(run), run, ...(temp ? {} : { cspFile: file }) };
   } finally {
     if (temp) removePrivateDir(temp, true);
@@ -96,10 +106,13 @@ export async function checkCspmWithFdr(req: CspmCheckRequest): Promise<CspmCheck
  * when FDR names one in it. `refines` is the local executable, or a runner
  * elsewhere.
  */
-export async function typecheckCspm(document: CspmDocument, refines: string | RefinesRunner, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<Array<{ message: string; span?: Span; file?: string }>> {
-  const base = documentDirectory(document.uri);
+export async function typecheckCspm(document: CspmDocument, refines: string | RefinesRunner, opts: { timeoutMs?: number; signal?: AbortSignal; includeRoots?: readonly string[] } = {}): Promise<Array<{ message: string; span?: Span; file?: string }>> {
+  // A refused include is the diagnostic, at the include; FDR does not read the file.
+  const prepared = prepareDocument(document, opts.includeRoots);
+  if (prepared.problems.length) return prepared.problems.map((problem) => ({ message: `${problem.message}. FDR may read only files inside the workspace`, span: problem.span }));
   const options: RunOptions = { typecheckOnly: true, timeoutMs: opts.timeoutMs ?? 20_000, signal: opts.signal };
   if (typeof refines !== 'string') {
+    const base = documentDirectory(document.uri);
     const name = safeName(document.title);
     const run = await refines({ text: document.text, name, ...(base ? { includeBase: base } : {}) }, options);
     if (run.aborted) return [];
@@ -108,9 +121,10 @@ export async function typecheckCspm(document: CspmDocument, refines: string | Re
   const temp = makePrivateDir('processj-fdr-tc-');
   try {
     const file = path.join(temp, safeName(document.title));
-    fs.writeFileSync(file, base ? absoluteIncludes(document.text, base) : document.text);
+    fs.writeFileSync(file, prepared.text);
     const run = await runRefines(refines, file, options);
-    if (run.aborted) return [];
+    // Stopped, or not started (too many FDR runs waiting): the next save type-checks again.
+    if (run.aborted || run.busy) return [];
     return fdrErrors([...run.errors, ...run.results.flatMap((result) => result.errors)], path.basename(file));
   } finally {
     removePrivateDir(temp, true);
