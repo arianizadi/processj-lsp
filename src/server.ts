@@ -111,7 +111,7 @@ import { checkWithFdr, drawnArguments, fdrDiagnostics, findRefines, formatFdrRep
 import type { CheckOutcome, ProcessSnapshot, SourceRef, VerificationReport } from './verification';
 import { CspmFeatures, isCspmDocument } from './cspm/features';
 import type { GraphFormat } from './graph/session';
-import { compileJob, compilerOutput, remoteOptions, remoteRefines, type Project, type RemoteCompileResult, type RemoteOptions, type RunRefinesResult } from './remote';
+import { compileJob, compilerOutput, projectPath, remoteOptions, remoteRefines, type Project, type RemoteCompileResult, type RemoteOptions, type RunRefinesResult } from './remote';
 import { augmentYieldAnnotations } from './yieldfix';
 
 const COMMAND_RUN = 'processj.run';
@@ -1433,11 +1433,15 @@ async function runRemoteCheck(uri: string, signal: AbortSignal): Promise<void> {
 
 /** The project files a document imports, directly or through other files (the standard library aside): what compiling it needs. */
 function projectImports(doc: TextDocument): string[] {
-  const own = safeFileUri(doc.uri);
+  return projectImportsOf(parsedFor(doc).program, safeFileUri(doc.uri));
+}
+
+/** projectImports for a program read from `own` (open or not). */
+function projectImportsOf(program: A.Program, own: string | undefined): string[] {
   const includeDir = install ? path.resolve(install.includeDir) : undefined;
   const seen = new Set<string>(own ? [path.resolve(own)] : []);
   const out: string[] = [];
-  const queue: Array<{ program: A.Program; file: string | undefined }> = [{ program: parsedFor(doc).program, file: own }];
+  const queue: Array<{ program: A.Program; file: string | undefined }> = [{ program, file: own }];
   for (let next = queue.shift(); next && out.length < DEFAULT_MAX_IMPORTED_FILES; next = queue.shift()) {
     for (const found of resolveImports(next.program, next.file, workspace.getRoots(), install?.includeDir).files) {
       const file = path.resolve(found);
@@ -1450,6 +1454,80 @@ function projectImports(doc: TextDocument): string[] {
   }
   return out;
 }
+
+/** A file as the compiler should read it: its text (an open buffer before the file) with the yield annotations its calls need. */
+function compilerText(file: string): { text: string; compiled: string } | undefined {
+  const open = documentForPath(file);
+  const text = open ? open.getText() : currentText(file);
+  if (text === undefined) return undefined;
+  try {
+    if (open) {
+      const parsed = parsedFor(open);
+      const analysis = checkFor(open);
+      return { text, compiled: augmentYieldAnnotations(text, { program: parsed.program, index: analysis.index, calls: analysis.checked.calls, callProvider: analysis.yieldCallProvider, syntaxErrors: parsed.errors.length }).text };
+    }
+    const parsed = parse(text);
+    // A file that does not parse is left as it is (as augmentYieldAnnotations would leave it), without checking it.
+    if (parsed.errors.length) return { text, compiled: text };
+    const analysis = analyzeProgram(parsed.program, file, text, parsed.tokens);
+    return { text, compiled: augmentYieldAnnotations(text, { program: parsed.program, index: analysis.index, calls: analysis.checked.calls, callProvider: analysis.yieldCallProvider, syntaxErrors: 0 }).text };
+  } catch (error) {
+    // As for diagnostics (publish): an analysis that fails leaves the file as it is, and the log says why.
+    connection.console.error(`could not add the yield annotations to ${file}: ${error instanceof Error ? error.stack ?? error.message : String(error)}`);
+    return { text, compiled: text };
+  }
+}
+
+/** Most files processj/buildInputs answers with (a runner job takes 64; the page sends what it can). */
+const MAX_BUILD_INPUT_FILES = 1000;
+
+/**
+ * processj/buildInputs: the project as Run and Build should send it to the
+ * runner for `entry` (a file URI, or a path from the workspace folder). The
+ * entry and every project .pj file it imports, directly or through other
+ * files, come as the compiler should read them, each with the yield
+ * annotations of its own analysis (its own imports and calls), exactly as
+ * runRemoteCheck sends a document; every other file below the workspace
+ * folder comes as it is. No line changes, so the runner's line numbers are
+ * still the editor's. `augmented` names the files whose text changed. Only
+ * for a client whose files are in memory (the browser IDE), whose project
+ * they are; null for an entry that is not a .pj file in the workspace.
+ */
+connection.onRequest('processj/buildInputs', (params: { entry?: unknown }): { entry: string; files: Array<{ path: string; text: string }>; augmented: string[] } | null => {
+  if (!platform.memoryFiles || typeof params?.entry !== 'string') return null;
+  const roots = workspace.getRoots();
+  const requested = params.entry;
+  const uri = requested.startsWith('file:') ? requested : roots[0] ? pathToFileURL(path.join(roots[0], requested)).toString() : undefined;
+  const entry = uri ? projectFile(uri) : undefined;
+  const place = entry && entry.endsWith('.pj') ? projectPath(entry, roots) : undefined;
+  const open = entry ? documentForPath(entry) : undefined;
+  if (!entry || !place || (!open && !isFile(entry))) return null;
+  const program = open ? parsedFor(open).program : parse(currentText(entry) ?? '').program;
+  const files = new Map<string, { path: string; text: string }>();
+  const augmented: string[] = [];
+  for (const file of [entry, ...projectImportsOf(program, entry)]) {
+    const at = projectPath(file, [place.root]);
+    if (!at || files.has(at.path)) continue;
+    const source = compilerText(file);
+    if (!source) continue;
+    files.set(at.path, { path: at.path, text: source.compiled });
+    if (source.compiled !== source.text) augmented.push(at.path);
+  }
+  // Every open buffer (ProcessJ or CSPm) before the file below it, and open ones the page has not written yet.
+  const buffers = new Map<string, string>();
+  for (const doc of allDocuments.all()) {
+    const file = safeFileUri(doc.uri);
+    if (file) buffers.set(path.resolve(file), doc.getText());
+  }
+  for (const file of [...buffers.keys(), ...filesUnder(place.root).sort()]) {
+    if (files.size >= MAX_BUILD_INPUT_FILES) break;
+    const at = projectPath(file, [place.root]);
+    if (!at || files.has(at.path)) continue;
+    const text = buffers.get(path.resolve(file)) ?? currentText(file);
+    if (text !== undefined) files.set(at.path, { path: at.path, text });
+  }
+  return { entry: place.path, files: [...files.values()], augmented };
+});
 
 /** The workspace as a runner job sees it: files below the workspace folders, open buffers first. */
 const project: Project = {

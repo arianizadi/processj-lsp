@@ -1550,6 +1550,7 @@ browser IDE, into `dist/browser/`:
 | `processj-lsp.worker.js` | the server as one classic worker script (minified, with a source map), LSP over the worker's `postMessage` |
 | `elk.<hash>.js` | the layout engine (elkjs, about half of the code), which the worker loads with `importScripts` from beside itself when it first lays out a view (`src/browser/elk.ts`); the name carries a hash of its content |
 | `graph-viewer.html` | the graph viewer page for `<iframe sandbox="allow-scripts">`: webview mode, fed by `postMessage` as VS Code's panel feeds it; a stand-in for `acquireVsCodeApi()` posts the page's messages to the parent as `{ pjViewer: message }`, starting with `{ type: 'ready' }`, and the parent's `{ type: 'theme', theme: 'light' \| 'dark' }` sets the page's theme (an iframe cannot see its embedder's) |
+| `gallery.json` | every example program as a project to open (`scripts/gallery.mjs`): below |
 | `manifest.json` | `{ version, commit, files }` |
 
 The viewer page's script nonce is made from a hash of the page, so the same
@@ -1604,7 +1605,32 @@ then answers two requests (`src/remote.ts`):
   the file is shown at its top, saying where the compiler put it.
 
 Run and Build are the page's (the worker answers them with a message), as is
-anything else that needs a process.
+anything else that needs a process. What the page sends the runner for them
+it asks the worker for: `processj/buildInputs { entry }` (a file URI, or a
+path from the workspace folder) → `{ entry, files: [{ path, text }], augmented }`
+is every file below the workspace folder, with the entry and the project
+`.pj` files it imports (directly or through other files) as the compiler
+should read them: each with the yield annotations of its own analysis, as
+`processj/compile` sends a document (`src/yieldfix.ts`). No line changes.
+`augmented` names the files that changed; the answer is null for an entry
+that is not a `.pj` file of the workspace, and from the Node server, whose
+files are the editor's disk.
+
+`gallery.json` is every ProcessJ and CSPm program of this repository (the
+standard library headers in `test/fixtures/include` aside) as a project an IDE
+can open: `examples/` (Start here), `test/fixtures/processj` (Classic
+programs), `test/differential` (Language corner cases), `test/fixtures/fifo`
+(Channel arrays and FIFOs), every `.csp` file (CSPm models) and the rest of
+`test/fixtures` (Other fixtures). An entry has an `id` (its path here), a
+`title` (from the file name, or a better one from `scripts/gallery.mjs`), a
+`description` (the leading comment, without `// expect:` and `// outcome:`,
+which become tags such as `deadlock`, `runs`, `compiler limit`, `type error`
+and `FDR`, next to the language features the code uses), a `category`, its
+`files` (the program, the project files it imports or includes, and its CSPm
+model, at their paths from the program's folder `dir`; the texts are in
+`sources`, each once), the file to `open` and the `entry` Run starts from.
+`featured` is a small set to start with. `test/gallery.test.ts` checks that
+every program is there and that every entry is a project the runner takes.
 
 A client whose files are in memory also uses three more messages:
 `processj/writeFiles { files: [{ uri, text }] }` and
@@ -1618,8 +1644,9 @@ export. The Node server does not accept them: its files are the editor's disk.
 `test/browser.test.ts` runs the built worker in a Node `vm` context with a Web
 Worker's globals only and drives it as a page does: its diagnostics against the
 Node server's over every example, ELK and the connection, the file messages,
-and FDR and the compiler through the two requests, answered from the
-recorded refines output and with canned compiler output.
+FDR and the compiler through the two requests, answered from the
+recorded refines output and with canned compiler output, and what
+`processj/buildInputs` gives Run and Build.
 
 ## Layout
 
@@ -1689,7 +1716,8 @@ test/fixtures/fdr/  refines output recorded for the explanation and graph tests 
                     test/fdr-recordings.ts reads them, and replays them as a stand-in refines for the server tests
 examples/           one program per diagnostic, self-describing and tested; dining_philosophers.pj is for FDR
 scripts/smoke.js    talks LSP over stdio to a real server, ends with a real program run
-scripts/build-browser.mjs the Web Worker build (dist/browser): the worker, the viewer page and a manifest
+scripts/build-browser.mjs the Web Worker build (dist/browser): the worker, the viewer page, the example gallery and a manifest
+scripts/gallery.mjs every example program as a project for the browser IDE (dist/browser/gallery.json)
 scripts/bench.js    complete in-memory analysis timings on generated large files
 scripts/validate.js builds and runs every program, comparing the checker's verdict against reality
 scripts/parse-diff.js compares the parser's trees with the compiler's -showTree output, on files or generated programs

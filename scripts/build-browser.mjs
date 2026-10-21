@@ -8,6 +8,7 @@
 //   elk.<hash>.js            the layout engine (elkjs), which the worker loads
 //                            with importScripts when it first lays out a view
 //   graph-viewer.html        the graph viewer for <iframe sandbox="allow-scripts">
+//   gallery.json             every example program as a project to open (scripts/gallery.mjs)
 //   manifest.json            { version, commit, files }
 //
 // The server is the one the editors run. Here src/connection.ts becomes
@@ -21,6 +22,7 @@ import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { gzipSync } from 'node:zlib';
 import * as esbuild from 'esbuild';
+import { buildGallery } from './gallery.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
 const require = createRequire(import.meta.url);
@@ -117,10 +119,13 @@ const draft = renderEmbeddedViewerHtml({ nonce: NONCE_SLOT });
 const nonce = createHash('sha256').update(draft).digest('base64').slice(0, 24);
 fs.writeFileSync(path.join(out, VIEWER), draft.split(NONCE_SLOT).join(nonce));
 
+// The example gallery, which the IDE fetches when someone asks for an example.
+fs.writeFileSync(path.join(out, 'gallery.json'), `${JSON.stringify(buildGallery(root, { version }))}\n`);
+
 let commit = 'unknown';
 try {
   commit = execFileSync('git', ['rev-parse', '--short=12', 'HEAD'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-  const dirty = execFileSync('git', ['status', '--porcelain', '--', 'src', 'scripts', 'package.json'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const dirty = execFileSync('git', ['status', '--porcelain', '--', 'src', 'scripts', 'package.json', 'examples', 'test/differential', 'test/fixtures'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
   if (dirty) commit += '-dirty';
 } catch {
   /* not a git checkout */
@@ -128,7 +133,7 @@ try {
 const files = fs.readdirSync(out).sort();
 fs.writeFileSync(path.join(out, 'manifest.json'), `${JSON.stringify({ version, commit, files }, null, 2)}\n`);
 
-for (const file of [WORKER, ELK, VIEWER]) {
+for (const file of [WORKER, ELK, VIEWER, 'gallery.json']) {
   const bytes = fs.readFileSync(path.join(out, file));
   console.log(`dist/browser/${file}: ${(bytes.length / 1024).toFixed(0)} KiB, ${(gzipSync(bytes, { level: 9 }).length / 1024).toFixed(0)} KiB gzipped`);
 }

@@ -378,6 +378,73 @@ test('compiler diagnostics come from processj/compile: after a pause in typing, 
   }
 });
 
+test('processj/buildInputs: the project for Run and Build, the entry and the files it imports as the compiler should read them', async () => {
+  const { worker } = await startWorker();
+  worker.onRequest('processj/compile', () => ({ output: '', ok: true }));
+  const waits = 'package lib;\nimport std.*;\n\npublic void wait1() { timer t; t.timeout(t.read() + 1); }\n\npublic void twice() { wait1(); wait1(); }\n';
+  const main = 'import std.*;\nimport lib.waits;\n\npublic void run2() { twice(); }\n\npublic void main(string[] args) { run2(); println("ok"); }\n';
+  // Not imported by main.pj: it would need an annotation, and is sent as it is.
+  const other = 'import std.*;\npublic void w() { timer t; t.timeout(1); }\npublic void v() { w(); }\n';
+  try {
+    writeFiles(worker, {
+      'yield_through_calls.pj': example('yield_through_calls.pj'),
+      'main.pj': main,
+      'lib/waits.pj': waits,
+      'other.pj': other,
+      'notes.txt': 'not ProcessJ\n',
+      'model.csp': 'channel a\nP = a -> P\n',
+    });
+    const lines = (text: string): number => text.split('\n').length;
+
+    // The example: `twice` suspends only through `wait1`, so it is marked; main and wait1 are not.
+    const single = await worker.request('processj/buildInputs', { entry: 'yield_through_calls.pj' });
+    assert.equal(single.entry, 'yield_through_calls.pj');
+    const marked = single.files.find((f: any) => f.path === 'yield_through_calls.pj').text;
+    assert.match(marked, /public void twice\(\) \[yield=true\] \{ wait1\(\); wait1\(\); \}/);
+    assert.match(marked, /public void wait1\(\) \{ timer t;/);
+    assert.match(marked, /public void main\(string\[\] args\) \{ twice\(\);/);
+    assert.equal(lines(marked), lines(example('yield_through_calls.pj')), 'no line added or removed');
+    assert.deepEqual(single.augmented, ['yield_through_calls.pj']);
+
+    // An entry with an import: both files annotated, each in its own context; the rest of the project as it is.
+    const both = await worker.request('processj/buildInputs', { entry: `${WORKSPACE}/main.pj` });
+    const byPath = new Map<string, string>(both.files.map((f: any) => [f.path, f.text]));
+    assert.deepEqual([...byPath.keys()].sort(), ['lib/waits.pj', 'main.pj', 'model.csp', 'notes.txt', 'other.pj', 'yield_through_calls.pj']);
+    assert.match(byPath.get('main.pj')!, /public void run2\(\) \[yield=true\] \{ twice\(\); \}/);
+    assert.match(byPath.get('lib/waits.pj')!, /public void twice\(\) \[yield=true\] \{ wait1\(\); wait1\(\); \}/);
+    assert.equal(lines(byPath.get('lib/waits.pj')!), lines(waits));
+    assert.equal(byPath.get('other.pj'), other, 'a file the entry does not reach is sent as it is');
+    assert.equal(byPath.get('yield_through_calls.pj'), example('yield_through_calls.pj'));
+    assert.equal(byPath.get('notes.txt'), 'not ProcessJ\n');
+    assert.deepEqual(both.augmented.sort(), ['lib/waits.pj', 'main.pj']);
+
+    // The entry as the background compile sends it (runRemoteCheck): the same text. An open buffer wins over the file.
+    const edited = main.replace('println("ok")', 'println("edited")');
+    await open(worker, `${WORKSPACE}/main.pj`, edited);
+    const asked = await worker.waitFor((m) => m.method === 'processj/compile', 5_000);
+    const fromBuffer = await worker.request('processj/buildInputs', { entry: 'main.pj' });
+    const sent = fromBuffer.files.find((f: any) => f.path === 'main.pj').text;
+    assert.match(sent, /println\("edited"\)/);
+    assert.equal(sent, asked.params.files.find((f: any) => f.path === 'main.pj').text);
+
+    // Nothing for what is not a .pj file of the workspace.
+    for (const entry of ['notes.txt', 'model.csp', 'missing.pj', '../outside.pj', 'file:///elsewhere/x.pj']) {
+      assert.equal(await worker.request('processj/buildInputs', { entry }), null, entry);
+    }
+  } finally {
+    await worker.close();
+  }
+});
+
+test('processj/buildInputs is the browser build\'s: the Node server, whose files are on disk, answers null', async () => {
+  const node = await startNode({ 'main.pj': 'public void main(string[] args) { }\n' }, () => ({}));
+  try {
+    assert.equal(await node.client.request('processj/buildInputs', { entry: node.uri('main.pj') }), null);
+  } finally {
+    await node.close();
+  }
+});
+
 test('the compiler runs unasked only on files inside the workspace, and the log says why for one outside', async () => {
   const { worker } = await startWorker();
   const asked: string[] = [];
