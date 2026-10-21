@@ -22,8 +22,12 @@ export type GeneratedWrite = { written: true } | { written: false; reason: strin
 /** Bytes of an existing file that `ours` is shown, to recognise a file this server generated. */
 const HEAD_BYTES = 4096;
 
-/** O_NOFOLLOW where the platform has it (not on Windows, where a link is not followed by these calls anyway). */
-const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+/**
+ * O_NOFOLLOW where the platform has it (not on Windows, where a link is not
+ * followed by these calls anyway). Read with care: the browser's in-memory
+ * file system has no `constants`, and this module loads there too.
+ */
+const NOFOLLOW = fs.constants?.O_NOFOLLOW ?? 0;
 
 /**
  * Write `content` to `file` when there is no file of that name, or when the
