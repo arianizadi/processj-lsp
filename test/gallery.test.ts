@@ -118,13 +118,25 @@ test('categories by where a program lives; tags from its expect and outcome line
   assert.equal(byId.get('test/fixtures/processj/fullAdder.pj')!.title, 'Full adder');
   assert.equal(byId.get('test/fixtures/processj/Hello.pj')!.entry, 'Hello.pj');
 
-  // Every differential program has its outcome as a tag and a sentence.
+  // Every differential program has its outcome as a tag and a sentence, but two whose outcome line is for
+  // ProcessJ's alt_timer_update branch: the IDE's runner builds with its main branch, where javac rejects them.
   const outcomeTag: Record<string, string> = { runs: 'runs', 'runs-wrong': 'runs wrong', error: 'build error', 'compiler-limit': 'compiler limit', deadlocks: 'deadlock' };
+  const onTheRunner: Record<string, string> = { 'test/differential/alt_timeout_guard.pj': 'compiler-limit', 'test/differential/two_alts_one_process.pj': 'compiler-limit' };
   for (const entry of gallery.entries.filter((e) => e.category === 'corners')) {
-    const outcome = /^\/\/ outcome:\s*(\S+)/.exec(gallery.sources[entry.id])![1];
+    const outcome = onTheRunner[entry.id] ?? /^\/\/ outcome:\s*(\S+)/.exec(gallery.sources[entry.id])![1];
     assert.ok(entry.tags.includes(outcomeTag[outcome]), `${entry.id}: ${outcome} in ${entry.tags.join(', ')}`);
   }
+  for (const id of Object.keys(onTheRunner)) {
+    const entry = byId.get(id)!;
+    assert.ok(!entry.tags.includes('runs'), `${id}: ${entry.tags.join(', ')}`);
+    assert.match(entry.description, /alt_timer_update branch builds and runs it.*main branch, which the IDE's runner builds with, javac rejects/);
+    assert.doesNotMatch(entry.description, /the checker says so|builds and runs as written/);
+  }
   assert.match(byId.get('test/differential/break_in_par.pj')!.description, /cannot build/);
+  // A description that already says how it went is not followed by a sentence that says it again.
+  assert.equal(byId.get('test/differential/alt_per_par_branch.pj')!.description, 'One alt per par branch is one alt per generated class, which builds and runs.');
+  assert.match(byId.get('test/differential/shared_writers_locked.pj')!.description, /single reader process\. It builds and runs as written\.$/);
+  for (const entry of gallery.entries) assert.doesNotMatch(entry.description, /\b(builds?|compiles?) and runs?\b.*It builds and runs as written\.$/, entry.id);
 
   // The featured set is the start of Start here.
   assert.ok(gallery.featured.length >= 4 && gallery.featured.length <= 8);
