@@ -128,6 +128,24 @@ export interface RunOptions {
   workers?: number;
 }
 
+/** A model for a refines that runs somewhere else. */
+export interface RefinesModel {
+  /** The model as FDR should read it. */
+  text: string;
+  /** A file name for it (`commstime.csp`), as FDR's messages will name it. */
+  name: string;
+  /** The directory its relative `include`s are relative to (the source's directory). */
+  includeBase?: string;
+}
+
+/**
+ * refines run somewhere else, such as the browser IDE's runner service (no
+ * process can be started in a browser): it answers what runRefines answers
+ * for a file holding the model. Everything after it (explain, the report, the
+ * graph) is the same as for a local run.
+ */
+export type RefinesRunner = (model: RefinesModel, opts: RunOptions) => Promise<FdrRun>;
+
 /** The memory refines may use when no limit is given: half of this machine's, at most 8 GB. */
 export function defaultMemoryLimit(): number {
   return Math.min(Math.floor(os.totalmem() / 2), 8 * 1024 ** 3);

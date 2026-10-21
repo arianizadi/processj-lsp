@@ -8,7 +8,7 @@ import { makePrivateDir, removePrivateDir } from '../compiler';
 import type { Pos } from '../parser/ast';
 import type { VerificationReport } from '../verification';
 import { explain, normalizeAssertion } from './explain';
-import { findRefines, refinesNotFoundMessage, runRefines, type FdrResult, type FdrRun } from './fdr';
+import { findRefines, refinesNotFoundMessage, runRefines, type FdrResult, type FdrRun, type RefinesRunner, type RunOptions } from './fdr';
 import type { CspModel } from './model';
 import { translateProcedure, translateProgram, type TranslateInput } from './translate';
 
@@ -20,6 +20,8 @@ export interface FdrCheckRequest extends TranslateInput {
   documentVersion?: number;
   /** FDR's refines; found with findRefines() when omitted. */
   refines?: string;
+  /** refines elsewhere (the browser IDE's runner): used instead of a local refines, and nothing is written. */
+  runner?: RefinesRunner;
   timeoutMs?: number;
   signal?: AbortSignal;
   /** Stop refines past this much memory (bytes); see RunOptions.memoryLimit. */
@@ -59,6 +61,25 @@ export async function checkWithFdr(req: FdrCheckRequest): Promise<FdrCheck> {
   const opts = { uri: req.uri, documentVersion: req.documentVersion };
   // Fail closed: an incomplete model is never run (explain() marks every check as not checked).
   if (model.unsupported.length) return { report: explain(model, undefined, opts), model };
+  const base = req.includeBase ?? (req.units[0]?.file ? path.dirname(req.units[0].file) : undefined);
+  // Progress by assertion text: a block's `include` can add assertions of its own to FDR's list.
+  let done = 0;
+  const options: RunOptions = {
+    timeoutMs: req.timeoutMs,
+    signal: req.signal,
+    memoryLimit: req.memoryLimit,
+    workers: req.workers,
+    onResult: (_index, result) => {
+      const a = model.assertions.find((x) => normalizeAssertion(x.assertion) === normalizeAssertion(result.assertion));
+      if (!a) return;
+      req.onProgress?.(++done, model.assertions.length, a.label, result);
+    },
+  };
+  if (req.runner) {
+    const name = req.cspFile ? path.basename(req.cspFile) : `${model.target.kind === 'program' ? 'program' : model.target.name}.csp`;
+    const run = await req.runner({ text: model.text, name, ...(base ? { includeBase: base } : {}) }, options);
+    return { report: explain(model, run, opts), model, rawResults: run };
+  }
   const refines = req.refines ?? findRefines();
   if (!refines) return { report: explain(model, undefined, { ...opts, notRun: refinesNotFoundMessage() }), model };
   // Removed when the check is over, or at exit if the process is stopped during it (a signal).
@@ -66,21 +87,8 @@ export async function checkWithFdr(req: FdrCheckRequest): Promise<FdrCheck> {
   const file = req.cspFile ?? path.join(temp!, `${model.target.kind === 'program' ? 'program' : model.target.name}.csp`);
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const base = req.includeBase ?? (req.units[0]?.file ? path.dirname(req.units[0].file) : undefined);
     fs.writeFileSync(file, base ? absoluteIncludes(model.text, base) : model.text);
-    // Progress by assertion text: a block's `include` can add assertions of its own to FDR's list.
-    let done = 0;
-    const run = await runRefines(refines, file, {
-      timeoutMs: req.timeoutMs,
-      signal: req.signal,
-      memoryLimit: req.memoryLimit,
-      workers: req.workers,
-      onResult: (_index, result) => {
-        const a = model.assertions.find((x) => normalizeAssertion(x.assertion) === normalizeAssertion(result.assertion));
-        if (!a) return;
-        req.onProgress?.(++done, model.assertions.length, a.label, result);
-      },
-    });
+    const run = await runRefines(refines, file, options);
     return { report: explain(model, run, opts), model, cspFile: temp ? undefined : file, rawResults: run };
   } finally {
     if (temp) removePrivateDir(temp, true);

@@ -50,6 +50,8 @@ export {
   type FdrResult,
   type FdrRun,
   type LeafBehaviour,
+  type RefinesModel,
+  type RefinesRunner,
   type RunOptions,
 } from './fdr';
 export { explain, matchResults, normalizeAssertion, processNames, sameChannel, specErrors, type ExplainOptions } from './explain';

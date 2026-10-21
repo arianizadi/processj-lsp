@@ -22,7 +22,7 @@ export interface InstallOptions {
 }
 
 /** Jars the compiler needs at runtime, relative to <install>/resources/jars. Mirrors the `pjc` script. */
-const RUNTIME_JARS = ['java_cup_runtime.jar', 'ST-4.0.7.jar', 'asm-all-5.2.jar'];
+export const RUNTIME_JARS: readonly string[] = ['java_cup_runtime.jar', 'ST-4.0.7.jar', 'asm-all-5.2.jar'];
 
 /** Parse a `key=value` file such as ~/processjrc. Lines starting with `#` are comments. */
 export function parseRcFile(text: string): Record<string, string> {
